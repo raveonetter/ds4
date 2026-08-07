@@ -63,38 +63,23 @@ The appendix-only cache argument holds in its current form. The strongest remain
 | All layers contribute to single `g_batch_enc` compute encoder | ds4.c lines 29595-29616 |
 | No implicit fence between encoders — resource dependency only | Metal spec + source trace |
 
-### Three Perturbation Mechanisms (ranked by proof strength)
+### 唯一 proven fact
 
-**#1: Encoder boundary disruption — PROVEN BY SOURCE**
-`ds4_gpu_close_batch_encoder()` terminates the current compute encoder before blit. Default mode: 40 layers → ONE encoder. With probe: N encoders + N blits. **This is the only claim fully supported by C source trace.**
+**Encoder boundary disruption (proven by C source):**
+`ds4_gpu_close_batch_encoder()` terminates the current compute encoder before blit, and a new compute encoder is created after. Default mode: 40 layers → ONE encoder. With probe: N encoders + N blits. **This is the ONLY claim fully supported by static code analysis.**
 
-**#2: Cache line flushing at encoder boundary — UNPROVEN (speculation)**
-Metal unified memory may or may not flush cache lines when a compute encoder ends. No C-level evidence proves this happens in our scenario. The encoder boundary guarantees dependency ordering, but does NOT imply visible cache state change.
+### Unproven speculation (independent claims — no causal chain)
 
-**#3: GPU bandwidth contention — UNQUANTIFIED**
-Blit copy competes with compute kernels for unified memory bandwidth. Latency exists but is unquantified; shifting dependent reads timing is plausible but not provable from C source.
+The following are **independent hypotheses**, each requiring GPU microarchitecture verification. None can be derived from C source alone, and none causally imply the others:
 
-### Critical Gap: Floating-Point Accumulation Order Change
-
-The question is not whether dependencies are correct (they are). The question is: **does the Metal driver's change from 1 encoder vs N encoders affect floating-point accumulation order at the kernel level?**
-
-| Perturbation chain | Status | Evidence |
+| Hypothesis | Status | Why unproven |
 |---|---|---|
-| Encoder split blocks kernel fusion | PROVEN | `ds4_gpu_close_batch_encoder()` ends encoder scope |
-| Cache line flushing at boundary | UNPROVEN | No C-level evidence; Metal dependency ≠ cache invalidation |
-| Kernel scheduling priority change | UNPROVEN | Depends on Metal driver internals |
-| FP accumulation order changes | UNPROVEN | Architecture-dependent, not provable from C source |
+| Cache lines flushed at encoder boundary | No evidence | Encoder boundary guarantees dependency ordering, not cache invalidation |
+| Kernel fusion prevented by multi-encoder topology | No evidence | Metal fusion rules are driver internals; opaque from C source |
+| GPU scheduling priorities shift with encoder count | No evidence | Apple Silicon scheduling heuristics are not public nor in our codebase |
+| FP accumulation order changes across boundaries | No evidence | Same mathematical formula ≠ same floating-point result; requires GPU verification |
 
-### The Fundamental Logical Gap
-
-**"Command order preserved" ≠ "Floating-point accumulation order identical"**
-
-- Command order: kernel dispatches happen in the order they were added to the encoder → PROVEN (Metal spec)
-- But Metal can reorder **within** a single encoder based on resource dependencies and heuristics → UNPROVEN (driver internals opaque)
-- Encoder boundary changes the set of available reorderings → PROVEN (fewer reorderings across boundaries)
-- FP accumulation order may differ → SPECULATION only; requires GPU microarchitecture verification
-
-The strongest proven claim is that blit copies **change the Metal command encoding structure** (1 encoder → N encoders). What this implies for GPU execution semantics — cache state, kernel scheduling, FP arithmetic order — cannot be determined from C source alone. The only way to verify is **runtime**: compare probe-on vs probe-off outputs.
+**Bottom line:** Only the command encoding structure change is proven. Everything about its effect on GPU execution semantics is speculation. The only way to verify any of these hypotheses is runtime comparison (probe-on vs probe-off).
 
 ### Verdict: WEAKENED
 
@@ -107,17 +92,17 @@ Codex's dependency correctness argument is solid. But the stronger claim "probe 
 | Codex claim | Strongest counterexample | Source evidence | Verdict |
 |---|---|---|---|
 | App-only rows invisible after counter restore | Fused store bypass: `comp_state_already_stored=true` skips state tensor path | ds4.c 22237-22258 | WEAKENED (but not invalidated) |
-| Probe blit copy doesn't perturb numerical execution | Encoder split changes Metal driver's kernel scheduling → FP accumulation order may differ | ds4_metal.m 8086, 907-914 | WEAKENED |
+| Probe blit copy doesn't perturb numerical execution | Only proven: encoder split (1→N). GPU semantics effect is speculation, not disproven by source. | ds4_metal.m 8086 | WEAKENED (only encoding structure proven) |
 
 ---
 
 ## Strongest Remaining Risk
 
-**Probe-induced floating-point perturbation via encoder boundary disruption.** The differential experiment measures the gap between Pass A (generic) and Pass B (ordinary sequential). If blit copies in Pass A change the accumulation order of generic verifier kernels, then the measured "divergence" may be partly or wholly due to probe artifacts — making the entire experiment invalid.
+**Blit copies change command encoding structure (proven).** Whether this changes the *result* of the generic verifier computation (vs merely changing *how* it's encoded) is unproven by static analysis and requires runtime verification. The differential experiment measures the gap between Pass A and Pass B — if encoder split alters the FP accumulation in Pass A, the measured "divergence" may include probe artifacts.
 
 ### What Would Falsify the GO Decision
 
-Runtime observation: **probe-on vs probe-off outputs for Pass A differ** (even without running Pass B). This demonstrates that the blit copies perturb the very computation we're trying to measure, making the differential inconclusive.
+Runtime observation: **probe-on vs probe-off outputs for Pass A differ** (even without running Pass B). This demonstrates that the blit copies perturb the computation we're trying to measure, making the differential inconclusive.
 
 ### Recommendation
 
