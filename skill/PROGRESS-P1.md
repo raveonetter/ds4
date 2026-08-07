@@ -263,3 +263,67 @@ DS4_TEST_DSPARK="$(pwd)/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf" \
 ### 注意
 - Support GGUF 不能单独用 `./ds4 -m <path>` 加载（会报缺少 main model metadata）——这是正常行为
 - 需要 GPU VRAM ≈ 9GB（Metal warmup）
+
+## P2: Dual-Pass Exactness Probe — Status (in progress)
+
+### Four Critical Findings (from user review, 2026-08-08)
+
+#### Finding 1: Dual-pass direction correct ✅
+generic verifier → restore S0 → ordinary sequential decode 是正确架构。exact N=2 仅作为 rows 0-1 的辅助 oracle，不作为完整 DSpark block 的 reference。
+
+#### Finding 2: Old P2 docs contradictory — abandon them ❌
+`PROBE-P2-DESIGN.md` 存在多处错误：
+- 建议从 `g->batch_cur_hc` 获取 Q/KV projection → **错误**，那是 HC (hidden state)，不是 Q/KV 中间态
+- 推荐 "现场重算 canonical" → 不必要且改变 GPU timing
+- 在 layer loop 中做 CPU sync readback → 不应该
+
+#### Finding 3: backup/qwen-p2-draft UNSAFE as implementation base ⚠️
+backup 分支包含 `DS4_DSPARK_EXACT_NOREPLAY`，尝试通过 `spec_frontier_commit_prefix1()` 直接提交 verifier frontier，绕过 replay。这**重新打开**了 upstream commit **7fb2830** 明确关闭的风险：
+
+> "The partial-accept shortcut retained the verifier batch compressor frontier and could change later greedy tokens. Restore the snapshot and replay partial accepts just like full accepts. Closes #658 #659"
+
+根因: `ds4_gpu_matmul_f16_pair_tensor` (generic verifier) vs `ds4_gpu_matmul_f16_pair_compressor_store_tensor` (canonical single-token) 浮点结果不同，直接 commit batch frontier 导致状态漂移。
+
+**Verdict**: backup/qwen-p2-draft = 取证/参考 only，NOT implementation base。
+
+#### Finding 4: Probe code has "written too fast" issues
+- `ds4_exactness_probe.c` 号称 pure C helper 但 include ds4_gpu.h 并调用 ds4_gpu_tensor_read() → 不是 GPU-independent
+- Sentinel reset 不完整
+- Compile-time gate (`DS4_PROBE_RUNTIME_ENABLED`) 是 dead code
+
+### P2 Architecture (approved, not implemented)
+
+```
+=== Pass A: generic verifier ===
+1. spec_frontier_snapshot(&frontier, s)    → captures persistent state
+2. push drafts [d0..dN] to checkpoint
+3. metal_graph_verify_suffix_tops()        → batched verify
+   └─ probe: GPU→GPU copy each layer's 5 checkpoints to snapshot buffers
+4. spec_frontier_restore(&frontier, s)     → restores persistent state
+
+=== Pass B: canonical sequential reference ===
+5. Snapshot raw KV cache at spec positions [start..start+N-1] (missing from spec_frontier!)
+6. metal_graph_eval_token_raw_swa() x N    → each draft token one-at-a-time
+   └─ probe: GPU→GPU copy same 5 checkpoints to snapshot buffers
+7. Restore raw KV cache
+
+=== Comparison ===
+8. ds4_gpu_end_commands() + batched CPU readback
+9. byte-for-byte compare batch[cp] vs ref[cp]
+10. Report first divergence
+```
+
+### Sanity check before interpretation
+`metal_graph_eval_token_raw_swa(d0)` == `metal_graph_verify_decode2_exact(d0, d1).row0`?
+如果不等，说明 matmul kernel 对 batch width 敏感 (tiling artifact)，所有比较都无效。
+
+### Unresolved: raw KV cache gap
+`spec_frontier_snapshot/restore()` **不** capture raw KV cache at spec positions。需要在 Pass A → restore 间隙额外快照。
+
+### What NOT to do yet
+- 不设计 exact-row kernel（等 probe 数据）
+- 不做新 API headers / 代码生成
+- 不假设 compressor projection 是第一个分歧点
+- 不在 layer loop 中 sync CPU readback
+
+### Recommendation: GO + raw KV snapshot fix
