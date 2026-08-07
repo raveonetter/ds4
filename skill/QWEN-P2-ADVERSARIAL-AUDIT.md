@@ -63,38 +63,38 @@ The appendix-only cache argument holds in its current form. The strongest remain
 | All layers contribute to single `g_batch_enc` compute encoder | ds4.c lines 29595-29616 |
 | No implicit fence between encoders — resource dependency only | Metal spec + source trace |
 
-### Three Confirmed Perturbation Mechanisms
+### Three Perturbation Mechanisms (ranked by proof strength)
 
-**#1: Encoder boundary disruption (confirmed)**
-`ds4_gpu_close_batch_encoder()` terminates the current compute encoder before blit, preventing any cross-boundary kernel fusion/reordering. Default mode: 40 layers → ONE encoder. With probe: N encoders + N blits.
+**#1: Encoder boundary disruption — PROVEN BY SOURCE**
+`ds4_gpu_close_batch_encoder()` terminates the current compute encoder before blit. Default mode: 40 layers → ONE encoder. With probe: N encoders + N blits. **This is the only claim fully supported by C source trace.**
 
-**#2: Resource cache line flushing (confirmed)**
-Metal unified memory flushes cache lines at encoder boundary. Without probe: layer L's output may stay in cache for layer L+1's kernel read. With probe: forced flush to memory, then reload.
+**#2: Cache line flushing at encoder boundary — UNPROVEN (speculation)**
+Metal unified memory may or may not flush cache lines when a compute encoder ends. No C-level evidence proves this happens in our scenario. The encoder boundary guarantees dependency ordering, but does NOT imply visible cache state change.
 
-**#3: GPU bandwidth contention (confirmed but unquantified)**
-Blit copy competes with compute kernels for unified memory bandwidth on Apple Silicon. Latency in microseconds to milliseconds shifts dependent reads timing.
+**#3: GPU bandwidth contention — UNQUANTIFIED**
+Blit copy competes with compute kernels for unified memory bandwidth. Latency exists but is unquantified; shifting dependent reads timing is plausible but not provable from C source.
 
 ### Critical Gap: Floating-Point Accumulation Order Change
 
 The question is not whether dependencies are correct (they are). The question is: **does the Metal driver's change from 1 encoder vs N encoders affect floating-point accumulation order at the kernel level?**
 
-| Perturbation chain | Exists? | Evidence |
+| Perturbation chain | Status | Evidence |
 |---|---|---|
-| Encoder split blocks kernel fusion | YES | `ds4_gpu_close_batch_encoder()` ends encoder scope |
-| Cache line flushing policy differs | YES | Metal unified memory at encoder boundary |
-| Kernel scheduling priorities change | MAYBE | Depends on Metal driver internals |
-| Floating-point accumulation order changes | UNPROVEN | Architecture-dependent, not provable from C code alone |
+| Encoder split blocks kernel fusion | PROVEN | `ds4_gpu_close_batch_encoder()` ends encoder scope |
+| Cache line flushing at boundary | UNPROVEN | No C-level evidence; Metal dependency ≠ cache invalidation |
+| Kernel scheduling priority change | UNPROVEN | Depends on Metal driver internals |
+| FP accumulation order changes | UNPROVEN | Architecture-dependent, not provable from C source |
 
 ### The Fundamental Logical Gap
 
 **"Command order preserved" ≠ "Floating-point accumulation order identical"**
 
-- Command order: kernel dispatches happen in the order they were added to the encoder
-- But Metal can reorder **within** a single encoder based on resource dependencies and heuristics
-- Encoder boundary changes the set of available reorderings
-- If two independent kernels share register/lcache state, their execution order within an encoder may produce different floating-point results than if they execute across boundaries
+- Command order: kernel dispatches happen in the order they were added to the encoder → PROVEN (Metal spec)
+- But Metal can reorder **within** a single encoder based on resource dependencies and heuristics → UNPROVEN (driver internals opaque)
+- Encoder boundary changes the set of available reorderings → PROVEN (fewer reorderings across boundaries)
+- FP accumulation order may differ → SPECULATION only; requires GPU microarchitecture verification
 
-This is a property of the Apple Silicon GPU microarchitecture, not provable from C source. The only way to verify is **runtime**: compare probe-on vs probe-off outputs.
+The strongest proven claim is that blit copies **change the Metal command encoding structure** (1 encoder → N encoders). What this implies for GPU execution semantics — cache state, kernel scheduling, FP arithmetic order — cannot be determined from C source alone. The only way to verify is **runtime**: compare probe-on vs probe-off outputs.
 
 ### Verdict: WEAKENED
 
