@@ -33,20 +33,25 @@ Root cause: `ds4_gpu_matmul_f16_pair_tensor` (generic verifier) vs `ds4_gpu_matm
 
 ## 2. P2 Architecture (approved, not yet implemented)
 
-### Execution model
+### Execution model (CORRECTED timing)
 ```
-=== Pass A: generic verifier ===
-1. spec_frontier_snapshot(&frontier, s)    → captures all persistent state
+=== Before Pass A: capture S0 ===
+0. Snapshot raw KV cache at spec positions [start..start+N-1] per layer ⚠️ NOT after Pass A
+1. spec_frontier_snapshot(&frontier, s)    → captures persistent state
 2. push drafts [d0..dN] to checkpoint
+
+=== Pass A: generic verifier ===
 3. metal_graph_verify_suffix_tops()        → batched verify
    └─ probe: GPU→GPU copy each layer's 5 checkpoints to snapshot buffers
+
+=== Restore S0 ===
 4. spec_frontier_restore(&frontier, s)     → restores persistent state
+5. restore raw KV cache from step-0 snapshot ⚠️ MUST happen BEFORE Pass B
 
 === Pass B: canonical sequential reference ===
-5. Snapshot raw KV cache at spec positions [start..start+N-1] (missing from spec_frontier!)
 6. metal_graph_eval_token_raw_swa() x N    → each draft token one-at-a-time
    └─ probe: GPU→GPU copy same 5 checkpoints to snapshot buffers
-7. Restore raw KV cache
+7. Restore raw KV cache (if needed for cleanup)
 
 === Comparison ===
 8. ds4_gpu_end_commands() + batched CPU readback
@@ -54,8 +59,20 @@ Root cause: `ds4_gpu_matmul_f16_pair_tensor` (generic verifier) vs `ds4_gpu_matm
 10. Report first divergence
 ```
 
-### Sanity check: ordinary decode == exact N=2 on rows 0-1
-Before interpreting any verifier divergence, verify that `metal_graph_eval_token_raw_swa(d0)` produces identical results to `metal_graph_verify_decode2_exact(d0, d1)`, row-by-row. If not, it means the matmul kernel itself is sensitive to batch width (tiling artifact), and ALL comparisons are invalid.
+### Sanity check: ordinary decode == exact N=2 on rows 0-1 (auxiliary oracle)
+Before interpreting verifier divergence, verify that `metal_graph_eval_token_raw_swa(d0)` produces identical results to `metal_graph_verify_decode2_exact(d0, d1).row0`, row-by-row.
+
+This is an **auxiliary** sanity check only. The priority hierarchy:
+
+| Relationship | Priority | If mismatch: |
+|---|---|---|
+| generic batch ↔ ordinary sequential | **authoritative** (core experiment) | Divergence IS the result — this is what we measure |
+| ordinary sequential ↔ exact N=2 | auxiliary oracle only | Stops interpreting three-way comparison; core dual-pass NOT invalidated |
+
+If ordinary != exact N=2:
+- The exact-N2 auxiliary oracle is invalid (likely kernel batch-width sensitivity)
+- Stop trusting the three-way comparison
+- But generic vs ordinary differential experiment may still be valid
 
 ## 3. Unresolved Items Before Implementation
 
