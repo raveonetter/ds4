@@ -61772,6 +61772,64 @@ static int ds4_session_eval_dspark_speculative_argmax(
         DS4_DSPARK_STATS_FINISH();
         return -1;
     }
+
+    /* Experiment hook (DSpark Metal replay-cost reduction):
+     * DS4_DSPARK_EXACT_NOREPLAY commits the verifier-generated frontier
+     * directly instead of replaying every accepted draft through ordinary
+     * decode.  Reuses the same per-row machinery as MTP prefix-1 commit:
+     * spec_frontier_commit_prefix1() installs the frontier after the accepted
+     * suffix, and metal_graph_read_spec_logits_row() reads the logits of the
+     * last accepted row from the verify block.  Only enabled when the exact
+     * verifier path is assumed canonical (see DS4_DSPARK_EXACTNESS_PROBE). */
+    if (commit_drafts > 0 && getenv("DS4_DSPARK_EXACT_NOREPLAY") != NULL) {
+        const double noreplay_t0 = stats_enabled ? now_sec() : 0.0;
+        /* Restore pre-verify state, then re-apply only the accepted suffix via
+         * the verifier's own per-row frontier capture.  spec_frontier_commit_prefix1
+         * commits frontier[commit_drafts-1]; we then read that row's logits. */
+        s->checkpoint.len = start;
+        ds4_session_dspark_capture_invalidate(s);
+        if (!spec_frontier_restore(&frontier, s) ||
+            !spec_frontier_commit_prefix1(s)) {
+            snprintf(err, errlen, "DSpark exact noreplay frontier commit failed");
+            s->checkpoint_valid = false;
+            if (stats_enabled) {
+                s->dspark_stats.verifier_errors++;
+                ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+            }
+            spec_frontier_free(&frontier);
+            DS4_DSPARK_STATS_FINISH();
+            return -1;
+        }
+        const uint32_t last_row = (uint32_t)(commit_drafts - 1);
+        if (!metal_graph_read_spec_logits_row(&s->graph, last_row, row_logits)) {
+            snprintf(err, errlen, "DSpark exact noreplay logits read failed");
+            s->checkpoint_valid = false;
+            spec_frontier_free(&frontier);
+            DS4_DSPARK_STATS_FINISH();
+            return -1;
+        }
+        memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        for (int i = 0; i < commit_drafts; i++) {
+            token_vec_push(&s->checkpoint, drafts[i]);
+            accepted[n_accept++] = drafts[i];
+            if (drafts[i] == eos_token) break;
+        }
+        s->checkpoint_valid = true;
+        ds4_session_dspark_capture_note_checkpoint(s);
+        if (stats_enabled) {
+            if (commit_drafts == draft_n) s->dspark_stats.full_accepts++;
+            else s->dspark_stats.partial_accepts++;
+            s->dspark_stats.accepted_draft_tokens += (uint64_t)commit_drafts;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
+                                      (uint32_t)commit_drafts);
+            s->dspark_stats.replay_ms += (now_sec() - noreplay_t0) * 1000.0;
+        }
+        ds4_session_dspark_scheduler_note(s, (uint32_t)commit_drafts, false,
+                                          DS4_DSPARK_SCHED_EXTRA_MS());
+        spec_frontier_free(&frontier);
+        return n_accept;
+    }
+
     const double replay_t0 = stats_enabled ? now_sec() : 0.0;
     int replayed_drafts = 0;
     for (int i = 0; i < replay_budget; i++) {

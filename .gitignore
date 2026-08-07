@@ -37,3 +37,10 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+
+# Local DSpark investigation artifacts
+monitor.log
+tests/test_exactness_probe_cpu
+
+# Local download helpers / state
+*.download
