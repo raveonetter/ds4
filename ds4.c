@@ -15289,9 +15289,23 @@ typedef struct {
     ds4_gpu_tensor *cp3_attn_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp3_attn_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp3_attn_cache[DS4_MAX_LAYER];
+    /* CP3-F producer closure fixtures.  These are captured at the real
+     * producer boundary: input/state before projection or mutation, paired
+     * F32 projection output after the producer, and exact host metadata.
+     * They are diagnostic fixtures, not ordered semantic checkpoints. */
+    ds4_gpu_tensor *cp3_attn_input[DS4_MAX_LAYER];
+    ds4_gpu_tensor *cp3_attn_pre_state_kv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *cp3_attn_pre_state_score[DS4_MAX_LAYER];
+    ds4_gpu_tensor *cp3_attn_proj_kv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *cp3_attn_proj_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp3_index_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp3_index_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp3_index_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *cp3_index_input[DS4_MAX_LAYER];
+    ds4_gpu_tensor *cp3_index_pre_state_kv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *cp3_index_pre_state_score[DS4_MAX_LAYER];
+    ds4_gpu_tensor *cp3_index_proj_kv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *cp3_index_proj_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp4[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp4_heads_raw[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp4_heads[DS4_MAX_LAYER];
@@ -15329,6 +15343,20 @@ typedef struct {
     uint8_t cp5_tail_path[DS4_MAX_LAYER];
     uint32_t cp3_n_comp[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
     uint32_t cp3_n_index[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint32_t cp3_attn_pos[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint32_t cp3_attn_counter_before[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint32_t cp3_attn_state_row[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint32_t cp3_attn_cache_row[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint8_t cp3_attn_emit[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint32_t cp3_index_pos[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint32_t cp3_index_counter_before[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint32_t cp3_index_state_row[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint32_t cp3_index_cache_row[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint8_t cp3_index_emit[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint32_t cp3_attn_pre_hooks;
+    uint32_t cp3_attn_post_hooks;
+    uint32_t cp3_index_pre_hooks;
+    uint32_t cp3_index_post_hooks;
     uint32_t attention_hooks;
     uint32_t ffn_hooks;
     uint32_t tail_input_hooks;
@@ -15360,6 +15388,8 @@ enum {
     DS4_FIRST_DIVERGENCE_CANON_ROUTED_MOE = 1u << 9,
     DS4_FIRST_DIVERGENCE_CANON_ROUTER_SELECT = 1u << 10,
     DS4_FIRST_DIVERGENCE_CANON_CP5_TAIL = 1u << 11,
+    DS4_FIRST_DIVERGENCE_CANON_CP3F_ATTN = 1u << 12,
+    DS4_FIRST_DIVERGENCE_CANON_CP3F_INDEX = 1u << 13,
 };
 
 enum {
@@ -15386,6 +15416,19 @@ static bool ds4_c2b_capture_attention_heads_raw(ds4_gpu_graph *g,
 static bool ds4_c45_capture_attention_heads_raw(ds4_gpu_graph *g,
                                                  uint32_t il,
                                                  uint32_t pos);
+static bool ds4_cp3f_capture_pre(ds4_gpu_graph *g,
+                                 bool indexer,
+                                 uint32_t il,
+                                 uint32_t row,
+                                 uint32_t pos,
+                                 uint32_t counter,
+                                 const ds4_gpu_tensor *input);
+static bool ds4_cp3f_capture_post(ds4_gpu_graph *g,
+                                  bool indexer,
+                                  uint32_t il,
+                                  uint32_t row,
+                                  const ds4_gpu_tensor *kv,
+                                  const ds4_gpu_tensor *score);
 
 /* Tensors that are temporary for chunked prefill and grouped multi-session
  * decode. The batched server serializes every operation that uses them, so one
@@ -22353,6 +22396,14 @@ static bool metal_graph_encode_decode_layer_phase(
             fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
             ok = false;
         }
+        const uint32_t cp3_capture_row = g_ds4_c45_capture &&
+            pos >= g_ds4_c45_capture->start
+                ? pos - g_ds4_c45_capture->start : 0u;
+        if (ok) {
+            ok = ds4_cp3f_capture_pre(
+                g, false, il, cp3_capture_row, pos,
+                g->layer_n_comp[il], metal_graph_attn_norm(g));
+        }
         bool comp_state_already_stored = false;
         if (ok && !metal_graph_use_reference_compressor_pair_proj()) {
             const int fused_store =
@@ -22397,6 +22448,11 @@ static bool metal_graph_encode_decode_layer_phase(
                                                      layer->attn_compressor_gate->abs_offset,
                                                      DS4_N_EMBD, comp_width,
                                                      metal_graph_attn_norm(g), 1) != 0;
+        }
+        if (ok) {
+            ok = ds4_cp3f_capture_post(
+                g, false, il, cp3_capture_row,
+                metal_graph_comp_kv_cur(g), metal_graph_comp_sc_cur(g));
         }
         DS4_METAL_PROFILE_DECODE_STAGE("compressor_proj");
         const uint32_t comp_row = g->layer_n_comp[il];
@@ -22460,6 +22516,11 @@ static bool metal_graph_encode_decode_layer_phase(
                 fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                 ok = false;
             }
+            if (ok) {
+                ok = ds4_cp3f_capture_pre(
+                    g, true, il, cp3_capture_row, pos,
+                    g->layer_n_index_comp[il], metal_graph_attn_norm(g));
+            }
             bool index_state_already_stored = false;
             if (ok && !metal_graph_use_reference_compressor_pair_proj()) {
                 const int fused_store =
@@ -22504,6 +22565,11 @@ static bool metal_graph_encode_decode_layer_phase(
                                                          layer->indexer_compressor_gate->abs_offset,
                                                          DS4_N_EMBD, index_width,
                                                          metal_graph_attn_norm(g), 1) != 0;
+            }
+            if (ok) {
+                ok = ds4_cp3f_capture_post(
+                    g, true, il, cp3_capture_row,
+                    metal_graph_comp_kv_cur(g), metal_graph_comp_sc_cur(g));
             }
             DS4_METAL_PROFILE_DECODE_STAGE("indexer_compressor_proj");
             const uint32_t index_row = g->layer_n_index_comp[il];
@@ -28448,13 +28514,16 @@ static bool metal_graph_encode_layer_attention_batch(
     } else if (ok && ratio != 0) {
         const uint32_t coff = ratio == 4 ? 2u : 1u;
         const uint32_t comp_width = coff * DS4_N_HEAD_DIM;
+        const bool canonical_cp3f_attn =
+            ds4_first_divergence_canonical_enabled(
+                DS4_FIRST_DIVERGENCE_CANON_CP3F_ATTN);
         const bool have_attn_comp = layer->attn_compressor_kv && layer->attn_compressor_gate &&
                                     layer->attn_compressor_ape && layer->attn_compressor_norm;
         if (!have_attn_comp) {
             fprintf(stderr, "ds4: Metal layer-major prefill needs attention compressor weights\n");
             ok = false;
         }
-        if (ok) {
+        if (ok && !canonical_cp3f_attn) {
             ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_kv(g),
                                              model->map,
                                              model->size,
@@ -28480,12 +28549,12 @@ static bool metal_graph_encode_layer_attention_batch(
                 }
             }
         }
-        if (ok) metal_graph_debug_dump_tensor("attn_comp_kv_raw",
+        if (ok && !canonical_cp3f_attn) metal_graph_debug_dump_tensor("attn_comp_kv_raw",
                                               metal_graph_batch_comp_kv(g),
                                               (uint64_t)comp_width * n_tokens,
                                               il,
                                               pos0);
-        if (ok) metal_graph_debug_dump_tensor("attn_comp_score_raw",
+        if (ok && !canonical_cp3f_attn) metal_graph_debug_dump_tensor("attn_comp_score_raw",
                                               metal_graph_batch_comp_sc(g),
                                               (uint64_t)comp_width * n_tokens,
                                               il,
@@ -28704,8 +28773,35 @@ static bool metal_graph_encode_layer_attention_batch(
                     }
                     ds4_gpu_tensor *kv_view = metal_graph_tensor_row_view(metal_graph_batch_comp_kv(g), t, comp_width);
                     ds4_gpu_tensor *sc_view = metal_graph_tensor_row_view(metal_graph_batch_comp_sc(g), t, comp_width);
+                    ds4_gpu_tensor *input_view = metal_graph_tensor_row_view(
+                        metal_graph_batch_attn_norm(g), t, DS4_N_EMBD);
                     const uint32_t comp_row = g->layer_n_comp[il];
-                    ok = kv_view && sc_view &&
+                    bool state_already_stored = false;
+                    ok = kv_view && sc_view && input_view &&
+                         ds4_cp3f_capture_pre(g, false, il, t, pos,
+                                              comp_row, input_view);
+                    if (ok && canonical_cp3f_attn) {
+                        const int fused_store =
+                            ds4_gpu_matmul_f16_pair_compressor_store_tensor(
+                                kv_view, sc_view,
+                                g->layer_attn_state_kv[il],
+                                g->layer_attn_state_score[il],
+                                model->map, model->size,
+                                layer->attn_compressor_kv->abs_offset,
+                                layer->attn_compressor_gate->abs_offset,
+                                layer->attn_compressor_ape->abs_offset,
+                                layer->attn_compressor_ape->type,
+                                DS4_N_EMBD, comp_width, input_view,
+                                ratio, pos);
+                        ok = fused_store > 0;
+                        state_already_stored = ok;
+                    }
+                    if (ok) {
+                        ok = ds4_cp3f_capture_post(
+                            g, false, il, t, kv_view, sc_view);
+                    }
+                    if (ok) {
+                        ok =
                          ds4_gpu_compressor_update_tensor(kv_view,
                                                             sc_view,
                                                             g->layer_attn_state_kv[il],
@@ -28730,7 +28826,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_ROPE_YARN_BETA_FAST,
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS,
-                                                            false) != 0;
+                                                            state_already_stored) != 0;
+                    }
                     if (ok && emit) {
                         ds4_gpu_tensor *comp_row_view = metal_graph_attn_comp_row_view(g, il, comp_row);
                         ok = comp_row_view &&
@@ -28756,6 +28853,7 @@ static bool metal_graph_encode_layer_attention_batch(
                     }
                     ds4_gpu_tensor_free(sc_view);
                     ds4_gpu_tensor_free(kv_view);
+                    ds4_gpu_tensor_free(input_view);
                 }
             }
             n_comp = g->layer_n_comp[il];
@@ -28764,13 +28862,16 @@ static bool metal_graph_encode_layer_attention_batch(
 
         if (ok && ratio == 4) {
             const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
+            const bool canonical_cp3f_index =
+                ds4_first_divergence_canonical_enabled(
+                    DS4_FIRST_DIVERGENCE_CANON_CP3F_INDEX);
             if (!layer->indexer_compressor_kv || !layer->indexer_compressor_gate ||
                 !layer->indexer_compressor_ape || !layer->indexer_compressor_norm ||
                 !layer->indexer_attn_q_b || !layer->indexer_proj) {
                 fprintf(stderr, "ds4: Metal layer-major prefill needs indexer weights\n");
                 ok = false;
             }
-            if (ok) {
+            if (ok && !canonical_cp3f_index) {
                 ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_kv(g),
                                                  model->map,
                                                  model->size,
@@ -28788,12 +28889,12 @@ static bool metal_graph_encode_layer_attention_batch(
                                                          metal_graph_batch_attn_norm(g),
                                                          n_tokens) != 0;
             }
-            if (ok) metal_graph_debug_dump_tensor("indexer_comp_kv_raw",
+            if (ok && !canonical_cp3f_index) metal_graph_debug_dump_tensor("indexer_comp_kv_raw",
                                                   metal_graph_batch_comp_kv(g),
                                                   (uint64_t)index_width * n_tokens,
                                                   il,
                                                   pos0);
-            if (ok) metal_graph_debug_dump_tensor("indexer_comp_score_raw",
+            if (ok && !canonical_cp3f_index) metal_graph_debug_dump_tensor("indexer_comp_score_raw",
                                                   metal_graph_batch_comp_sc(g),
                                                   (uint64_t)index_width * n_tokens,
                                                   il,
@@ -29003,8 +29104,35 @@ static bool metal_graph_encode_layer_attention_batch(
                         }
                         ds4_gpu_tensor *kv_view = metal_graph_tensor_row_view(metal_graph_batch_comp_kv(g), t, index_width);
                         ds4_gpu_tensor *sc_view = metal_graph_tensor_row_view(metal_graph_batch_comp_sc(g), t, index_width);
+                        ds4_gpu_tensor *input_view = metal_graph_tensor_row_view(
+                            metal_graph_batch_attn_norm(g), t, DS4_N_EMBD);
                         const uint32_t index_row = g->layer_n_index_comp[il];
-                        ok = kv_view && sc_view &&
+                        bool state_already_stored = false;
+                        ok = kv_view && sc_view && input_view &&
+                             ds4_cp3f_capture_pre(g, true, il, t, pos,
+                                                  index_row, input_view);
+                        if (ok && canonical_cp3f_index) {
+                            const int fused_store =
+                                ds4_gpu_matmul_f16_pair_compressor_store_tensor(
+                                    kv_view, sc_view,
+                                    g->layer_index_state_kv[il],
+                                    g->layer_index_state_score[il],
+                                    model->map, model->size,
+                                    layer->indexer_compressor_kv->abs_offset,
+                                    layer->indexer_compressor_gate->abs_offset,
+                                    layer->indexer_compressor_ape->abs_offset,
+                                    layer->indexer_compressor_ape->type,
+                                    DS4_N_EMBD, index_width, input_view,
+                                    ratio, pos);
+                            ok = fused_store > 0;
+                            state_already_stored = ok;
+                        }
+                        if (ok) {
+                            ok = ds4_cp3f_capture_post(
+                                g, true, il, t, kv_view, sc_view);
+                        }
+                        if (ok) {
+                            ok =
                              ds4_gpu_compressor_update_tensor(kv_view,
                                                                 sc_view,
                                                                 g->layer_index_state_kv[il],
@@ -29029,7 +29157,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 DS4_ROPE_YARN_BETA_FAST,
                                                                 DS4_ROPE_YARN_BETA_SLOW,
                                                                 DS4_RMS_EPS,
-                                                                false) != 0;
+                                                                state_already_stored) != 0;
+                        }
                         if (ok && emit) {
                             ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
                                     g->layer_index_comp_cache[il],
@@ -29052,6 +29181,7 @@ static bool metal_graph_encode_layer_attention_batch(
                         }
                         ds4_gpu_tensor_free(sc_view);
                         ds4_gpu_tensor_free(kv_view);
+                        ds4_gpu_tensor_free(input_view);
                     }
                 }
             }
@@ -30440,6 +30570,118 @@ static bool ds4_c2b_inline_copy(ds4_gpu_tensor *dst,
     return dst && src && bytes != 0 &&
            ds4_gpu_tensor_copy_f32_inline(dst, dst_offset,
                                           src, src_offset, bytes) != 0;
+}
+
+static ds4_c2b_capture *ds4_cp3f_active_capture(ds4_gpu_graph *g) {
+    ds4_c2b_capture *c = g_ds4_c2b_capture
+        ? g_ds4_c2b_capture : g_ds4_c45_capture;
+    return c && c->graph == g ? c : NULL;
+}
+
+/* Capture the naturally materialized CP3-F producer operands immediately
+ * before either the generic state update or the sequential fused producer.
+ * Physical buffer addresses are deliberately excluded: only semantic row
+ * placement and future-visible counters are recorded. */
+static bool ds4_cp3f_capture_pre(ds4_gpu_graph *g,
+                                 bool indexer,
+                                 uint32_t il,
+                                 uint32_t row,
+                                 uint32_t pos,
+                                 uint32_t counter,
+                                 const ds4_gpu_tensor *input) {
+    ds4_c2b_capture *c = ds4_cp3f_active_capture(g);
+    if (!c) return true;
+    if (il >= DS4_N_LAYER || row >= c->n_tokens ||
+        pos != c->start + row || !input) {
+        return false;
+    }
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    if (ratio == 0u || (indexer && ratio != 4u)) return false;
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t state_row = ratio == 4u
+        ? ratio + (pos % ratio) : pos % ratio;
+    const uint64_t input_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    ds4_gpu_tensor *dst_input = indexer
+        ? c->cp3_index_input[il] : c->cp3_attn_input[il];
+    ds4_gpu_tensor *dst_state_kv = indexer
+        ? c->cp3_index_pre_state_kv[il]
+        : c->cp3_attn_pre_state_kv[il];
+    ds4_gpu_tensor *dst_state_score = indexer
+        ? c->cp3_index_pre_state_score[il]
+        : c->cp3_attn_pre_state_score[il];
+    const ds4_gpu_tensor *src_state_kv = indexer
+        ? g->layer_index_state_kv[il] : g->layer_attn_state_kv[il];
+    const ds4_gpu_tensor *src_state_score = indexer
+        ? g->layer_index_state_score[il] : g->layer_attn_state_score[il];
+    const uint64_t state_bytes = ds4_gpu_tensor_bytes(src_state_kv);
+    const uint32_t head_dim = indexer
+        ? DS4_N_INDEXER_HEAD_DIM : DS4_N_HEAD_DIM;
+    const uint64_t expected_state_bytes =
+        (uint64_t)(coff * ratio) * (coff * head_dim) * sizeof(float);
+    if (!dst_input || !dst_state_kv || !dst_state_score ||
+        !src_state_kv || !src_state_score ||
+        state_bytes != expected_state_bytes ||
+        ds4_gpu_tensor_bytes(src_state_score) != state_bytes) {
+        return false;
+    }
+    bool ok =
+        ds4_c2b_inline_copy(dst_input, (uint64_t)row * input_bytes,
+                            input, 0, input_bytes) &&
+        ds4_c2b_inline_copy(dst_state_kv, (uint64_t)row * state_bytes,
+                            src_state_kv, 0, state_bytes) &&
+        ds4_c2b_inline_copy(dst_state_score, (uint64_t)row * state_bytes,
+                            src_state_score, 0, state_bytes);
+    if (!ok) return false;
+    uint32_t (*positions)[DS4_DSPARK_MAX_BLOCK_SIZE] = indexer
+        ? c->cp3_index_pos : c->cp3_attn_pos;
+    uint32_t (*counters)[DS4_DSPARK_MAX_BLOCK_SIZE] = indexer
+        ? c->cp3_index_counter_before : c->cp3_attn_counter_before;
+    uint32_t (*state_rows)[DS4_DSPARK_MAX_BLOCK_SIZE] = indexer
+        ? c->cp3_index_state_row : c->cp3_attn_state_row;
+    uint32_t (*cache_rows)[DS4_DSPARK_MAX_BLOCK_SIZE] = indexer
+        ? c->cp3_index_cache_row : c->cp3_attn_cache_row;
+    uint8_t (*emits)[DS4_DSPARK_MAX_BLOCK_SIZE] = indexer
+        ? c->cp3_index_emit : c->cp3_attn_emit;
+    positions[il][row] = pos;
+    counters[il][row] = counter;
+    state_rows[il][row] = state_row;
+    cache_rows[il][row] = counter;
+    emits[il][row] = (uint8_t)(((pos + 1u) % ratio) == 0u);
+    if (indexer) c->cp3_index_pre_hooks++;
+    else c->cp3_attn_pre_hooks++;
+    return true;
+}
+
+static bool ds4_cp3f_capture_post(ds4_gpu_graph *g,
+                                  bool indexer,
+                                  uint32_t il,
+                                  uint32_t row,
+                                  const ds4_gpu_tensor *kv,
+                                  const ds4_gpu_tensor *score) {
+    ds4_c2b_capture *c = ds4_cp3f_active_capture(g);
+    if (!c) return true;
+    if (il >= DS4_N_LAYER || row >= c->n_tokens || !kv || !score) {
+        return false;
+    }
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    if (ratio == 0u || (indexer && ratio != 4u)) return false;
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t head_dim = indexer
+        ? DS4_N_INDEXER_HEAD_DIM : DS4_N_HEAD_DIM;
+    const uint64_t bytes = (uint64_t)coff * head_dim * sizeof(float);
+    ds4_gpu_tensor *dst_kv = indexer
+        ? c->cp3_index_proj_kv[il] : c->cp3_attn_proj_kv[il];
+    ds4_gpu_tensor *dst_score = indexer
+        ? c->cp3_index_proj_score[il] : c->cp3_attn_proj_score[il];
+    const bool ok =
+        ds4_c2b_inline_copy(dst_kv, (uint64_t)row * bytes,
+                            kv, 0, bytes) &&
+        ds4_c2b_inline_copy(dst_score, (uint64_t)row * bytes,
+                            score, 0, bytes);
+    if (!ok) return false;
+    if (indexer) c->cp3_index_post_hooks++;
+    else c->cp3_attn_post_hooks++;
+    return true;
 }
 
 /* Both paths materialize F32 attention heads before inverse RoPE mutates the
@@ -51393,9 +51635,19 @@ static void ds4_c2b_capture_free(ds4_c2b_capture *c) {
         DS4_C2B_FREE(cp3_attn_state_kv);
         DS4_C2B_FREE(cp3_attn_state_score);
         DS4_C2B_FREE(cp3_attn_cache);
+        DS4_C2B_FREE(cp3_attn_input);
+        DS4_C2B_FREE(cp3_attn_pre_state_kv);
+        DS4_C2B_FREE(cp3_attn_pre_state_score);
+        DS4_C2B_FREE(cp3_attn_proj_kv);
+        DS4_C2B_FREE(cp3_attn_proj_score);
         DS4_C2B_FREE(cp3_index_state_kv);
         DS4_C2B_FREE(cp3_index_state_score);
         DS4_C2B_FREE(cp3_index_cache);
+        DS4_C2B_FREE(cp3_index_input);
+        DS4_C2B_FREE(cp3_index_pre_state_kv);
+        DS4_C2B_FREE(cp3_index_pre_state_score);
+        DS4_C2B_FREE(cp3_index_proj_kv);
+        DS4_C2B_FREE(cp3_index_proj_score);
         DS4_C2B_FREE(cp4);
         DS4_C2B_FREE(cp4_heads_raw);
         DS4_C2B_FREE(cp4_heads);
@@ -51642,6 +51894,9 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
         if (ratio == 0) continue;
         const uint64_t attn_state_bytes =
             ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+        const uint32_t coff = ratio == 4u ? 2u : 1u;
+        const uint64_t attn_proj_bytes =
+            (uint64_t)n_tokens * coff * DS4_N_HEAD_DIM * sizeof(float);
         if (!attn_state_bytes ||
             ds4_gpu_tensor_bytes(g->layer_attn_state_score[il]) != attn_state_bytes ||
             (n_tokens > 1u &&
@@ -51654,6 +51909,13 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
             ds4_gpu_tensor_alloc((uint64_t)n_tokens * attn_state_bytes);
         c->cp3_attn_state_score[il] =
             ds4_gpu_tensor_alloc((uint64_t)n_tokens * attn_state_bytes);
+        c->cp3_attn_input[il] = ds4_gpu_tensor_alloc(cp1_bytes);
+        c->cp3_attn_pre_state_kv[il] =
+            ds4_gpu_tensor_alloc((uint64_t)n_tokens * attn_state_bytes);
+        c->cp3_attn_pre_state_score[il] =
+            ds4_gpu_tensor_alloc((uint64_t)n_tokens * attn_state_bytes);
+        c->cp3_attn_proj_kv[il] = ds4_gpu_tensor_alloc(attn_proj_bytes);
+        c->cp3_attn_proj_score[il] = ds4_gpu_tensor_alloc(attn_proj_bytes);
 #if !DS4_GPU_ATTN_COMP_CACHE_F16
         const uint64_t attn_cache_row_bytes =
             (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
@@ -51661,6 +51923,9 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
             ds4_gpu_tensor_alloc((uint64_t)n_tokens * attn_cache_row_bytes);
 #endif
         if (!c->cp3_attn_state_kv[il] || !c->cp3_attn_state_score[il] ||
+            !c->cp3_attn_input[il] || !c->cp3_attn_pre_state_kv[il] ||
+            !c->cp3_attn_pre_state_score[il] ||
+            !c->cp3_attn_proj_kv[il] || !c->cp3_attn_proj_score[il] ||
 #if !DS4_GPU_ATTN_COMP_CACHE_F16
             !c->cp3_attn_cache[il]
 #else
@@ -51690,9 +51955,25 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
                 ds4_gpu_tensor_alloc((uint64_t)n_tokens * index_state_bytes);
             c->cp3_index_cache[il] =
                 ds4_gpu_tensor_alloc((uint64_t)n_tokens * index_row_bytes);
+            c->cp3_index_input[il] = ds4_gpu_tensor_alloc(cp1_bytes);
+            c->cp3_index_pre_state_kv[il] =
+                ds4_gpu_tensor_alloc((uint64_t)n_tokens * index_state_bytes);
+            c->cp3_index_pre_state_score[il] =
+                ds4_gpu_tensor_alloc((uint64_t)n_tokens * index_state_bytes);
+            const uint64_t index_proj_bytes =
+                (uint64_t)n_tokens * coff * DS4_N_INDEXER_HEAD_DIM *
+                sizeof(float);
+            c->cp3_index_proj_kv[il] =
+                ds4_gpu_tensor_alloc(index_proj_bytes);
+            c->cp3_index_proj_score[il] =
+                ds4_gpu_tensor_alloc(index_proj_bytes);
             if (!c->cp3_index_state_kv[il] ||
                 !c->cp3_index_state_score[il] ||
-                !c->cp3_index_cache[il]) {
+                !c->cp3_index_cache[il] || !c->cp3_index_input[il] ||
+                !c->cp3_index_pre_state_kv[il] ||
+                !c->cp3_index_pre_state_score[il] ||
+                !c->cp3_index_proj_kv[il] ||
+                !c->cp3_index_proj_score[il]) {
                 ds4_c2b_capture_free(c);
                 return false;
             }
@@ -52462,6 +52743,713 @@ static void ds4_projection_primitive_ab_print_metrics(
             " positive_delta_count=%zu negative_delta_count=%zu",
             signature->positive_delta_count,
             signature->negative_delta_count);
+}
+
+typedef struct {
+    bool executed;
+    bool input_bits_equal;
+    bool pre_state_equal;
+    bool metadata_equal;
+    bool weights_same;
+    bool generic_runtime_replay_exact;
+    bool value_equal;
+    bool placement_equal;
+    bool counter_after_equal;
+    bool state_transition_equal;
+    ds4_float_compare_result kv_comparison;
+    ds4_float_compare_result score_comparison;
+    ds4_float_compare_result state_kv_comparison;
+    ds4_float_compare_result state_score_comparison;
+    ds4_first_divergence_float_signature kv_signature;
+    ds4_first_divergence_float_signature score_signature;
+    ds4_first_divergence_float_signature state_kv_signature;
+    ds4_first_divergence_float_signature state_score_signature;
+} ds4_cp3f_producer_ab_result;
+
+static bool ds4_cp3f_read_row_f32(const ds4_gpu_tensor *tensor,
+                                  uint32_t row,
+                                  size_t values,
+                                  float *out) {
+    return tensor && out && values != 0u &&
+        ds4_gpu_tensor_read(tensor,
+                            (uint64_t)row * values * sizeof(float),
+                            out, (uint64_t)values * sizeof(float)) != 0;
+}
+
+static bool ds4_cp3f_compare_rows(const ds4_gpu_tensor *a,
+                                  const ds4_gpu_tensor *b,
+                                  uint32_t row,
+                                  size_t values,
+                                  ds4_float_compare_result *comparison,
+                                  ds4_first_divergence_float_signature *signature) {
+    if (!a || !b || !comparison || !signature || values == 0u) return false;
+    float *av = xmalloc(values * sizeof(float));
+    float *bv = xmalloc(values * sizeof(float));
+    bool ok = ds4_cp3f_read_row_f32(a, row, values, av) &&
+        ds4_cp3f_read_row_f32(b, row, values, bv) &&
+        ds4_float_compare_exact(av, bv, values, comparison) &&
+        ds4_first_divergence_float_signature_compute(
+            av, bv, values, signature);
+    free(bv);
+    free(av);
+    return ok;
+}
+
+static const char *ds4_cp3f_producer_name(bool indexer) {
+    return indexer ? "indexer" : "attention";
+}
+
+static void ds4_cp3f_source_audit(uint32_t layer, bool indexer) {
+    const uint32_t ratio = ds4_layer_compress_ratio(layer);
+    const uint32_t head_dim = indexer
+        ? DS4_N_INDEXER_HEAD_DIM : DS4_N_HEAD_DIM;
+    const uint32_t width = (ratio == 4u ? 2u : 1u) * head_dim;
+    fprintf(stderr,
+            "REAL_GENERIC_CP3F producer=%s layer=%u ratio=%u "
+            "graph=exact_F32_attn_norm_batch->"
+            "kernel_mul_mv_ext_f16_f32_r1_N_x2->materialized_F32_proj[%u]"
+            "->compressor_update_pool->persistent_F32_state "
+            "storage=input:F32,weight:F16,projection:F32,state:F32 "
+            "accumulator=F32 indexing=logical_pos:captured,physical_state_row:%s,"
+            "cache_row:layer_counter group_head_layer=producer_specific/layer%u "
+            "counters=layer_n_%s_comp_before_and_after "
+            "fusion=two_projection_dispatches_then_separate_state_update "
+            "store_load=F32_batch_projection_store_then_row_view_load_then_state_write\n",
+            ds4_cp3f_producer_name(indexer), layer, ratio, width,
+            ratio == 4u ? "ratio+pos_mod" : "pos_mod", layer,
+            indexer ? "index" : "attn");
+    fprintf(stderr,
+            "REAL_SEQ_CP3F producer=%s layer=%u ratio=%u "
+            "graph=exact_F32_attn_norm_row->"
+            "kernel_mul_mv_f16_f32_pair_compressor_store_4->"
+            "materialized_F32_pair[%u]+state_store->compressor_update_pool->"
+            "persistent_F32_state "
+            "storage=input:F32,weight:F16,projection:F32,state:F32 "
+            "accumulator=F32 indexing=logical_pos:captured,physical_state_row:%s,"
+            "cache_row:layer_counter group_head_layer=producer_specific/layer%u "
+            "counters=layer_n_%s_comp_before_and_after "
+            "fusion=paired_single_MV_plus_exact_projection_state_store "
+            "store_load=F32_projection_store_and_exact_reload_inside_fused_kernel"
+            "_then_ordinary_state_update\n",
+            ds4_cp3f_producer_name(indexer), layer, ratio, width,
+            ratio == 4u ? "ratio+pos_mod" : "pos_mod", layer,
+            indexer ? "index" : "attn");
+}
+
+static bool ds4_cp3f_input_close(
+        const ds4_c2b_capture *generic,
+        const ds4_c2b_capture *sequential,
+        const ds4_layer_weights *layer_weights,
+        uint32_t layer,
+        uint32_t row,
+        bool indexer,
+        ds4_cp3f_producer_ab_result *result) {
+    if (!generic || !sequential || !layer_weights || !result ||
+        layer >= DS4_N_LAYER || row >= generic->n_tokens ||
+        generic->n_tokens != sequential->n_tokens) {
+        return false;
+    }
+    memset(result, 0, sizeof(*result));
+    const uint32_t ratio = ds4_layer_compress_ratio(layer);
+    if (ratio == 0u || (indexer && ratio != 4u)) return false;
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t head_dim = indexer
+        ? DS4_N_INDEXER_HEAD_DIM : DS4_N_HEAD_DIM;
+    const size_t state_values =
+        (size_t)(coff * ratio) * (coff * head_dim);
+    const ds4_gpu_tensor *input_a = indexer
+        ? generic->cp3_index_input[layer]
+        : generic->cp3_attn_input[layer];
+    const ds4_gpu_tensor *input_b = indexer
+        ? sequential->cp3_index_input[layer]
+        : sequential->cp3_attn_input[layer];
+    const ds4_gpu_tensor *state_kv_a = indexer
+        ? generic->cp3_index_pre_state_kv[layer]
+        : generic->cp3_attn_pre_state_kv[layer];
+    const ds4_gpu_tensor *state_kv_b = indexer
+        ? sequential->cp3_index_pre_state_kv[layer]
+        : sequential->cp3_attn_pre_state_kv[layer];
+    const ds4_gpu_tensor *state_score_a = indexer
+        ? generic->cp3_index_pre_state_score[layer]
+        : generic->cp3_attn_pre_state_score[layer];
+    const ds4_gpu_tensor *state_score_b = indexer
+        ? sequential->cp3_index_pre_state_score[layer]
+        : sequential->cp3_attn_pre_state_score[layer];
+    ds4_float_compare_result input_cmp, state_kv_cmp, state_score_cmp;
+    ds4_first_divergence_float_signature input_sig, state_kv_sig,
+        state_score_sig;
+    const bool comparisons_ok =
+        ds4_cp3f_compare_rows(input_a, input_b, row, DS4_N_EMBD,
+                              &input_cmp, &input_sig) &&
+        ds4_cp3f_compare_rows(state_kv_a, state_kv_b, row, state_values,
+                              &state_kv_cmp, &state_kv_sig) &&
+        ds4_cp3f_compare_rows(state_score_a, state_score_b, row,
+                              state_values, &state_score_cmp,
+                              &state_score_sig);
+    if (!comparisons_ok) return false;
+    result->input_bits_equal = input_cmp.bit_exact;
+    result->pre_state_equal = state_kv_cmp.bit_exact &&
+        state_score_cmp.bit_exact;
+    const uint32_t (*pos_a)[DS4_DSPARK_MAX_BLOCK_SIZE] = indexer
+        ? generic->cp3_index_pos : generic->cp3_attn_pos;
+    const uint32_t (*pos_b)[DS4_DSPARK_MAX_BLOCK_SIZE] = indexer
+        ? sequential->cp3_index_pos : sequential->cp3_attn_pos;
+    const uint32_t (*counter_a)[DS4_DSPARK_MAX_BLOCK_SIZE] = indexer
+        ? generic->cp3_index_counter_before
+        : generic->cp3_attn_counter_before;
+    const uint32_t (*counter_b)[DS4_DSPARK_MAX_BLOCK_SIZE] = indexer
+        ? sequential->cp3_index_counter_before
+        : sequential->cp3_attn_counter_before;
+    const uint32_t (*state_row_a)[DS4_DSPARK_MAX_BLOCK_SIZE] = indexer
+        ? generic->cp3_index_state_row : generic->cp3_attn_state_row;
+    const uint32_t (*state_row_b)[DS4_DSPARK_MAX_BLOCK_SIZE] = indexer
+        ? sequential->cp3_index_state_row : sequential->cp3_attn_state_row;
+    const uint32_t (*cache_row_a)[DS4_DSPARK_MAX_BLOCK_SIZE] = indexer
+        ? generic->cp3_index_cache_row : generic->cp3_attn_cache_row;
+    const uint32_t (*cache_row_b)[DS4_DSPARK_MAX_BLOCK_SIZE] = indexer
+        ? sequential->cp3_index_cache_row : sequential->cp3_attn_cache_row;
+    const uint8_t (*emit_a)[DS4_DSPARK_MAX_BLOCK_SIZE] = indexer
+        ? generic->cp3_index_emit : generic->cp3_attn_emit;
+    const uint8_t (*emit_b)[DS4_DSPARK_MAX_BLOCK_SIZE] = indexer
+        ? sequential->cp3_index_emit : sequential->cp3_attn_emit;
+    result->metadata_equal =
+        pos_a[layer][row] == pos_b[layer][row] &&
+        counter_a[layer][row] == counter_b[layer][row] &&
+        state_row_a[layer][row] == state_row_b[layer][row] &&
+        cache_row_a[layer][row] == cache_row_b[layer][row] &&
+        emit_a[layer][row] == emit_b[layer][row];
+    const ds4_tensor *kv_weight = indexer
+        ? layer_weights->indexer_compressor_kv
+        : layer_weights->attn_compressor_kv;
+    const ds4_tensor *score_weight = indexer
+        ? layer_weights->indexer_compressor_gate
+        : layer_weights->attn_compressor_gate;
+    const ds4_tensor *ape = indexer
+        ? layer_weights->indexer_compressor_ape
+        : layer_weights->attn_compressor_ape;
+    const ds4_tensor *norm = indexer
+        ? layer_weights->indexer_compressor_norm
+        : layer_weights->attn_compressor_norm;
+    result->weights_same = kv_weight && score_weight && ape && norm &&
+        kv_weight->type == DS4_TENSOR_F16 &&
+        score_weight->type == DS4_TENSOR_F16 &&
+        kv_weight->dim[0] == DS4_N_EMBD &&
+        score_weight->dim[0] == DS4_N_EMBD &&
+        kv_weight->dim[1] == (uint64_t)coff * head_dim &&
+        score_weight->dim[1] == (uint64_t)coff * head_dim;
+    const char *first = "NONE";
+    const char *first_producer = "NONE";
+    if (!result->input_bits_equal) first = "attention_input";
+    else if (!state_kv_cmp.bit_exact) first = "pre_state_kv";
+    else if (!state_score_cmp.bit_exact) first = "pre_state_score";
+    else if (!result->metadata_equal) first = "position_or_counter";
+    else if (!result->weights_same) first = "weights_or_constants";
+    if (strcmp(first, "attention_input") == 0) {
+        first_producer = "layer2_attention_norm_producer";
+    } else if (strcmp(first, "pre_state_kv") == 0 ||
+               strcmp(first, "pre_state_score") == 0) {
+        first_producer = "restored_S0_or_previous_compressor_transition";
+    } else if (strcmp(first, "position_or_counter") == 0) {
+        first_producer = "frontier_position_driver";
+    } else if (strcmp(first, "weights_or_constants") == 0) {
+        first_producer = "model_weight_binding";
+    }
+    fprintf(stderr,
+            "CP3F_INPUT_AB producer=%s layer=%u row=%u "
+            "attention_input=%s pre_state_kv=%s pre_state_score=%s "
+            "raw_kv=NOT_CONSUMED weights_same=%s indices_same=%s "
+            "compressor_state_same=%s frontier_same=%s "
+            "group_head_layer_indices_same=%s\n",
+            ds4_cp3f_producer_name(indexer), layer, row,
+            result->input_bits_equal ? "EXACT" : "MISMATCH",
+            state_kv_cmp.bit_exact ? "EXACT" : "MISMATCH",
+            state_score_cmp.bit_exact ? "EXACT" : "MISMATCH",
+            result->weights_same ? "PASS" : "FAIL",
+            result->metadata_equal ? "PASS" : "FAIL",
+            result->pre_state_equal ? "PASS" : "FAIL",
+            counter_a[layer][row] == counter_b[layer][row]
+                ? "PASS" : "FAIL",
+            pos_a[layer][row] == pos_b[layer][row]
+                ? "PASS" : "FAIL");
+    fprintf(stderr, "CP3F_INPUT_BITS_EQUAL %s\n",
+            result->input_bits_equal && result->pre_state_equal
+                ? "PASS" : "FAIL");
+    fprintf(stderr, "CP3F_METADATA_EQUAL %s\n",
+            result->metadata_equal ? "PASS" : "FAIL");
+    fprintf(stderr,
+            "CP3F_INPUT_FIRST_DIVERGENCE input=%s producer=%s\n",
+            first, first_producer);
+    return result->input_bits_equal && result->pre_state_equal &&
+        result->metadata_equal && result->weights_same;
+}
+
+static bool ds4_cp3f_generic_replay(
+        ds4_session *s,
+        const ds4_c2b_capture *capture,
+        uint32_t layer,
+        uint32_t row,
+        bool indexer,
+        ds4_cp3f_producer_ab_result *result) {
+    const ds4_layer_weights *lw = &s->engine->weights.layer[layer];
+    const ds4_tensor *kv_weight = indexer
+        ? lw->indexer_compressor_kv : lw->attn_compressor_kv;
+    const ds4_tensor *score_weight = indexer
+        ? lw->indexer_compressor_gate : lw->attn_compressor_gate;
+    const ds4_tensor *ape = indexer
+        ? lw->indexer_compressor_ape : lw->attn_compressor_ape;
+    const ds4_tensor *norm = indexer
+        ? lw->indexer_compressor_norm : lw->attn_compressor_norm;
+    const ds4_gpu_tensor *input = indexer
+        ? capture->cp3_index_input[layer]
+        : capture->cp3_attn_input[layer];
+    const ds4_gpu_tensor *runtime_kv = indexer
+        ? capture->cp3_index_proj_kv[layer]
+        : capture->cp3_attn_proj_kv[layer];
+    const ds4_gpu_tensor *runtime_score = indexer
+        ? capture->cp3_index_proj_score[layer]
+        : capture->cp3_attn_proj_score[layer];
+    const ds4_gpu_tensor *pre_state_kv = indexer
+        ? capture->cp3_index_pre_state_kv[layer]
+        : capture->cp3_attn_pre_state_kv[layer];
+    const ds4_gpu_tensor *pre_state_score = indexer
+        ? capture->cp3_index_pre_state_score[layer]
+        : capture->cp3_attn_pre_state_score[layer];
+    const ds4_gpu_tensor *runtime_state_kv = indexer
+        ? capture->cp3_index_state_kv[layer]
+        : capture->cp3_attn_state_kv[layer];
+    const ds4_gpu_tensor *runtime_state_score = indexer
+        ? capture->cp3_index_state_score[layer]
+        : capture->cp3_attn_state_score[layer];
+    const uint32_t ratio = ds4_layer_compress_ratio(layer);
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t head_dim = indexer
+        ? DS4_N_INDEXER_HEAD_DIM : DS4_N_HEAD_DIM;
+    const uint32_t width = coff * head_dim;
+    const size_t state_values = (size_t)(coff * ratio) * width;
+    const uint32_t rows = capture->n_tokens;
+    const uint32_t pos = indexer
+        ? capture->cp3_index_pos[layer][row]
+        : capture->cp3_attn_pos[layer][row];
+    const uint32_t counter = indexer
+        ? capture->cp3_index_counter_before[layer][row]
+        : capture->cp3_attn_counter_before[layer][row];
+    const bool emit = indexer
+        ? capture->cp3_index_emit[layer][row] != 0u
+        : capture->cp3_attn_emit[layer][row] != 0u;
+    ds4_gpu_tensor *replay_kv = ds4_gpu_tensor_alloc(
+        (uint64_t)rows * width * sizeof(float));
+    ds4_gpu_tensor *replay_score = ds4_gpu_tensor_alloc(
+        (uint64_t)rows * width * sizeof(float));
+    ds4_gpu_tensor *replay_state_kv = ds4_gpu_tensor_alloc(
+        (uint64_t)state_values * sizeof(float));
+    ds4_gpu_tensor *replay_state_score = ds4_gpu_tensor_alloc(
+        (uint64_t)state_values * sizeof(float));
+    const uint32_t update_row = indexer ? counter : 0u;
+    uint64_t cache_rows = emit ? (uint64_t)update_row + 1u : 1u;
+    ds4_gpu_tensor *replay_cache = ds4_gpu_tensor_alloc(
+        cache_rows * head_dim * sizeof(float));
+    bool ok = replay_kv && replay_score && replay_state_kv &&
+        replay_state_score && replay_cache && kv_weight && score_weight &&
+        ape && norm;
+    if (ok) {
+        ok = ds4_gpu_matmul_f16_tensor(
+                 replay_kv, s->engine->model.map, s->engine->model.size,
+                 kv_weight->abs_offset, DS4_N_EMBD, width, input, rows) != 0 &&
+             ds4_gpu_matmul_f16_tensor(
+                 replay_score, s->engine->model.map, s->engine->model.size,
+                 score_weight->abs_offset, DS4_N_EMBD, width, input,
+                 rows) != 0;
+    }
+    ds4_float_compare_result replay_kv_cmp, replay_score_cmp,
+        replay_state_kv_cmp, replay_state_score_cmp;
+    ds4_first_divergence_float_signature replay_kv_sig,
+        replay_score_sig, replay_state_kv_sig, replay_state_score_sig;
+    if (ok) {
+        ok = ds4_cp3f_compare_rows(
+                 replay_kv, runtime_kv, row, width,
+                 &replay_kv_cmp, &replay_kv_sig) &&
+             ds4_cp3f_compare_rows(
+                 replay_score, runtime_score, row, width,
+                 &replay_score_cmp, &replay_score_sig);
+    }
+    if (ok) {
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) {
+            ok = ds4_c2b_inline_copy(
+                     replay_state_kv, 0, pre_state_kv,
+                     (uint64_t)row * state_values * sizeof(float),
+                     (uint64_t)state_values * sizeof(float)) &&
+                 ds4_c2b_inline_copy(
+                     replay_state_score, 0, pre_state_score,
+                     (uint64_t)row * state_values * sizeof(float),
+                     (uint64_t)state_values * sizeof(float));
+        }
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+    }
+    ds4_gpu_tensor *kv_row = ok
+        ? metal_graph_tensor_row_view(replay_kv, row, width) : NULL;
+    ds4_gpu_tensor *score_row = ok
+        ? metal_graph_tensor_row_view(replay_score, row, width) : NULL;
+    if (ok) {
+        const bool compressed = true;
+        const float freq_base = layer_rope_freq_base(layer);
+        const float freq_scale = layer_rope_freq_scale(layer);
+        const float ext_factor = compressed && DS4_ROPE_SCALE_FACTOR > 1.0f
+            ? 1.0f : 0.0f;
+        float attn_factor = 1.0f;
+        if (ext_factor != 0.0f && freq_scale > 0.0f) {
+            attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        ok = kv_row && score_row &&
+            ds4_gpu_compressor_update_tensor(
+                kv_row, score_row, replay_state_kv, replay_state_score,
+                replay_cache, s->engine->model.map, s->engine->model.size,
+                ape->abs_offset, ape->type, norm->abs_offset, norm->type,
+                head_dim, ratio, pos, update_row, DS4_N_ROT,
+                (uint32_t)DS4_ROPE_ORIG_CTX, freq_base, freq_scale,
+                ext_factor, attn_factor, DS4_ROPE_YARN_BETA_FAST,
+                DS4_ROPE_YARN_BETA_SLOW, DS4_RMS_EPS, false) != 0;
+    }
+    ds4_gpu_tensor_free(score_row);
+    ds4_gpu_tensor_free(kv_row);
+    if (ok) {
+        ok = ds4_cp3f_compare_rows(
+                 replay_state_kv, runtime_state_kv, row, state_values,
+                 &replay_state_kv_cmp, &replay_state_kv_sig) &&
+             ds4_cp3f_compare_rows(
+                 replay_state_score, runtime_state_score, row, state_values,
+                 &replay_state_score_cmp, &replay_state_score_sig);
+    }
+    result->generic_runtime_replay_exact = ok &&
+        replay_kv_cmp.bit_exact && replay_score_cmp.bit_exact &&
+        replay_state_kv_cmp.bit_exact && replay_state_score_cmp.bit_exact;
+    fprintf(stderr,
+            "CP3F_GENERIC_RUNTIME_REPLAY producer=%s layer=%u row=%u "
+            "projection_kv=%s projection_score=%s state_kv=%s "
+            "state_score=%s result=%s\n",
+            ds4_cp3f_producer_name(indexer), layer, row,
+            ok && replay_kv_cmp.bit_exact ? "EXACT" : "MISMATCH",
+            ok && replay_score_cmp.bit_exact ? "EXACT" : "MISMATCH",
+            ok && replay_state_kv_cmp.bit_exact ? "EXACT" : "MISMATCH",
+            ok && replay_state_score_cmp.bit_exact ? "EXACT" : "MISMATCH",
+            result->generic_runtime_replay_exact ? "EXACT" : "MISMATCH");
+    ds4_gpu_tensor_free(replay_cache);
+    ds4_gpu_tensor_free(replay_state_score);
+    ds4_gpu_tensor_free(replay_state_kv);
+    ds4_gpu_tensor_free(replay_score);
+    ds4_gpu_tensor_free(replay_kv);
+    return result->generic_runtime_replay_exact;
+}
+
+static bool ds4_cp3f_producer_ab_run(
+        ds4_session *s,
+        const ds4_c2b_capture *generic,
+        const ds4_c2b_capture *sequential,
+        uint32_t layer,
+        uint32_t row,
+        bool indexer,
+        ds4_cp3f_producer_ab_result *result) {
+    if (!s || !generic || !sequential || !result) return false;
+    ds4_cp3f_source_audit(layer, indexer);
+    if (!ds4_cp3f_input_close(
+            generic, sequential, &s->engine->weights.layer[layer],
+            layer, row, indexer, result)) {
+        fputs("CP3F_PRIMITIVE_AB result=SKIPPED reason=input_closure_failed\n",
+              stderr);
+        fputs("CP3F_CAUSE_CLASS numerical_arithmetic=UNKNOWN "
+              "state_transition=UNKNOWN indexing_or_placement=UNKNOWN\n",
+              stderr);
+        return false;
+    }
+    if (!ds4_cp3f_generic_replay(
+            s, generic, layer, row, indexer, result)) {
+        fputs("CP3F_PRIMITIVE_AB result=SKIPPED "
+              "reason=generic_runtime_replay_failed\n", stderr);
+        return false;
+    }
+    const uint32_t ratio = ds4_layer_compress_ratio(layer);
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t head_dim = indexer
+        ? DS4_N_INDEXER_HEAD_DIM : DS4_N_HEAD_DIM;
+    const size_t width = (size_t)coff * head_dim;
+    const size_t state_values = (size_t)(coff * ratio) * width;
+    const ds4_gpu_tensor *generic_kv = indexer
+        ? generic->cp3_index_proj_kv[layer]
+        : generic->cp3_attn_proj_kv[layer];
+    const ds4_gpu_tensor *generic_score = indexer
+        ? generic->cp3_index_proj_score[layer]
+        : generic->cp3_attn_proj_score[layer];
+    const ds4_gpu_tensor *seq_kv = indexer
+        ? sequential->cp3_index_proj_kv[layer]
+        : sequential->cp3_attn_proj_kv[layer];
+    const ds4_gpu_tensor *seq_score = indexer
+        ? sequential->cp3_index_proj_score[layer]
+        : sequential->cp3_attn_proj_score[layer];
+    const ds4_gpu_tensor *generic_state_kv = indexer
+        ? generic->cp3_index_state_kv[layer]
+        : generic->cp3_attn_state_kv[layer];
+    const ds4_gpu_tensor *seq_state_kv = indexer
+        ? sequential->cp3_index_state_kv[layer]
+        : sequential->cp3_attn_state_kv[layer];
+    const ds4_gpu_tensor *generic_state_score = indexer
+        ? generic->cp3_index_state_score[layer]
+        : generic->cp3_attn_state_score[layer];
+    const ds4_gpu_tensor *seq_state_score = indexer
+        ? sequential->cp3_index_state_score[layer]
+        : sequential->cp3_attn_state_score[layer];
+    bool ok = ds4_cp3f_compare_rows(
+                  generic_kv, seq_kv, row, width,
+                  &result->kv_comparison, &result->kv_signature) &&
+              ds4_cp3f_compare_rows(
+                  generic_score, seq_score, row, width,
+                  &result->score_comparison, &result->score_signature) &&
+              ds4_cp3f_compare_rows(
+                  generic_state_kv, seq_state_kv, row, state_values,
+                  &result->state_kv_comparison,
+                  &result->state_kv_signature) &&
+              ds4_cp3f_compare_rows(
+                  generic_state_score, seq_state_score, row, state_values,
+                  &result->state_score_comparison,
+                  &result->state_score_signature);
+    if (!ok) return false;
+    result->value_equal = result->kv_comparison.bit_exact &&
+        result->score_comparison.bit_exact;
+    result->placement_equal = result->metadata_equal;
+    result->counter_after_equal = indexer
+        ? generic->cp3_n_index[layer][row] ==
+              sequential->cp3_n_index[layer][row]
+        : generic->cp3_n_comp[layer][row] ==
+              sequential->cp3_n_comp[layer][row];
+    result->state_transition_equal = result->state_kv_comparison.bit_exact &&
+        result->state_score_comparison.bit_exact &&
+        result->counter_after_equal;
+    result->executed = true;
+    const struct {
+        const char *name;
+        size_t elements;
+        const ds4_float_compare_result *comparison;
+        const ds4_first_divergence_float_signature *signature;
+    } objects[] = {
+        {"projected_kv", width, &result->kv_comparison,
+         &result->kv_signature},
+        {"projected_score", width, &result->score_comparison,
+         &result->score_signature},
+        {indexer ? "index_state_kv" : "attn_state_kv", state_values,
+         &result->state_kv_comparison,
+         &result->state_kv_signature},
+        {indexer ? "index_state_score" : "attn_state_score", state_values,
+         &result->state_score_comparison,
+         &result->state_score_signature},
+    };
+    for (size_t i = 0; i < sizeof(objects) / sizeof(objects[0]); i++) {
+        fprintf(stderr,
+                "CP3F_PRIMITIVE_AB producer=%s subobject=%s result=%s "
+                "elements=%zu",
+                ds4_cp3f_producer_name(indexer), objects[i].name,
+                objects[i].comparison->bit_exact ? "EXACT" : "MISMATCH",
+                objects[i].elements);
+        if (objects[i].comparison->bit_exact) {
+            fputs(" mismatch_count=0 first_index=none generic_bits=none "
+                  "sequential_bits=none max_abs=0 max_rel=0 max_ulp=0",
+                  stderr);
+        } else {
+            ds4_projection_primitive_ab_print_metrics(
+                objects[i].comparison, objects[i].signature);
+        }
+        fputc('\n', stderr);
+    }
+    fprintf(stderr,
+            "CP3F_VALUE_AB producer=%s same_semantic_value=%s\n",
+            ds4_cp3f_producer_name(indexer),
+            result->value_equal ? "YES" : "NO");
+    fprintf(stderr,
+            "CP3F_PLACEMENT_AB producer=%s same_state_row=%s "
+            "same_cache_row=%s result=%s\n",
+            ds4_cp3f_producer_name(indexer),
+            result->placement_equal ? "YES" : "NO",
+            result->placement_equal ? "YES" : "NO",
+            result->placement_equal ? "EXACT" : "MISMATCH");
+    fprintf(stderr,
+            "CP3F_STATE_TRANSITION_AB producer=%s same_previous_state=YES "
+            "same_next_counters=%s next_state_kv_bits=%s "
+            "next_state_score_bits=%s result=%s\n",
+            ds4_cp3f_producer_name(indexer),
+            result->counter_after_equal ? "YES" : "NO",
+            result->state_kv_comparison.bit_exact ? "EXACT" : "MISMATCH",
+            result->state_score_comparison.bit_exact ? "EXACT" : "MISMATCH",
+            result->state_transition_equal ? "EXACT" : "MISMATCH");
+    const bool state_transition_cause = result->value_equal &&
+        result->placement_equal && !result->state_transition_equal;
+    fprintf(stderr,
+            "CP3F_CAUSE_CLASS numerical_arithmetic=%s state_transition=%s "
+            "indexing_or_placement=%s\n",
+            result->value_equal ? "NO" : "YES",
+            state_transition_cause ? "YES" :
+                result->placement_equal ? "NO" : "UNKNOWN",
+            result->placement_equal ? "NO" : "YES");
+    return true;
+}
+
+static const ds4_first_divergence_snapshot *
+ds4_cp3f_find_snapshot(const ds4_first_divergence_capture *capture,
+                       uint32_t row,
+                       uint32_t layer,
+                       ds4_first_divergence_checkpoint checkpoint,
+                       const char *subobject) {
+    if (!capture || !subobject) return NULL;
+    for (size_t i = 0; i < capture->count; i++) {
+        const ds4_first_divergence_snapshot *snapshot =
+            &capture->snapshots[i];
+        if (snapshot->row == row && snapshot->layer == layer &&
+            snapshot->checkpoint == checkpoint &&
+            strcmp(snapshot->subobject, subobject) == 0) {
+            return snapshot;
+        }
+    }
+    return NULL;
+}
+
+static bool ds4_cp3f_snapshot_equal(
+        const ds4_first_divergence_snapshot *a,
+        const ds4_first_divergence_snapshot *b) {
+    if (!a || !b || a->kind != b->kind ||
+        a->element_count != b->element_count ||
+        a->element_size != b->element_size ||
+        a->element_count > SIZE_MAX / a->element_size) {
+        return false;
+    }
+    const size_t bytes = a->element_count * a->element_size;
+    return bytes == 0u || memcmp(a->data, b->data, bytes) == 0;
+}
+
+static bool ds4_cp3f_object_exact(
+        const ds4_first_divergence_capture *pass_a,
+        const ds4_first_divergence_capture *pass_b,
+        uint32_t row,
+        uint32_t layer,
+        ds4_first_divergence_checkpoint checkpoint,
+        const char *subobject) {
+    return ds4_cp3f_snapshot_equal(
+        ds4_cp3f_find_snapshot(pass_a, row, layer, checkpoint, subobject),
+        ds4_cp3f_find_snapshot(pass_b, row, layer, checkpoint, subobject));
+}
+
+static bool ds4_cp3f_regression_gate(
+        const ds4_first_divergence_capture *pass_a,
+        const ds4_first_divergence_capture *pass_b) {
+    bool cp2_exact = true, cp4_exact = true, cp5_exact = true;
+    bool cp2_seen = false, cp4_seen = false, cp5_seen = false;
+    bool prefix_exact = true;
+    if (!pass_a || !pass_b) return false;
+    for (size_t i = 0; i < pass_a->count; i++) {
+        const ds4_first_divergence_snapshot *a = &pass_a->snapshots[i];
+        if (a->row != 0u || a->layer > 2u) continue;
+        const bool before_cp3f = a->layer < 2u ||
+            (a->layer == 2u && a->checkpoint < DS4_FIRST_DIVERGENCE_CP3_F);
+        if (!before_cp3f) continue;
+        const ds4_first_divergence_snapshot *b = ds4_cp3f_find_snapshot(
+            pass_b, a->row, a->layer, a->checkpoint, a->subobject);
+        const bool exact = ds4_cp3f_snapshot_equal(a, b);
+        prefix_exact = prefix_exact && exact;
+        if (a->checkpoint >= DS4_FIRST_DIVERGENCE_CP2_Q &&
+            a->checkpoint <= DS4_FIRST_DIVERGENCE_CP2_KV_R) {
+            cp2_seen = true;
+            cp2_exact = cp2_exact && exact;
+        } else if (a->checkpoint >= DS4_FIRST_DIVERGENCE_CP4_HEADS_RAW &&
+                   a->checkpoint < DS4_FIRST_DIVERGENCE_CP5) {
+            cp4_seen = true;
+            cp4_exact = cp4_exact && exact;
+        } else if (a->checkpoint == DS4_FIRST_DIVERGENCE_CP5) {
+            cp5_seen = true;
+            cp5_exact = cp5_exact && exact;
+        }
+    }
+    const bool ok = prefix_exact && cp2_seen && cp4_seen && cp5_seen &&
+        cp2_exact && cp4_exact && cp5_exact;
+    fprintf(stderr,
+            "CP3F_REGRESSION_GATE CP2=%s CP4=%s CP5=%s "
+            "pre_CP3F_prefix=%s result=%s\n",
+            cp2_seen && cp2_exact ? "EXACT" : "FAIL",
+            cp4_seen && cp4_exact ? "EXACT" : "FAIL",
+            cp5_seen && cp5_exact ? "EXACT" : "FAIL",
+            prefix_exact ? "EXACT" : "MISMATCH", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static bool ds4_c2b_restore_s0(ds4_session *s,
+                               ds4_spec_frontier *frontier,
+                               const ds4_c2b_raw_s0 *raw,
+                               uint32_t start,
+                               ds4_gpu_tensor *batch_cur,
+                               ds4_gpu_tensor *batch_next);
+
+static bool ds4_c2b_run_pass(
+        ds4_session *s,
+        const int *drafts,
+        uint32_t n_tokens,
+        uint32_t start,
+        ds4_c2b_capture *capture,
+        ds4_c2b_observable *observable,
+        const uint32_t n_comp_before[DS4_MAX_LAYER],
+        const uint32_t n_index_before[DS4_MAX_LAYER]);
+
+static bool ds4_cp3f_run_generic_variant(
+        ds4_session *s,
+        ds4_spec_frontier *frontier,
+        const ds4_c2b_raw_s0 *raw,
+        const int *forced_tokens,
+        uint32_t n_tokens,
+        uint32_t start,
+        ds4_gpu_tensor *batch_cur,
+        ds4_gpu_tensor *batch_next,
+        const uint32_t n_comp_before[DS4_MAX_LAYER],
+        const uint32_t n_index_before[DS4_MAX_LAYER],
+        uint32_t mask,
+        const char *variant,
+        ds4_c2b_capture *capture,
+        ds4_c2b_observable *a0,
+        ds4_c2b_observable *a1,
+        ds4_c2b_observable *a2,
+        ds4_first_divergence_capture *materialized) {
+    if (!s || !frontier || !raw || !forced_tokens || !variant || !capture ||
+        !a0 || !a1 || !a2 || !materialized) {
+        return false;
+    }
+    ds4_c2b_observable_free(a0);
+    ds4_c2b_observable_free(a1);
+    ds4_c2b_observable_free(a2);
+    const bool restore0 = ds4_c2b_restore_s0(
+        s, frontier, raw, start, batch_cur, batch_next);
+    g_ds4_first_divergence_canonical_mask = restore0 ? mask : 0u;
+    const bool run0 = restore0 && ds4_c2b_run_pass(
+        s, forced_tokens, n_tokens, start, NULL, a0,
+        n_comp_before, n_index_before);
+    const bool restore1 = run0 && ds4_c2b_restore_s0(
+        s, frontier, raw, start, batch_cur, batch_next);
+    const bool run1 = restore1 && ds4_c2b_run_pass(
+        s, forced_tokens, n_tokens, start, NULL, a1,
+        n_comp_before, n_index_before);
+    const bool restore2 = run1 && ds4_c2b_restore_s0(
+        s, frontier, raw, start, batch_cur, batch_next);
+    const bool run2 = restore2 && ds4_c2b_run_pass(
+        s, forced_tokens, n_tokens, start, capture, a2,
+        n_comp_before, n_index_before);
+    g_ds4_first_divergence_canonical_mask = 0u;
+    const bool control = run0 && run1 && ds4_c2b_compare_observables(
+        "CP3F_A0_vs_A1", a1, a0, start, n_tokens,
+        s->graph.raw_cap);
+    const bool probe = run0 && run2 && ds4_c2b_compare_observables(
+        "CP3F_A0_vs_A2", a2, a0, start, n_tokens,
+        s->graph.raw_cap);
+    const bool ok = control && probe &&
+        ds4_first_divergence_capture_init(materialized, variant) &&
+        ds4_c2b_materialize_capture(capture, materialized);
+    fprintf(stderr,
+            "CP3F_C2B variant=%s control=%s probe=%s result=%s\n",
+            variant, control ? "PASS" : "FAIL",
+            probe ? "PASS" : "FAIL", ok ? "PASS" : "FAIL");
+    return ok;
 }
 
 /* Re-run only layer-0 Q-A on the real Pass-A CP1 bits.  The generic call
@@ -53602,6 +54590,10 @@ static bool ds4_c2b_run_pass(ds4_session *s,
     if (capture) {
         capture->attention_hooks = 0;
         capture->ffn_hooks = 0;
+        capture->cp3_attn_pre_hooks = 0;
+        capture->cp3_attn_post_hooks = 0;
+        capture->cp3_index_pre_hooks = 0;
+        capture->cp3_index_post_hooks = 0;
     }
     g_ds4_c2b_capture = capture;
     bool ok = metal_graph_verify_suffix_tops(
@@ -53611,8 +54603,19 @@ static bool ds4_c2b_run_pass(ds4_session *s,
         n_tokens > 1u ? row_tops : NULL, NULL, NULL);
     g_ds4_c2b_capture = NULL;
     if (ok && capture) {
+        uint32_t expected_cp3_attn_hooks = 0u;
+        uint32_t expected_cp3_index_hooks = 0u;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (ratio != 0u) expected_cp3_attn_hooks += n_tokens;
+            if (ratio == 4u) expected_cp3_index_hooks += n_tokens;
+        }
         ok = capture->attention_hooks == DS4_N_LAYER &&
-             capture->ffn_hooks == DS4_N_LAYER;
+             capture->ffn_hooks == DS4_N_LAYER &&
+             capture->cp3_attn_pre_hooks == expected_cp3_attn_hooks &&
+             capture->cp3_attn_post_hooks == expected_cp3_attn_hooks &&
+             capture->cp3_index_pre_hooks == expected_cp3_index_hooks &&
+             capture->cp3_index_post_hooks == expected_cp3_index_hooks;
     }
     if (ok) {
         ok = ds4_c2b_observable_read(observable, s, start, n_tokens,
@@ -53637,6 +54640,10 @@ static bool ds4_c45_run_pass_b(ds4_session *s,
     capture->attention_hooks = 0;
     capture->ffn_hooks = 0;
     capture->tail_input_hooks = 0;
+    capture->cp3_attn_pre_hooks = 0;
+    capture->cp3_attn_post_hooks = 0;
+    capture->cp3_index_pre_hooks = 0;
+    capture->cp3_index_post_hooks = 0;
     capture->expected_hooks = n_tokens * DS4_N_LAYER;
     g_ds4_c45_capture = capture;
     g_ds4_c45_capture_tail_inputs = capture_tail_inputs;
@@ -53653,8 +54660,19 @@ static bool ds4_c45_run_pass_b(ds4_session *s,
     }
     g_ds4_c45_capture_tail_inputs = false;
     g_ds4_c45_capture = NULL;
+    uint32_t expected_cp3_attn_hooks = 0u;
+    uint32_t expected_cp3_index_hooks = 0u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio != 0u) expected_cp3_attn_hooks += n_tokens;
+        if (ratio == 4u) expected_cp3_index_hooks += n_tokens;
+    }
     return ok && capture->attention_hooks == capture->expected_hooks &&
            capture->ffn_hooks == capture->expected_hooks &&
+           capture->cp3_attn_pre_hooks == expected_cp3_attn_hooks &&
+           capture->cp3_attn_post_hooks == expected_cp3_attn_hooks &&
+           capture->cp3_index_pre_hooks == expected_cp3_index_hooks &&
+           capture->cp3_index_post_hooks == expected_cp3_index_hooks &&
            (!capture_tail_inputs ||
             capture->tail_input_hooks == capture->expected_hooks) &&
            s->checkpoint.len == (int)(start + n_tokens);
@@ -54748,6 +55766,7 @@ static int ds4_first_divergence_run(ds4_session *s,
     ds4_first_divergence_capture pass_b = {0};
     ds4_first_divergence_capture
         cp5_pass_a[DS4_CP5_SWEEP_VARIANT_COUNT] = {0};
+    ds4_first_divergence_capture cp3f_pass_a[2] = {0};
     ds4_cp4_to_cp5_trace_result
         cp5_traces[DS4_CP5_SWEEP_VARIANT_COUNT] = {0};
     bool cp5_variant_ok[DS4_CP5_SWEEP_VARIANT_COUNT] = {false};
@@ -54758,6 +55777,8 @@ static int ds4_first_divergence_run(ds4_session *s,
     ds4_qb_primitive_ab_result qb_ab = {0};
     ds4_hc_attn_pre_split_ab_result hc_attn_pre_split_ab = {0};
     ds4_cp4_tail_primitive_ab_result cp4_tail_ab = {0};
+    ds4_cp3f_producer_ab_result cp3f_attn_ab = {0};
+    ds4_cp3f_producer_ab_result cp3f_index_ab = {0};
     int forced_tokens[DS4_DSPARK_MAX_BLOCK_SIZE] = {0};
     uint32_t n_comp_before[DS4_MAX_LAYER] = {0};
     uint32_t n_index_before[DS4_MAX_LAYER] = {0};
@@ -54780,6 +55801,10 @@ static int ds4_first_divergence_run(ds4_session *s,
     const bool cp5_sweep_requested =
         cp5_sweep_env && cp5_sweep_env[0] &&
         strcmp(cp5_sweep_env, "0") != 0;
+    const char *cp3f_sweep_env = getenv("DS4_CP3F_SWEEP");
+    const bool cp3f_sweep_requested =
+        cp3f_sweep_env && cp3f_sweep_env[0] &&
+        strcmp(cp3f_sweep_env, "0") != 0;
     const char *cp4_tail_ab_env = getenv("DS4_CP4_TAIL_AB");
     const bool cp4_tail_ab_requested =
         cp5_sweep_requested ||
@@ -54795,6 +55820,24 @@ static int ds4_first_divergence_run(ds4_session *s,
     if (legacy_canonical_qa_env && legacy_canonical_qa_env[0] &&
         strcmp(legacy_canonical_qa_env, "0") != 0) {
         canonical_mask |= DS4_FIRST_DIVERGENCE_CANON_QA;
+    }
+    if (cp3f_sweep_requested) {
+        /* CP4 through CP5 is already closed.  Enter the CP3-F experiment
+         * with that complete proven canonical set directly; do not reopen
+         * the earlier interval's attribution sweep. */
+        canonical_mask |=
+            DS4_FIRST_DIVERGENCE_CANON_QA |
+            DS4_FIRST_DIVERGENCE_CANON_KV |
+            DS4_FIRST_DIVERGENCE_CANON_QB |
+            DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW |
+            DS4_FIRST_DIVERGENCE_CANON_HC_ATTN_PRE_SPLIT |
+            DS4_FIRST_DIVERGENCE_CANON_CP4_TAIL |
+            DS4_FIRST_DIVERGENCE_CANON_HC_FFN_PRE_SPLIT |
+            DS4_FIRST_DIVERGENCE_CANON_FFN_ROUTER |
+            DS4_FIRST_DIVERGENCE_CANON_ROUTER_SELECT |
+            DS4_FIRST_DIVERGENCE_CANON_SHARED_GATE_UP |
+            DS4_FIRST_DIVERGENCE_CANON_ROUTED_MOE |
+            DS4_FIRST_DIVERGENCE_CANON_CP5_TAIL;
     }
     canonical_config_ok = canonical_config_ok &&
         ((canonical_mask & DS4_FIRST_DIVERGENCE_CANON_KV) == 0 ||
@@ -54965,10 +56008,11 @@ static int ds4_first_divergence_run(ds4_session *s,
     canonical_rerun_ok = canonical_rerun_ok &&
         hc_attn_pre_split_ab_ok && hc_attn_pre_split_substitution_ok;
 
-    const bool cp4_tail_isolated_requested = cp4_tail_ab_requested ||
-        (!prefix_operand_probe_requested &&
+    const bool cp4_tail_isolated_requested = !cp3f_sweep_requested &&
+        (cp4_tail_ab_requested ||
+         (!prefix_operand_probe_requested &&
          (pre_tail_canonical_mask &
-          DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW) != 0);
+          DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW) != 0));
     const bool cp4_tail_ab_ok = !cp4_tail_isolated_requested ||
         (canonical_rerun_ok && a2_ok &&
          (!cp4_tail_ab_requested ||
@@ -54976,7 +56020,8 @@ static int ds4_first_divergence_run(ds4_session *s,
            hc_attn_pre_split_substitution_ok)) &&
          ds4_cp4_tail_primitive_ab_run(s, &capture_a, &cp4_tail_ab));
     const bool cp4_tail_substitution_requested =
-        cp4_tail_selected || cp4_tail_ab_requested;
+        !cp3f_sweep_requested &&
+        (cp4_tail_selected || cp4_tail_ab_requested);
     bool cp4_tail_substitution_performed = false;
     bool cp4_tail_substitution_ok = !cp4_tail_substitution_requested ||
         (cp4_tail_ab_ok && !cp4_tail_ab.numerical_non_equivalence);
@@ -55201,6 +56246,7 @@ static int ds4_first_divergence_run(ds4_session *s,
     bool pass_b_materialize_ok = false;
     bool report_ok = false;
     bool cp5_sweep_report_ok = !cp5_sweep_requested;
+    bool cp3f_sweep_report_ok = !cp3f_sweep_requested;
     bool cp4_prefix_input_ok = !cp4_prefix_input_requested;
     bool cp4_prefix_input_attempted = false;
     bool hc_attn_pre_split_causal_ok =
@@ -55261,7 +56307,204 @@ static int ds4_first_divergence_run(ds4_session *s,
             fputc('\n', stderr);
             report_ok = report_ok && cp5_sweep_report_ok;
         }
-        if (report_ok && !cp5_sweep_requested && (canonical_mask &
+        if (report_ok && cp3f_sweep_requested) {
+            const uint32_t cp3f_layer = 2u;
+            const uint32_t cp3f_row = 0u;
+            const uint32_t cp3f_base_mask =
+                cp5_variant_masks[DS4_CP5_SWEEP_VARIANT_COUNT - 1u];
+            unsigned new_family_sites = 0u;
+            unsigned state_transition_causes = 0u;
+            bool attention_repaired = false;
+            bool index_repaired = false;
+            const bool baseline_reproduced =
+                report.first_divergence_found &&
+                report.row == cp3f_row && report.layer == cp3f_layer &&
+                report.checkpoint == DS4_FIRST_DIVERGENCE_CP3_F &&
+                strcmp(report.subobject, "attn_state_kv") == 0;
+            fprintf(stderr,
+                    "CP3F_BASELINE_GATE expected=row0_layer2_CP3-F_attn_state_kv "
+                    "result=%s\n",
+                    baseline_reproduced ? "PASS" : "FAIL");
+            bool attention_ab_ok = baseline_reproduced &&
+                ds4_cp3f_producer_ab_run(
+                    s, &capture_a, &capture_b, cp3f_layer, cp3f_row,
+                    false, &cp3f_attn_ab);
+            const bool attention_arithmetic_cause = attention_ab_ok &&
+                cp3f_attn_ab.executed && !cp3f_attn_ab.value_equal &&
+                cp3f_attn_ab.placement_equal &&
+                cp3f_attn_ab.generic_runtime_replay_exact;
+            const bool attention_state_cause = attention_ab_ok &&
+                cp3f_attn_ab.executed && cp3f_attn_ab.value_equal &&
+                cp3f_attn_ab.placement_equal &&
+                !cp3f_attn_ab.state_transition_equal &&
+                cp3f_attn_ab.generic_runtime_replay_exact;
+            const bool attention_narrow_cause =
+                attention_arithmetic_cause || attention_state_cause;
+            if (attention_arithmetic_cause) new_family_sites++;
+            if (attention_state_cause) state_transition_causes++;
+            if (attention_arithmetic_cause) {
+                fprintf(stderr,
+                        "CP3F_DRIFT_SOURCE site=layer2_CP3F_attention_projection "
+                        "generic=kernel_mul_mv_ext_f16_f32_r1_N_separate_pair "
+                        "sequential=kernel_mul_mv_f16_f32_pair_compressor_store_4 "
+                        "candidate_family=%s evidence=%s\n",
+                        "FAMILY_F16_BATCH_EXT_VS_SINGLE_MV",
+                        "PROVEN_BY_SOURCE_AND_TEST");
+            } else if (attention_state_cause) {
+                fputs("CP3F_STATE_TRANSITION_SOURCE "
+                      "site=layer2_CP3F_attention_state_store "
+                      "generic=separate_compressor_store "
+                      "sequential=fused_pair_projection_state_store "
+                      "evidence=PROVEN_BY_TEST\n", stderr);
+            }
+            if (attention_narrow_cause) {
+                const uint32_t attention_mask = cp3f_base_mask |
+                    DS4_FIRST_DIVERGENCE_CANON_CP3F_ATTN;
+                const bool variant_ok = ds4_cp3f_run_generic_variant(
+                    s, &frontier, &raw, forced_tokens, n_tokens, start,
+                    batch_cur, batch_next, n_comp_before, n_index_before,
+                    attention_mask, "CP3F_ATTN", &capture_a,
+                    &a0, &a1, &a2, &cp3f_pass_a[0]);
+                const bool frontier_ok_after = variant_ok &&
+                    ds4_first_divergence_emit_report(
+                        &cp3f_pass_a[0], &pass_b, stderr, &report);
+                const bool target_exact = frontier_ok_after &&
+                    ds4_cp3f_object_exact(
+                        &cp3f_pass_a[0], &pass_b, cp3f_row, cp3f_layer,
+                        DS4_FIRST_DIVERGENCE_CP3_F, "attn_state_kv");
+                const bool prior_exact = frontier_ok_after &&
+                    ds4_cp3f_regression_gate(&cp3f_pass_a[0], &pass_b);
+                const bool attn_producer_closed = frontier_ok_after &&
+                    (!report.first_divergence_found ||
+                     report.row != cp3f_row || report.layer != cp3f_layer ||
+                     report.checkpoint != DS4_FIRST_DIVERGENCE_CP3_F ||
+                     (strcmp(report.subobject, "attn_state_score") != 0 &&
+                      strcmp(report.subobject, "layer_n_comp") != 0 &&
+                      strcmp(report.subobject, "attn_cache") != 0));
+                attention_repaired = target_exact && prior_exact &&
+                    attn_producer_closed;
+                fprintf(stderr,
+                        "CP3F_CAUSAL_SUBSTITUTION attn_state_kv=%s "
+                        "result=%s\n",
+                        target_exact ? "EXACT" : "MISMATCH",
+                        attention_repaired ? "PASS" : "FAIL");
+                fputs("CAUSAL_SUBSTITUTION_FRONTIER "
+                      "site=layer2_CP3F_attention_projection "
+                      "FIRST_DIVERGENCE=", stderr);
+                ds4_first_divergence_print_report_location(&report);
+                fputc('\n', stderr);
+            } else {
+                fputs("CP3F_CAUSAL_SUBSTITUTION attn_state_kv=NOT_RUN "
+                      "result=STOP reason=cause_not_narrowly_proven\n",
+                      stderr);
+            }
+
+            const bool index_is_next = attention_repaired &&
+                report.first_divergence_found &&
+                report.row == cp3f_row && report.layer == cp3f_layer &&
+                report.checkpoint == DS4_FIRST_DIVERGENCE_CP3_F &&
+                (strncmp(report.subobject, "index_", 6u) == 0 ||
+                 strcmp(report.subobject, "layer_n_index_comp") == 0);
+            bool index_ab_ok = false;
+            bool index_arithmetic_cause = false;
+            bool index_state_cause = false;
+            if (index_is_next) {
+                index_ab_ok = ds4_cp3f_producer_ab_run(
+                    s, &capture_a, &capture_b, cp3f_layer, cp3f_row,
+                    true, &cp3f_index_ab);
+                index_arithmetic_cause = index_ab_ok &&
+                    cp3f_index_ab.executed && !cp3f_index_ab.value_equal &&
+                    cp3f_index_ab.placement_equal &&
+                    cp3f_index_ab.generic_runtime_replay_exact;
+                index_state_cause = index_ab_ok &&
+                    cp3f_index_ab.executed && cp3f_index_ab.value_equal &&
+                    cp3f_index_ab.placement_equal &&
+                    !cp3f_index_ab.state_transition_equal &&
+                    cp3f_index_ab.generic_runtime_replay_exact;
+                if (index_arithmetic_cause) new_family_sites++;
+                if (index_state_cause) state_transition_causes++;
+                if (index_arithmetic_cause) {
+                    fputs("CP3F_DRIFT_SOURCE "
+                          "site=layer2_CP3F_indexer_projection "
+                          "generic=kernel_mul_mv_ext_f16_f32_r1_N_separate_pair "
+                          "sequential=kernel_mul_mv_f16_f32_pair_compressor_store_4 "
+                          "candidate_family=FAMILY_F16_BATCH_EXT_VS_SINGLE_MV "
+                          "evidence=PROVEN_BY_SOURCE_AND_TEST\n", stderr);
+                } else if (index_state_cause) {
+                    fputs("CP3F_STATE_TRANSITION_SOURCE "
+                          "site=layer2_CP3F_indexer_state_store "
+                          "generic=separate_compressor_store "
+                          "sequential=fused_pair_projection_state_store "
+                          "evidence=PROVEN_BY_TEST\n", stderr);
+                }
+            }
+            if (index_arithmetic_cause || index_state_cause) {
+                const uint32_t index_mask = cp3f_base_mask |
+                    DS4_FIRST_DIVERGENCE_CANON_CP3F_ATTN |
+                    DS4_FIRST_DIVERGENCE_CANON_CP3F_INDEX;
+                const bool variant_ok = ds4_cp3f_run_generic_variant(
+                    s, &frontier, &raw, forced_tokens, n_tokens, start,
+                    batch_cur, batch_next, n_comp_before, n_index_before,
+                    index_mask, "CP3F_ATTN_INDEX", &capture_a,
+                    &a0, &a1, &a2, &cp3f_pass_a[1]);
+                const bool frontier_ok_after = variant_ok &&
+                    ds4_first_divergence_emit_report(
+                        &cp3f_pass_a[1], &pass_b, stderr, &report);
+                const bool target_exact = frontier_ok_after &&
+                    ds4_cp3f_object_exact(
+                        &cp3f_pass_a[1], &pass_b, cp3f_row, cp3f_layer,
+                        DS4_FIRST_DIVERGENCE_CP3_F, "index_state_kv");
+                const bool prior_exact = frontier_ok_after &&
+                    ds4_cp3f_regression_gate(&cp3f_pass_a[1], &pass_b);
+                const bool index_producer_closed = frontier_ok_after &&
+                    (!report.first_divergence_found ||
+                     report.row != cp3f_row || report.layer != cp3f_layer ||
+                     report.checkpoint != DS4_FIRST_DIVERGENCE_CP3_F ||
+                     (strncmp(report.subobject, "index_", 6u) != 0 &&
+                      strcmp(report.subobject, "layer_n_index_comp") != 0));
+                index_repaired = target_exact && prior_exact &&
+                    index_producer_closed;
+                fprintf(stderr,
+                        "CP3F_INDEX_CAUSAL_SUBSTITUTION index_state_kv=%s "
+                        "result=%s\n",
+                        target_exact ? "EXACT" : "MISMATCH",
+                        index_repaired ? "PASS" : "FAIL");
+                fputs("CAUSAL_SUBSTITUTION_FRONTIER "
+                      "site=layer2_CP3F_indexer_projection "
+                      "FIRST_DIVERGENCE=", stderr);
+                ds4_first_divergence_print_report_location(&report);
+                fputc('\n', stderr);
+            }
+            cp3f_sweep_report_ok = attention_repaired &&
+                (!index_is_next || index_repaired);
+            fputs("ARITHMETIC_FAMILY_TABLE\n", stderr);
+            fprintf(stderr,
+                    "family=FAMILY_F16_BATCH_EXT_VS_SINGLE_MV "
+                    "proven_sites=hc_attn_pre_split,hc_ffn_pre,"
+                    "ffn_router_projection%s%s status=PROVEN\n",
+                    attention_arithmetic_cause
+                        ? ",layer2_CP3F_attention" : "",
+                    index_arithmetic_cause
+                        ? ",layer2_CP3F_indexer" : "");
+            fprintf(stderr,
+                    "ARITHMETIC_FAMILY_COUNT=6 TOTAL_CAUSAL_SOURCE_COUNT=%u\n",
+                    12u + new_family_sites + state_transition_causes);
+            fprintf(stderr,
+                    "CANONICAL_SWEEP_STATUS independent_arithmetic_families=6 "
+                    "proven_family_sites=%u state_transition_causes=%u "
+                    "unresolved_intervals=%u closed_through=%s "
+                    "FIRST_DIVERGENCE=",
+                    12u + new_family_sites, state_transition_causes,
+                    report.first_divergence_found ? 1u : 0u,
+                    index_repaired ? "layer2_CP3-F_index_state" :
+                    attention_repaired ? "layer2_CP3-F_attn_state" :
+                    "layer2_before_CP3-F");
+            ds4_first_divergence_print_report_location(&report);
+            fputc('\n', stderr);
+            report_ok = report_ok && cp3f_sweep_report_ok;
+        }
+        if (report_ok && !cp5_sweep_requested && !cp3f_sweep_requested &&
+            (canonical_mask &
                           DS4_FIRST_DIVERGENCE_CANON_QA) != 0) {
             bool q_projection_exact = false;
             report_ok = ds4_first_divergence_emit_q_trace(
@@ -55546,6 +56789,9 @@ static int ds4_first_divergence_run(ds4_session *s,
          variant++) {
         ds4_first_divergence_capture_free(&cp5_pass_a[variant]);
     }
+    for (size_t variant = 0; variant < 2u; variant++) {
+        ds4_first_divergence_capture_free(&cp3f_pass_a[variant]);
+    }
     ds4_c2b_capture_free(&capture_a);
     ds4_c2b_capture_free(&capture_b);
     ds4_c2b_capture_free(&capture_b_probe);
@@ -55553,6 +56799,7 @@ static int ds4_first_divergence_run(ds4_session *s,
     spec_frontier_free(&frontier);
     return control && probe && qa_ab_proven && kv_ab_proven && qb_ab_proven &&
         canonical_rerun_ok && report_ok && cp5_sweep_report_ok &&
+        cp3f_sweep_report_ok &&
         cp4_prefix_input_ok &&
         hc_attn_pre_split_causal_ok && cp4_tail_causal_ok ? 0 : 1;
 }

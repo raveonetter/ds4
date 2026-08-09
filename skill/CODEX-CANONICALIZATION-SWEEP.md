@@ -20,21 +20,80 @@
   **PROVEN BY TEST** on M4 Max.
 - HC attention pre-split and CP4 tail causal substitutions:
   **PROVEN BY TEST** on M4 Max.
-- Current first divergence after the complete proven CP4 prefix:
-  `CP5/layer_output` at row 0, layer 0; `CP4/after_attn_hc` exact:
+- CP4-to-CP5 natural-stage sweep, CP5-tail isolated A/B, and causal
+  substitution: **PROVEN BY TEST** on M4 Max.
+- Current first divergence after the complete proven CP4-to-CP5 interval:
+  `CP3-F/attn_state_kv` at row 0, layer 2:
   **PROVEN BY TEST** on M4 Max.
-- CP4-to-CP5 natural-stage sweep and cumulative causal substitutions:
-  **IMPLEMENTED; M4 RUNTIME REQUIRED**.
+- Layer-2 CP3-F input closure, runtime replay, producer A/B, and cumulative
+  attention/indexer causal substitutions: **IMPLEMENTED; M4 RUNTIME REQUIRED**.
 - Default production behavior remains unchanged when
   `DS4_FIRST_DIVERGENCE_CANONICAL` is unset.
 
 Current proven family concentration:
 
 ```text
-family=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV proven_sites=QA,KV,QB,CP4_output_B status=PROVEN
+family=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV proven_sites=QA,KV,QB,CP4_output_B,shared_gate_up status=PROVEN
 family=FAMILY_FLASH_ATTN_BATCH_DIRECT_VS_SINGLE_VEC_REDUCE proven_sites=CP4-HEADS-RAW status=PROVEN
-family=FAMILY_F16_BATCH_EXT_VS_SINGLE_MV proven_sites=hc_attn_pre_split status=PROVEN
+family=FAMILY_F16_BATCH_EXT_VS_SINGLE_MV proven_sites=hc_attn_pre_split,hc_ffn_pre,ffn_router_projection status=PROVEN
+family=FAMILY_ROUTER_WEIGHT_NORMALIZATION_BATCH_REDUCE_VS_SINGLE_KERNEL proven_sites=ffn_router_weights status=PROVEN
+family=FAMILY_ROUTED_MOE_IQ2_XXS_Q2_K_BATCH_VS_SINGLE proven_sites=routed_moe status=PROVEN
+family=FAMILY_Q8_SHARED_DOWN_BATCH_F32_HC_ADD_VS_SINGLE_FUSED_HC proven_sites=cp5_tail status=PROVEN
 ```
+
+The independent arithmetic-family count is six. State-transition and indexing
+causes are tracked separately and do not increment this count.
+
+## Layer-2 CP3-F causal sweep
+
+Run only the new frontier experiment:
+
+```sh
+DS4_CP3F_SWEEP=1 <the same canonical first-divergence command and true S0>
+```
+
+`DS4_CP3F_SWEEP` directly selects the complete already-proven canonical mask
+through CP5. It does not rerun the CP4-to-CP5 attribution sweep. Every
+diagnostic Pass A variant still executes A0/A1/A2 and must pass the C2B
+non-perturbation gate; Pass B remains ordinary
+`metal_graph_eval_token_raw_swa` from the same restored S0 and forced proposal
+IDs.
+
+The real producer topology audited by this mode is:
+
+```text
+REAL_GENERIC_CP3F:
+F32 batch attn_norm
+-> two F16-weight kernel_mul_mv_ext_f16_f32_r1_N projections
+-> materialized paired F32 rows
+-> separate compressor state store/update
+-> persistent F32 recurrent state
+
+REAL_SEQ_CP3F:
+F32 single-row attn_norm
+-> kernel_mul_mv_f16_f32_pair_compressor_store_4
+-> materialized paired F32 rows plus exact-bit recurrent-state store
+-> ordinary compressor update with state_already_stored=true
+-> persistent F32 recurrent state
+```
+
+Before producer attribution, the sweep compares the consumed F32 input row,
+the complete pre-update KV and score state, logical position, physical state
+row, cache row, pre-update frontier, emit decision, layer/indexer identity, and
+the shared model weights/constants. The isolated generic replay must reproduce
+both real generic projections and both post-update recurrent-state tensors.
+
+If the projected values differ while placement is exact, the candidate is the
+already-proven `FAMILY_F16_BATCH_EXT_VS_SINGLE_MV`; the family count remains
+six. If projections are exact but the next state or counter differs, the site
+is reported as a non-arithmetic state-transition cause. Any input or placement
+mismatch stops arithmetic attribution.
+
+On a narrow cause, the diagnostic generic path substitutes only the ordinary
+sequential paired projection/state-store primitive at that producer. It then
+requires raw-bit exact `attn_state_kv`, exact prior CP2/CP4/CP5 objects, and a
+fresh same-S0 frontier run. If the indexer state is next, the same closure and
+substitution sequence runs once more automatically.
 
 ## Starting proven facts
 
