@@ -741,6 +741,29 @@ int ds4_gpu_matmul_f16_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Metal family repairs: one dispatch over independent rows while retaining
+ * the ordinary decode matvec reduction order within every row. */
+int ds4_gpu_matmul_f16_decode_rows_exact_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
+int ds4_gpu_matmul_f16_pair_decode_rows_exact_tensor(
+        ds4_gpu_tensor       *out_a,
+        ds4_gpu_tensor       *out_b,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_a_offset,
+        uint64_t              weight_b_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
+
 /* CUDA batch path: fold an input RMS normalization into the FP16 activation
  * conversion used by the following projection. Returns 0 without touching
  * out when the optimized path is unavailable. */
@@ -2099,6 +2122,18 @@ int ds4_gpu_router_select_tensor(
         bool                    has_bias,
         bool                    hash_mode,
         const ds4_gpu_tensor *logits);
+
+/* Isolated router-weight family entry and its ordinary one-row oracle. */
+int ds4_gpu_router_weights_rows_exact_tensor(
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *probs,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_rows,
+        float                 scale);
+int ds4_gpu_router_weights_one_tensor(
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *probs,
+        const ds4_gpu_tensor *selected);
 
 int ds4_gpu_router_select_batch_tensor(
         ds4_gpu_tensor       *selected,

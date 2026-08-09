@@ -481,6 +481,32 @@ kernel void kernel_dsv4_router_weights_one(
     w[tid] = p[s[tid]] / sum * 1.5f;
 }
 
+// Production family repair for multiple rows. Each threadgroup owns one row;
+// its six lanes independently repeat the ordinary one-token accumulation in
+// the same scalar order. Rows remain parallel without changing the canonical
+// denominator or division/multiply sequence.
+kernel void kernel_dsv4_router_weights_rows_exact(
+        device const char *probs,
+        device const char *selected,
+        device char *weights,
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    if (tid >= 6) return;
+
+    device const float *p = (device const float *)probs +
+        (uint64_t)row * 256u;
+    device const int *s = (device const int *)selected +
+        (uint64_t)row * 6u;
+    float sum = 0.0f;
+    for (uint i = 0; i < 6; i++) {
+        sum += p[s[i]];
+    }
+    sum = max(sum, 6.103515625e-5f);
+
+    device float *w = (device float *)weights + (uint64_t)row * 6u;
+    w[tid] = p[s[tid]] / sum * 1.5f;
+}
+
 static inline float ds4_glm_router_sigmoid(float x) {
     if (x >= 0.0f) {
         const float e = exp(-x);

@@ -1,15 +1,16 @@
 #include "family_repair.h"
 
 #include <ctype.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define DS4_REPAIR_FAMILY_BIT(family) (1u << (unsigned)(family))
 #define DS4_REPAIR_FAMILY_ALL_MASK \
     ((1u << (unsigned)DS4_REPAIR_FAMILY_COUNT) - 1u)
 
-/* Frozen from the completed 177-site canonical sweep.  P1 intentionally
- * exposes every production entry as NOT_IMPLEMENTED; P2/P3 replace status
- * and entry behavior family by family without changing the site taxonomy. */
+/* Frozen from the completed 177-site canonical sweep.  P2 repairs the four
+ * pure projection/reduction families; P3 owns the remaining mixed families.
+ * The site taxonomy and proven-site counts stay unchanged. */
 static const ds4_family_repair_manifest_entry g_family_manifest[] = {
     {
         DS4_REPAIR_FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV,
@@ -20,7 +21,7 @@ static const ds4_family_repair_manifest_entry g_family_manifest[] = {
         "kernel_mul_mv_q8_0_f32 ordinary single MV",
         DS4_FAMILY_REPAIR_ENTRY_Q8_0_BATCH_EXT,
         "ds4_repair_q8_0_batch_ext",
-        DS4_FAMILY_REPAIR_NOT_IMPLEMENTED,
+        DS4_FAMILY_REPAIR_EXACT,
     },
     {
         DS4_REPAIR_FAMILY_FLASH_ATTN_BATCH_DIRECT_VS_SINGLE_VEC_REDUCE,
@@ -42,7 +43,7 @@ static const ds4_family_repair_manifest_entry g_family_manifest[] = {
         "F16 ordinary single MV projection",
         DS4_FAMILY_REPAIR_ENTRY_F16_BATCH_EXT,
         "ds4_repair_f16_batch_ext",
-        DS4_FAMILY_REPAIR_NOT_IMPLEMENTED,
+        DS4_FAMILY_REPAIR_EXACT,
     },
     {
         DS4_REPAIR_FAMILY_ROUTER_WEIGHT_NORMALIZATION_BATCH_REDUCE_VS_SINGLE_KERNEL,
@@ -53,7 +54,7 @@ static const ds4_family_repair_manifest_entry g_family_manifest[] = {
         "kernel_dsv4_router_weights_one",
         DS4_FAMILY_REPAIR_ENTRY_ROUTER_WEIGHT_NORMALIZATION,
         "ds4_repair_router_weight_normalization",
-        DS4_FAMILY_REPAIR_NOT_IMPLEMENTED,
+        DS4_FAMILY_REPAIR_EXACT,
     },
     {
         DS4_REPAIR_FAMILY_ROUTED_MOE_IQ2_XXS_Q2_K_BATCH_VS_SINGLE,
@@ -86,7 +87,7 @@ static const ds4_family_repair_manifest_entry g_family_manifest[] = {
         "F16 ordinary single-pair MV projections",
         DS4_FAMILY_REPAIR_ENTRY_F16_BATCH_EXT_PAIR,
         "ds4_repair_f16_batch_ext_pair",
-        DS4_FAMILY_REPAIR_NOT_IMPLEMENTED,
+        DS4_FAMILY_REPAIR_EXACT,
     },
 };
 
@@ -227,6 +228,18 @@ bool ds4_family_repair_enabled(ds4_family_repair_mask mask,
                                ds4_repair_family family) {
     return (unsigned)family < (unsigned)DS4_REPAIR_FAMILY_COUNT &&
         (mask & DS4_REPAIR_FAMILY_BIT(family)) != 0;
+}
+
+bool ds4_family_repair_runtime_enabled(ds4_repair_family family) {
+    ds4_family_repair_mask mask = 0;
+    const char *selection = getenv("DS4_FAMILY_REPAIRS");
+
+    if (!selection || !selection[0] ||
+        !ds4_family_repair_parse_selection(selection, &mask)) {
+        return false;
+    }
+    return ds4_family_repair_enabled(mask, family) &&
+        ds4_family_repair_family(family)->status == DS4_FAMILY_REPAIR_EXACT;
 }
 
 bool ds4_family_repair_select(ds4_repair_site site,

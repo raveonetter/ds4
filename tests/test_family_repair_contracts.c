@@ -1,6 +1,7 @@
 #include "family_repair.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define REQUIRE(condition) do { \
@@ -40,6 +41,12 @@ int main(void) {
     REQUIRE(ds4_family_repair_parse_selection(manifest[0].name, &selected));
     REQUIRE(ds4_family_repair_enabled(selected, manifest[0].family));
     REQUIRE(!ds4_family_repair_enabled(selected, manifest[1].family));
+    REQUIRE(unsetenv("DS4_FAMILY_REPAIRS") == 0);
+    REQUIRE(!ds4_family_repair_runtime_enabled(manifest[0].family));
+    REQUIRE(setenv("DS4_FAMILY_REPAIRS", "all", 1) == 0);
+    REQUIRE(ds4_family_repair_runtime_enabled(manifest[0].family));
+    REQUIRE(!ds4_family_repair_runtime_enabled(manifest[1].family));
+    REQUIRE(unsetenv("DS4_FAMILY_REPAIRS") == 0);
 
     for (i = 0; i < site_class_count; i++) {
         ds4_family_repair_dispatch disabled;

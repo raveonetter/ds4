@@ -102,6 +102,7 @@ bool ds4_family_repair_parse_selection(const char *value,
                                        ds4_family_repair_mask *mask);
 bool ds4_family_repair_enabled(ds4_family_repair_mask mask,
                                ds4_repair_family family);
+bool ds4_family_repair_runtime_enabled(ds4_repair_family family);
 bool ds4_family_repair_select(ds4_repair_site site,
                               ds4_family_repair_mask enabled,
                               ds4_family_repair_dispatch *dispatch);

@@ -44,6 +44,7 @@
 #include "ds4_distributed.h"
 #include "ds4_float_compare.h"
 #include "first_divergence_capture.h"
+#include "family_repair.h"
 #include "ds4_tp.h"
 
 /* Wave-2 multi-GPU types are needed in every build because the engine
@@ -237,15 +238,17 @@ int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
         uint64_t weight0_offset, uint64_t weight1_offset,
         uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
         const ds4_gpu_tensor *x, uint32_t n_rows) {
-    return ds4_gpu_matmul_q8_0_pair_tensor(
-            out0, out1, model_map, model_size,
-            weight0_offset, weight1_offset,
-            in_dim, out0_dim, out1_dim, x, n_rows);
+    return ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+               out0, model_map, model_size, weight0_offset,
+               in_dim, out0_dim, x, n_rows) &&
+           ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+               out1, model_map, model_size, weight1_offset,
+               in_dim, out1_dim, x, n_rows);
 }
 int ds4_gpu_matmul_f16_router_rows_exact_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, const ds4_gpu_tensor *x, uint32_t n_rows) {
-    return ds4_gpu_matmul_f16_tensor(
+    return ds4_gpu_matmul_f16_decode_rows_exact_tensor(
             out, model_map, model_size, weight_offset,
             4096u, 256u, x, n_rows);
 }
@@ -25512,20 +25515,31 @@ static bool metal_graph_attention_output_dense_quant_batch(
         return false;
     }
     if (out_a->type == DS4_TENSOR_Q8_0 && out_b->type == DS4_TENSOR_Q8_0) {
-        return ds4_gpu_attention_output_q8_batch_tensor(out,
-                                                        low,
-                                                        metal_graph_batch_group_tmp(g),
-                                                        metal_graph_batch_low_tmp(g),
-                                                        model->map,
-                                                        model->size,
-                                                        out_a->abs_offset,
-                                                        out_b->abs_offset,
-                                                        group_dim,
-                                                        rank,
-                                                        n_groups,
-                                                        out_dim,
-                                                        heads,
-                                                        n_tokens) != 0;
+        bool ok = ds4_gpu_attention_output_q8_batch_tensor(
+                      out,
+                      low,
+                      metal_graph_batch_group_tmp(g),
+                      metal_graph_batch_low_tmp(g),
+                      model->map,
+                      model->size,
+                      out_a->abs_offset,
+                      out_b->abs_offset,
+                      group_dim,
+                      rank,
+                      n_groups,
+                      out_dim,
+                      heads,
+                      n_tokens) != 0;
+#if defined(__APPLE__)
+        if (ok && ds4_family_repair_runtime_enabled(
+                      DS4_REPAIR_FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV)) {
+            ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                     out, model->map, model->size, out_b->abs_offset,
+                     (uint64_t)n_groups * rank, out_dim, low,
+                     n_tokens) != 0;
+        }
+#endif
+        return ok;
     }
     if (out_a->type == DS4_TENSOR_Q4_K && n_tokens >= 32u) {
         if (ds4_gpu_attention_output_q4_K_batch_tensor(out,
@@ -25598,9 +25612,22 @@ static bool metal_graph_matmul_q8_0_named_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
-    (void)module;
     (void)il;
     (void)pos0;
+#if defined(__APPLE__)
+    if (module && w && w->type == DS4_TENSOR_Q8_0 &&
+        ds4_family_repair_runtime_enabled(
+            DS4_REPAIR_FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV) &&
+        (strcmp(module, "attn_q_a") == 0 ||
+         strcmp(module, "attn_kv") == 0 ||
+         strcmp(module, "attn_q_b") == 0)) {
+        return ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                   out, model->map, model->size, w->abs_offset,
+                   in_dim, out_dim, x, (uint32_t)n_tok) != 0;
+    }
+#else
+    (void)module;
+#endif
     return metal_graph_matmul_dense_quant_tensor(out,
                                                 model,
                                                 w,
@@ -25608,6 +25635,15 @@ static bool metal_graph_matmul_q8_0_named_tensor(
                                                 out_dim,
                                                 x,
                                                 n_tok);
+}
+
+static bool metal_graph_q8_projection_repair_enabled(void) {
+#if defined(__APPLE__)
+    return ds4_family_repair_runtime_enabled(
+        DS4_REPAIR_FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV);
+#else
+    return false;
+#endif
 }
 
 static bool metal_graph_matmul_canonical_rows(
@@ -27552,35 +27588,34 @@ static bool metal_graph_refresh_ratio4_compressor_state(
     }
     if (ok) {
 #if defined(__APPLE__)
-        ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_kv(g),
-                                        model->map,
-                                        model->size,
-                                        kv_weight->abs_offset,
-                                        DS4_N_EMBD,
-                                        width,
-                                        tail_hc,
-                                        4) != 0;
-        if (ok) {
-            ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_sc(g),
-                                            model->map,
-                                            model->size,
-                                            score_weight->abs_offset,
-                                            DS4_N_EMBD,
-                                            width,
-                                            tail_hc,
-                                            4) != 0;
+        if (ds4_family_repair_runtime_enabled(
+                DS4_REPAIR_FAMILY_F16_BATCH_EXT_VS_SINGLE_PAIR_MV)) {
+            ok = ds4_gpu_matmul_f16_pair_decode_rows_exact_tensor(
+                     metal_graph_batch_comp_kv(g),
+                     metal_graph_batch_comp_sc(g),
+                     model->map, model->size,
+                     kv_weight->abs_offset, score_weight->abs_offset,
+                     DS4_N_EMBD, width, tail_hc, 4) != 0;
+        } else {
+            ok = ds4_gpu_matmul_f16_tensor(
+                     metal_graph_batch_comp_kv(g), model->map, model->size,
+                     kv_weight->abs_offset, DS4_N_EMBD, width,
+                     tail_hc, 4) != 0;
+            if (ok) {
+                ok = ds4_gpu_matmul_f16_tensor(
+                         metal_graph_batch_comp_sc(g),
+                         model->map, model->size,
+                         score_weight->abs_offset, DS4_N_EMBD, width,
+                         tail_hc, 4) != 0;
+            }
         }
 #else
-        ok = ds4_gpu_matmul_f16_pair_tensor(metal_graph_batch_comp_kv(g),
-                                             metal_graph_batch_comp_sc(g),
-                                             model->map,
-                                             model->size,
-                                             kv_weight->abs_offset,
-                                             score_weight->abs_offset,
-                                             DS4_N_EMBD,
-                                             width,
-                                             tail_hc,
-                                             4) != 0;
+        ok = ds4_gpu_matmul_f16_pair_tensor(
+                 metal_graph_batch_comp_kv(g),
+                 metal_graph_batch_comp_sc(g),
+                 model->map, model->size,
+                 kv_weight->abs_offset, score_weight->abs_offset,
+                 DS4_N_EMBD, width, tail_hc, 4) != 0;
 #endif
         if (!ok) {
             fprintf(stderr, "ds4: ratio-4 compressor tail projection failed\n");
@@ -27823,6 +27858,21 @@ static bool metal_graph_hc_rms_scale_project(
         return false;
     }
 #if defined(__APPLE__)
+    if (weight->type == DS4_TENSOR_F16 &&
+        ds4_family_repair_runtime_enabled(
+            DS4_REPAIR_FAMILY_F16_BATCH_EXT_VS_SINGLE_MV)) {
+        bool ok = ds4_gpu_rms_norm_plain_rows_tensor(
+                      norm_scratch, x, (uint32_t)in_dim,
+                      n_tokens, DS4_RMS_EPS) != 0;
+        if (ok) {
+            ok = ds4_gpu_matmul_f16_decode_rows_exact_tensor(
+                     out, model->map, model->size, weight->abs_offset,
+                     in_dim,
+                     2u * DS4_N_HC + DS4_N_HC * DS4_N_HC,
+                     norm_scratch, n_tokens) != 0;
+        }
+        return ok;
+    }
     return ds4_gpu_hc_rms_scale_project_f16_tensor(
                out,
                norm_scratch,
@@ -28662,18 +28712,33 @@ static bool metal_graph_encode_layer_attention_batch(
             ok = false;
         }
         if (ok) {
-            ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_kv(g),
-                                             model->map,
-                                             model->size,
-                                             layer->attn_compressor_kv->abs_offset,
-                                             DS4_N_EMBD,
-                                             comp_width,
-                                             metal_graph_batch_attn_norm(g),
-                                             n_tokens) != 0;
+            bool repair_pair = false;
+#if defined(__APPLE__)
+            repair_pair = ds4_family_repair_runtime_enabled(
+                    DS4_REPAIR_FAMILY_F16_BATCH_EXT_VS_SINGLE_PAIR_MV);
+            if (repair_pair) {
+                ok = ds4_gpu_matmul_f16_pair_decode_rows_exact_tensor(
+                         metal_graph_batch_comp_kv(g),
+                         metal_graph_batch_comp_sc(g),
+                         model->map, model->size,
+                         layer->attn_compressor_kv->abs_offset,
+                         layer->attn_compressor_gate->abs_offset,
+                         DS4_N_EMBD, comp_width,
+                         metal_graph_batch_attn_norm(g), n_tokens) != 0;
+            } else
+#endif
+            {
+                ok = ds4_gpu_matmul_f16_tensor(
+                         metal_graph_batch_comp_kv(g),
+                         model->map, model->size,
+                         layer->attn_compressor_kv->abs_offset,
+                         DS4_N_EMBD, comp_width,
+                         metal_graph_batch_attn_norm(g), n_tokens) != 0;
+            }
             if (!ok) {
                 fprintf(stderr, "ds4: gpu layer %u attention compressor KV projection failed\n", il);
             }
-            if (ok) {
+            if (ok && !repair_pair) {
                 ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_sc(g),
                                                 model->map,
                                                 model->size,
@@ -28995,22 +29060,34 @@ static bool metal_graph_encode_layer_attention_batch(
                 ok = false;
             }
             if (ok) {
-                ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_kv(g),
-                                                 model->map,
-                                                 model->size,
-                                                 layer->indexer_compressor_kv->abs_offset,
-                                                 DS4_N_EMBD,
-                                                 index_width,
-                                                 metal_graph_batch_attn_norm(g),
-                                                 n_tokens) != 0;
-                if (ok) ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_sc(g),
-                                                         model->map,
-                                                         model->size,
-                                                         layer->indexer_compressor_gate->abs_offset,
-                                                         DS4_N_EMBD,
-                                                         index_width,
-                                                         metal_graph_batch_attn_norm(g),
-                                                         n_tokens) != 0;
+#if defined(__APPLE__)
+                const bool repair_pair = ds4_family_repair_runtime_enabled(
+                        DS4_REPAIR_FAMILY_F16_BATCH_EXT_VS_SINGLE_PAIR_MV);
+                if (repair_pair) {
+                    ok = ds4_gpu_matmul_f16_pair_decode_rows_exact_tensor(
+                             metal_graph_batch_comp_kv(g),
+                             metal_graph_batch_comp_sc(g),
+                             model->map, model->size,
+                             layer->indexer_compressor_kv->abs_offset,
+                             layer->indexer_compressor_gate->abs_offset,
+                             DS4_N_EMBD, index_width,
+                             metal_graph_batch_attn_norm(g), n_tokens) != 0;
+                } else
+#endif
+                {
+                    ok = ds4_gpu_matmul_f16_tensor(
+                             metal_graph_batch_comp_kv(g),
+                             model->map, model->size,
+                             layer->indexer_compressor_kv->abs_offset,
+                             DS4_N_EMBD, index_width,
+                             metal_graph_batch_attn_norm(g), n_tokens) != 0;
+                    if (ok) ok = ds4_gpu_matmul_f16_tensor(
+                             metal_graph_batch_comp_sc(g),
+                             model->map, model->size,
+                             layer->indexer_compressor_gate->abs_offset,
+                             DS4_N_EMBD, index_width,
+                             metal_graph_batch_attn_norm(g), n_tokens) != 0;
+                }
                 if (ok) {
                     ok = metal_graph_cp3_projection_substitute_rows(
                         g, model, layer->indexer_compressor_kv,
@@ -29803,6 +29880,10 @@ static bool metal_graph_encode_layer_attention_batch(
         !tp_row_split_attn &&
         layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
         layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&
+#if defined(__APPLE__)
+        !ds4_family_repair_runtime_enabled(
+            DS4_REPAIR_FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV) &&
+#endif
         !metal_graph_directional_steering_attn_enabled(g)) {
         attn_out_f16 = ds4_gpu_attention_output_q8_batch_f16_tensor(g->batch_q_half,
                                                                     metal_graph_batch_attn_low(g),
@@ -30125,6 +30206,17 @@ static bool metal_graph_encode_layer_ffn_batch(
             metal_graph_batch_router_logits(g), model, layer->ffn_gate_inp,
             DS4_N_EMBD, DS4_N_EXPERT,
             metal_graph_batch_ffn_norm(g), n_tokens);
+#if defined(__APPLE__)
+    } else if (ok && layer->ffn_gate_inp->type == DS4_TENSOR_F16 &&
+               ds4_family_repair_runtime_enabled(
+                   DS4_REPAIR_FAMILY_F16_BATCH_EXT_VS_SINGLE_MV)) {
+        ok = ds4_gpu_matmul_f16_decode_rows_exact_tensor(
+                 metal_graph_batch_router_logits(g),
+                 model->map, model->size,
+                 layer->ffn_gate_inp->abs_offset,
+                 DS4_N_EMBD, DS4_N_EXPERT,
+                 metal_graph_batch_ffn_norm(g), n_tokens) != 0;
+#endif
     } else if (ok) {
         ok = metal_graph_matmul_plain_tensor(
             metal_graph_batch_router_logits(g), model, layer->ffn_gate_inp,
@@ -30270,6 +30362,9 @@ static bool metal_graph_encode_layer_ffn_batch(
         const bool canonical_shared_gate_up_ = \
             ds4_first_divergence_canonical_enabled( \
                 DS4_FIRST_DIVERGENCE_CANON_SHARED_GATE_UP); \
+        const bool repair_shared_gate_up_ = \
+            !canonical_shared_gate_up_ && \
+            metal_graph_q8_projection_repair_enabled(); \
         if (ok && canonical_shared_gate_up_) { \
             ok = metal_graph_shared_gate_up_canonical_rows( \
                     metal_graph_batch_shared_gate(g), \
@@ -30278,7 +30373,19 @@ static bool metal_graph_encode_layer_ffn_batch(
                     tp_ffn_x ? tp_ffn_x : metal_graph_batch_ffn_norm(g), \
                     model, layer, tp_rows); \
         } \
-        if (ok && !canonical_shared_gate_up_) ok = metal_graph_matmul_q8_0_named_tensor("shared_gate", \
+        if (ok && repair_shared_gate_up_) { \
+            ok = ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor( \
+                    metal_graph_batch_shared_gate(g), \
+                    metal_graph_batch_shared_up(g), \
+                    metal_graph_batch_shared_mid(g), \
+                    model->map, model->size, \
+                    layer->ffn_gate_shexp->abs_offset, \
+                    layer->ffn_up_shexp->abs_offset, \
+                    DS4_N_EMBD, shared_dim, \
+                    tp_ffn_x ? tp_ffn_x : metal_graph_batch_ffn_norm(g), \
+                    tp_rows, DS4_SWIGLU_CLAMP_EXP) != 0; \
+        } \
+        if (ok && !canonical_shared_gate_up_ && !repair_shared_gate_up_) ok = metal_graph_matmul_q8_0_named_tensor("shared_gate", \
                                                           il, \
                                                           pos0, \
                                                           metal_graph_batch_shared_gate(g), \
@@ -30288,7 +30395,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                           shared_dim, \
                                                           tp_ffn_x ? tp_ffn_x : metal_graph_batch_ffn_norm(g), \
                                                           tp_rows); \
-        if (ok && !canonical_shared_gate_up_) ok = metal_graph_matmul_q8_0_named_tensor("shared_up", \
+        if (ok && !canonical_shared_gate_up_ && !repair_shared_gate_up_) ok = metal_graph_matmul_q8_0_named_tensor("shared_up", \
                                                           il, \
                                                           pos0, \
                                                           metal_graph_batch_shared_up(g), \
@@ -30299,7 +30406,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                           tp_ffn_x ? tp_ffn_x : metal_graph_batch_ffn_norm(g), \
                                                           tp_rows); \
         DS4_METAL_PROFILE_FFN_STAGE("shared_gate_up"); \
-        if (ok && !canonical_shared_gate_up_) ok = ds4_gpu_swiglu_tensor(metal_graph_batch_shared_mid(g), \
+        if (ok && !canonical_shared_gate_up_ && !repair_shared_gate_up_) ok = ds4_gpu_swiglu_tensor(metal_graph_batch_shared_mid(g), \
                                              metal_graph_batch_shared_gate(g), \
                                              metal_graph_batch_shared_up(g), \
                                              (uint32_t)((uint64_t)tp_rows * shared_dim), \

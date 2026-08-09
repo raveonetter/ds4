@@ -63,7 +63,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-float-compare test-first-divergence test-family-repair-contracts test-metal-f32-inline-copy test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-float-compare test-first-divergence test-family-repair-contracts test-projection-repairs-metal test-metal-f32-inline-copy test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -120,6 +120,17 @@ tests/test_metal_f32_inline_copy: tests/test_metal_f32_inline_copy.o \
 
 test-metal-f32-inline-copy: tests/test_metal_f32_inline_copy
 	./tests/test_metal_f32_inline_copy
+
+tests/test_projection_repairs_metal.o: tests/test_projection_repairs_metal.c \
+		ds4_gpu.h ds4_float_compare.h
+	$(CC) $(FLOAT_COMPARE_CFLAGS) -I. -c -o $@ $<
+
+tests/test_projection_repairs_metal: tests/test_projection_repairs_metal.o \
+		ds4_float_compare.o family_repair.o ds4_metal.o
+	$(CC) $(FLOAT_COMPARE_CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-projection-repairs-metal: tests/test_projection_repairs_metal
+	./tests/test_projection_repairs_metal
 
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_help.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -204,6 +215,10 @@ test-metal-f32-inline-copy:
 	@echo "test-metal-f32-inline-copy requires macOS Metal" >&2
 	@false
 
+test-projection-repairs-metal:
+	@echo "test-projection-repairs-metal requires macOS Metal" >&2
+	@false
+
 tests/test_mxfp4_cuda: tests/test_mxfp4_cuda.cu $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -o $@ $^ $(CUDA_LDLIBS)
 
@@ -211,7 +226,7 @@ test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_float_compare.h first_divergence_capture.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_float_compare.h first_divergence_capture.h family_repair.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 family_repair.o: family_repair.c family_repair.h
@@ -310,7 +325,7 @@ ds4_eval_cpu.o: ds4_eval.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
 ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_agent.c
 
-ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
+ds4_metal.o: ds4_metal.m ds4_gpu.h family_repair.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h
@@ -518,4 +533,4 @@ test-float-compare: tests/test_float_compare
 	./tests/test_float_compare
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_float_compare tests/test_first_divergence tests/test_family_repair_contracts tests/test_metal_f32_inline_copy tests/test_mxfp4_metal tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_float_compare tests/test_first_divergence tests/test_family_repair_contracts tests/test_projection_repairs_metal tests/test_metal_f32_inline_copy tests/test_mxfp4_metal tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
