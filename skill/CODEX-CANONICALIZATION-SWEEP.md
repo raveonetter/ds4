@@ -425,6 +425,57 @@ existing per-row `ds4_gpu_attention_decode_heads_tensor` fallback. Compressed
 attention, inverse RoPE, output projection/fusion, replay, and production
 behavior remain unchanged.
 
+## Prefix-controlled CP4 input closure
+
+`DS4_CP4_PREFIX_INPUT_AB=1` requires the exact canonical prefix
+`QA,KV,QB,ATTN-RAW`. It does not select `CP4-TAIL` and suppresses the isolated
+tail primitive A/B for this run. The repaired generic Pass A snapshots the
+actual layer-0 row-0 `CP4-HEADS`, `cur_hc`, and attention `hc_split` operands.
+
+The authoritative ordinary Pass B retains its existing arithmetic, fusion,
+scheduling, and checkpoint tape. After it completes, the diagnostic restores
+S0 and runs one ordinary shadow Pass B with inline copies immediately after
+`hc_attn_pre_split`. The shadow is admissible only when every layer and row of
+its `after_attn_hc` is bitwise exact against the authoritative Pass B:
+
+```text
+PASSB_PREFIX_INPUT_PROBE_CONTROL result=EXACT
+```
+
+Only then are the repaired Pass-A operands compared with the controlled
+Pass-B snapshots. `post` and `comb` are read directly from the corresponding
+views of the captured `hc_split`; no tensor is recomputed for the probe.
+
+```sh
+DS4_FIRST_DIVERGENCE=1 \
+DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB,ATTN-RAW \
+DS4_CP4_PREFIX_INPUT_AB=1 \
+DS4_DSPARK_SCHEDULER=0 \
+./ds4 --dspark --dspark-confidence 0 \
+  -m ./ds4flash.gguf \
+  --mtp ./gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --tokens 16 --temp 0 --nothink \
+  -p 'Explain Redis in one sentence.' \
+  >canonical-sweep-cp4-prefix-input-ab.log 2>&1
+```
+
+Required result:
+
+```text
+C2B_CONTROL A0_vs_A1 PASS
+C2B_PROBE   A0_vs_A2 PASS
+C2B_RESULT  PASS
+PASSB_PREFIX_INPUT_PROBE_CONTROL result=EXACT ...
+CP4_PREFIX_INPUT_AB cp4_heads=EXACT cur_hc=EXACT|MISMATCH post=EXACT|MISMATCH comb=EXACT|MISMATCH
+CP4_PREFIX_OUTPUT_AB after_attn_hc=EXACT|MISMATCH
+CP4_PREFIX_ADJUDICATION ...
+```
+
+If `post` or `comb` differs, the remaining CP4 drift is already present at the
+output of `hc_attn_pre_split`, and the producer interval is
+`CP4-HEADS → hc_attn_pre_split`. If all four inputs are exact while
+`after_attn_hc` differs, the adjudication is `REOPEN_CP4_TAIL`.
+
 ## Isolated CP4 tail A/B
 
 No additional first-divergence checkpoint is introduced between `CP4-HEADS`

@@ -736,6 +736,66 @@ bool ds4_first_divergence_emit_qa_canonical_summary(
     return ferror(stream) == 0;
 }
 
+bool ds4_first_divergence_emit_cp4_prefix_input_summary(
+        FILE *stream,
+        bool cp4_heads_exact,
+        bool cur_hc_exact,
+        bool post_exact,
+        bool comb_exact,
+        bool after_attn_hc_exact) {
+    if (!stream) return false;
+    fprintf(stream,
+            "CP4_PREFIX_INPUT_AB cp4_heads=%s cur_hc=%s post=%s comb=%s\n",
+            cp4_heads_exact ? "EXACT" : "MISMATCH",
+            cur_hc_exact ? "EXACT" : "MISMATCH",
+            post_exact ? "EXACT" : "MISMATCH",
+            comb_exact ? "EXACT" : "MISMATCH");
+    fprintf(stream, "CP4_PREFIX_OUTPUT_AB after_attn_hc=%s\n",
+            after_attn_hc_exact ? "EXACT" : "MISMATCH");
+
+    if (!cp4_heads_exact) {
+        fputs("CP4_PREFIX_INPUT_FIRST_DIVERGENCE input=cp4_heads "
+              "producer=attention_core_inverse_rope "
+              "interval=BEFORE_CP4_HEADS\n",
+              stream);
+        fputs("CP4_PREFIX_ADJUDICATION result=INVALID_CANONICAL_PREFIX "
+              "reopen_cp4_tail=NO\n",
+              stream);
+    } else if (!cur_hc_exact) {
+        fputs("CP4_PREFIX_INPUT_FIRST_DIVERGENCE input=cur_hc "
+              "producer=layer_input_HC interval=BEFORE_CP4_HEADS\n",
+              stream);
+        fputs("CP4_PREFIX_ADJUDICATION result=UPSTREAM_RESIDUAL_DIVERGENCE "
+              "reopen_cp4_tail=NO\n",
+              stream);
+    } else if (!post_exact) {
+        fputs("CP4_PREFIX_INPUT_FIRST_DIVERGENCE input=post "
+              "producer=hc_attn_pre_split "
+              "interval=CP4-HEADS_to_hc_attn_pre_split\n",
+              stream);
+        fputs("CP4_PREFIX_ADJUDICATION result=HC_ATTN_PRE_SPLIT_INPUT_DIVERGENCE "
+              "reopen_cp4_tail=NO\n",
+              stream);
+    } else if (!comb_exact) {
+        fputs("CP4_PREFIX_INPUT_FIRST_DIVERGENCE input=comb "
+              "producer=hc_attn_pre_split "
+              "interval=CP4-HEADS_to_hc_attn_pre_split\n",
+              stream);
+        fputs("CP4_PREFIX_ADJUDICATION result=HC_ATTN_PRE_SPLIT_INPUT_DIVERGENCE "
+              "reopen_cp4_tail=NO\n",
+              stream);
+    } else if (!after_attn_hc_exact) {
+        fputs("CP4_PREFIX_ADJUDICATION result=REOPEN_CP4_TAIL "
+              "reopen_cp4_tail=YES\n",
+              stream);
+    } else {
+        fputs("CP4_PREFIX_ADJUDICATION result=EXACT_THROUGH_CP4 "
+              "reopen_cp4_tail=NO\n",
+              stream);
+    }
+    return ferror(stream) == 0;
+}
+
 bool ds4_first_divergence_emit_report(
         const ds4_first_divergence_capture *pass_a,
         const ds4_first_divergence_capture *pass_b,

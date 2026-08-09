@@ -334,6 +334,50 @@ int main(void) {
     ds4_first_divergence_capture_free(&interval_pass_a);
     ds4_first_divergence_capture_free(&interval_pass_b);
 
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_cp4_prefix_input_summary(
+        q_log, true, true, false, false, false));
+    REQUIRE(fflush(q_log) == 0);
+    REQUIRE(fseek(q_log, 0, SEEK_SET) == 0);
+    q_log_bytes = fread(q_log_text, 1, sizeof(q_log_text) - 1, q_log);
+    q_log_text[q_log_bytes] = '\0';
+    REQUIRE(strstr(q_log_text,
+                   "CP4_PREFIX_INPUT_AB cp4_heads=EXACT cur_hc=EXACT post=MISMATCH comb=MISMATCH") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "CP4_PREFIX_INPUT_FIRST_DIVERGENCE input=post producer=hc_attn_pre_split interval=CP4-HEADS_to_hc_attn_pre_split") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "CP4_PREFIX_ADJUDICATION result=HC_ATTN_PRE_SPLIT_INPUT_DIVERGENCE reopen_cp4_tail=NO") != NULL);
+    REQUIRE(fclose(q_log) == 0);
+
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_cp4_prefix_input_summary(
+        q_log, true, true, true, true, false));
+    REQUIRE(fflush(q_log) == 0);
+    REQUIRE(fseek(q_log, 0, SEEK_SET) == 0);
+    q_log_bytes = fread(q_log_text, 1, sizeof(q_log_text) - 1, q_log);
+    q_log_text[q_log_bytes] = '\0';
+    REQUIRE(strstr(q_log_text,
+                   "CP4_PREFIX_INPUT_AB cp4_heads=EXACT cur_hc=EXACT post=EXACT comb=EXACT") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "CP4_PREFIX_OUTPUT_AB after_attn_hc=MISMATCH") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "CP4_PREFIX_ADJUDICATION result=REOPEN_CP4_TAIL reopen_cp4_tail=YES") != NULL);
+    REQUIRE(fclose(q_log) == 0);
+
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_cp4_prefix_input_summary(
+        q_log, true, true, true, true, true));
+    REQUIRE(fflush(q_log) == 0);
+    REQUIRE(fseek(q_log, 0, SEEK_SET) == 0);
+    q_log_bytes = fread(q_log_text, 1, sizeof(q_log_text) - 1, q_log);
+    q_log_text[q_log_bytes] = '\0';
+    REQUIRE(strstr(q_log_text,
+                   "CP4_PREFIX_ADJUDICATION result=EXACT_THROUGH_CP4 reopen_cp4_tail=NO") != NULL);
+    REQUIRE(fclose(q_log) == 0);
+
     puts("first-divergence forced pair: OK");
     return 0;
 }
