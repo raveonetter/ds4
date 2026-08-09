@@ -741,9 +741,9 @@ int ds4_gpu_matmul_f16_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-/* Metal family repairs: one command encoder with an ordinary one-row decode
- * dispatch per row.  Kernel entry, tensor shape, grid geometry, and reduction
- * order therefore match canonical decode; only buffer offsets advance. */
+/* Metal family repairs: invoke the ordinary one-row decode entry per row.
+ * Model mapping, pipeline selection, command encoding, tensor shape, grid
+ * geometry, and reduction order therefore match canonical decode. */
 int ds4_gpu_matmul_f16_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,
