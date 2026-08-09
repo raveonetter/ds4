@@ -60,6 +60,32 @@ FIRST_DIVERGENCE NONE
 
 Here `actual` is generic Pass A and `expected` is canonical sequential Pass B.
 
+## E2 CP4-tail input closure
+
+`DS4_CP4_TAIL_E2=1` implies the first-divergence diagnostic. The authoritative
+Pass B remains unchanged. After it completes, E2 restores S0 and runs a
+diagnostic sequential shadow replay that snapshots the residual and HC split
+at the pre-head producer boundary. A post-layer hook retains heads and CP4.
+The shadow CP4 must first be bitwise exact to the authoritative Pass B CP4;
+this is the non-perturbation control for the added operand snapshots.
+
+For row 0/layer 0, E2 compares Pass A against the controlled Pass-B shadow for
+`cp4_heads`, `cur_hc`, `hc_split.post`, and `hc_split.comb`, then verifies the
+shared output-A/output-B weight descriptors and normalized row/group mapping.
+It emits:
+
+```text
+CP4_TAIL_INPUT_AB heads=... cur_hc=... post=... comb=... weights_same=... metadata_same=...
+```
+
+Any mismatch stops the experiment before output-B/HC decomposition and reports
+the earliest differing operand plus its producer. If every input is exact, E2
+feeds the Pass-B snapshots through the isolated sequential tail and requires:
+
+```text
+PASS_B_SELF_REPLAY result=EXACT ... replay_first_bits=0xbb9ce2ad
+```
+
 ## Build
 
 ```sh
@@ -78,9 +104,24 @@ DS4_DSPARK_SCHEDULER=0 \
   -p 'Explain Redis in one sentence.'
 ```
 
+Run E2 on the same forced proposal block with:
+
+```sh
+DS4_CP4_TAIL_E2=1 \
+DS4_DSPARK_SCHEDULER=0 \
+./ds4 --dspark --dspark-confidence 0 \
+  -m "$PWD/ds4flash.gguf" \
+  --mtp "$PWD/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf" \
+  --tokens 16 --temp 0 --nothink \
+  -p 'Explain Redis in one sentence.' \
+  2>&1 | tee e2-sequential-tail.log
+```
+
 The process exits immediately after the first available proposal block. A
 successful experiment run exits zero whether the paths are exact or diverged;
 setup, capture, restore, synchronization, and readback errors exit nonzero.
+For E2, an input mismatch is a valid stop result; a failed Pass-B probe control
+or failed self-replay acceptance exits nonzero.
 
 ## Local validation
 

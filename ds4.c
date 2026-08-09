@@ -15294,12 +15294,17 @@ typedef struct {
     ds4_gpu_tensor *cp3_index_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp3_index_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp3_index_cache[DS4_MAX_LAYER];
+    /* E2 snapshots actual operands without changing tail arithmetic. */
+    ds4_gpu_tensor *cp4_heads[DS4_MAX_LAYER];
+    ds4_gpu_tensor *cp4_residual[DS4_MAX_LAYER];
+    ds4_gpu_tensor *cp4_split[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp4[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp5[DS4_MAX_LAYER];
     uint32_t cp3_n_comp[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
     uint32_t cp3_n_index[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
     uint32_t attention_hooks;
     uint32_t ffn_hooks;
+    uint32_t tail_input_hooks;
 } ds4_c2b_capture;
 
 /* The diagnostic command is single-session and single-device by contract.
@@ -15309,10 +15314,16 @@ static ds4_c2b_capture *g_ds4_c2b_capture;
 /* C4/C5 attaches a second diagnostic-only hook to the ordinary sequential
  * decoder.  It is NULL for every production call. */
 static ds4_c2b_capture *g_ds4_fd_sequential_capture;
+/* E2 enables pre-head operand copies only for a post-Pass-B shadow replay.
+ * The authoritative Pass B keeps its original command schedule. */
+static bool g_ds4_e2_capture_tail_inputs;
 
 static bool ds4_fd_capture_decode_layer(ds4_gpu_graph *g,
                                         uint32_t il,
                                         uint32_t pos);
+static bool ds4_fd_capture_decode_tail_inputs(ds4_gpu_graph *g,
+                                              uint32_t il,
+                                              uint32_t pos);
 
 /* Tensors that are temporary for chunked prefill and grouped multi-session
  * decode. The batched server serializes every operation that uses them, so one
@@ -22048,6 +22059,9 @@ static bool metal_graph_encode_decode_layer_phase(
     if (ok) {
         metal_graph_debug_dump_tensor("attn_norm", metal_graph_attn_norm(g), DS4_N_EMBD, il, pos);
     }
+    /* E2 input capture sits at the already-materialized HC-pre boundary,
+     * before CP4 heads exist.  It never splits or rewrites the fused tail. */
+    if (ok) ok = ds4_fd_capture_decode_tail_inputs(g, il, pos);
     if (phase == METAL_DECODE_LAYER_TO_QKV) return ok;
     }
     if (!resume_after_attn) {
@@ -29668,6 +29682,11 @@ static bool ds4_c2b_capture_attention(ds4_gpu_graph *g,
         (uint64_t)n_tokens * c->q_values[il] * sizeof(float);
     const uint64_t kv_bytes =
         (uint64_t)n_tokens * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t heads_bytes =
+        (uint64_t)n_tokens * DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t split_bytes =
+        (uint64_t)n_tokens *
+        (2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC) * sizeof(float);
     const uint64_t hc_bytes =
         (uint64_t)n_tokens * DS4_N_HC * DS4_N_EMBD * sizeof(float);
     bool ok =
@@ -29677,8 +29696,15 @@ static bool ds4_c2b_capture_attention(ds4_gpu_graph *g,
                             metal_graph_batch_qr(g), 0, q_bytes) &&
         ds4_c2b_inline_copy(c->cp2_kv_p[il], 0,
                             metal_graph_batch_kv_raw(g), 0, kv_bytes) &&
+        ds4_c2b_inline_copy(c->cp4_heads[il], 0,
+                            metal_graph_batch_heads(g), 0, heads_bytes) &&
+        ds4_c2b_inline_copy(c->cp4_residual[il], 0,
+                            metal_graph_batch_cur_hc(g), 0, hc_bytes) &&
+        ds4_c2b_inline_copy(c->cp4_split[il], 0,
+                            metal_graph_batch_hc_split(g), 0, split_bytes) &&
         ds4_c2b_inline_copy(c->cp4[il], 0,
                             metal_graph_batch_after_attn_hc(g), 0, hc_bytes);
+    if (ok) c->tail_input_hooks++;
 
     const uint64_t raw_row_bytes =
         (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
@@ -29787,6 +29813,33 @@ static bool ds4_c2b_capture_ffn(ds4_gpu_graph *g,
                                metal_graph_batch_next_hc(g), 0, bytes);
 }
 
+/* Capture the Pass-B residual and HC split at their producer boundary.  This
+ * boundary precedes CP4 heads, so the real output projection / fused HC tail
+ * remains one uninterrupted production encode. */
+static bool ds4_fd_capture_decode_tail_inputs(ds4_gpu_graph *g,
+                                              uint32_t il,
+                                              uint32_t pos) {
+    ds4_c2b_capture *c = g_ds4_fd_sequential_capture;
+    if (!c || !g_ds4_e2_capture_tail_inputs) return true;
+    if (c->graph != g || il >= DS4_N_LAYER || pos < c->start ||
+        pos - c->start >= c->n_tokens) {
+        return false;
+    }
+    const uint32_t r = pos - c->start;
+    const uint64_t hc_bytes =
+        (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    const uint64_t split_bytes =
+        (2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC) *
+        sizeof(float);
+    const bool ok =
+        ds4_c2b_inline_copy(c->cp4_residual[il], (uint64_t)r * hc_bytes,
+                            metal_graph_cur_hc(g), 0, hc_bytes) &&
+        ds4_c2b_inline_copy(c->cp4_split[il], (uint64_t)r * split_bytes,
+                            metal_graph_hc_split(g), 0, split_bytes);
+    if (ok) c->tail_input_hooks++;
+    return ok;
+}
+
 /* Capture one layer of the canonical sequential path after the complete
  * layer encoder has populated all frozen source objects and before its HC
  * pointers are swapped.  Every copy remains in the decoder's current compute
@@ -29805,6 +29858,8 @@ static bool ds4_fd_capture_decode_layer(ds4_gpu_graph *g,
     const uint64_t cp1_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint64_t q_bytes = c->q_values[il] * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t heads_bytes =
+        (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
     const uint64_t hc_bytes =
         (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
     bool ok =
@@ -29818,6 +29873,8 @@ static bool ds4_fd_capture_decode_layer(ds4_gpu_graph *g,
                             g->layer_raw_cache[il],
                             (uint64_t)(pos % g->raw_cap) * kv_bytes,
                             kv_bytes) &&
+        ds4_c2b_inline_copy(c->cp4_heads[il], (uint64_t)r * heads_bytes,
+                            metal_graph_heads(g), 0, heads_bytes) &&
         ds4_c2b_inline_copy(c->cp4[il], (uint64_t)r * hc_bytes,
                             metal_graph_after_attn_hc(g), 0, hc_bytes) &&
         ds4_c2b_inline_copy(c->cp5[il], (uint64_t)r * hc_bytes,
@@ -50380,6 +50437,9 @@ static void ds4_c2b_capture_free(ds4_c2b_capture *c) {
         DS4_C2B_FREE(cp3_index_state_kv);
         DS4_C2B_FREE(cp3_index_state_score);
         DS4_C2B_FREE(cp3_index_cache);
+        DS4_C2B_FREE(cp4_heads);
+        DS4_C2B_FREE(cp4_residual);
+        DS4_C2B_FREE(cp4_split);
         DS4_C2B_FREE(cp4);
         DS4_C2B_FREE(cp5);
 #undef DS4_C2B_FREE
@@ -50410,11 +50470,18 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
         (uint64_t)n_tokens * DS4_N_HEAD_DIM * sizeof(float);
     const uint64_t hc_bytes =
         (uint64_t)n_tokens * DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    const uint64_t heads_bytes =
+        (uint64_t)n_tokens * DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t split_bytes =
+        (uint64_t)n_tokens *
+        (2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC) * sizeof(float);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *layer = &weights->layer[il];
         if (!g->layer_raw_cache[il] || !layer->attn_q_a ||
             !metal_graph_batch_attn_norm(g) || !metal_graph_batch_qr(g) ||
             !metal_graph_batch_kv_raw(g) ||
+            !metal_graph_batch_heads(g) || !metal_graph_batch_cur_hc(g) ||
+            !metal_graph_batch_hc_split(g) ||
             !metal_graph_batch_after_attn_hc(g) ||
             !metal_graph_batch_next_hc(g)) {
             ds4_c2b_capture_free(c);
@@ -50427,6 +50494,9 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
             ds4_gpu_tensor_bytes(metal_graph_batch_attn_norm(g)) < cp1_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_qr(g)) < q_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_kv_raw(g)) < kv_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_heads(g)) < heads_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_cur_hc(g)) < hc_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_hc_split(g)) < split_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_after_attn_hc(g)) < hc_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_next_hc(g)) < hc_bytes) {
             ds4_c2b_capture_free(c);
@@ -50436,10 +50506,15 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
         c->cp2_q[il] = ds4_gpu_tensor_alloc(q_bytes);
         c->cp2_kv_p[il] = ds4_gpu_tensor_alloc(kv_bytes);
         c->cp2_kv_r[il] = ds4_gpu_tensor_alloc(kv_bytes);
+        c->cp4_heads[il] = ds4_gpu_tensor_alloc(heads_bytes);
+        c->cp4_residual[il] = ds4_gpu_tensor_alloc(hc_bytes);
+        c->cp4_split[il] = ds4_gpu_tensor_alloc(split_bytes);
         c->cp4[il] = ds4_gpu_tensor_alloc(hc_bytes);
         c->cp5[il] = ds4_gpu_tensor_alloc(hc_bytes);
         if (!c->cp1[il] || !c->cp2_q[il] || !c->cp2_kv_p[il] ||
-            !c->cp2_kv_r[il] || !c->cp4[il] || !c->cp5[il]) {
+            !c->cp2_kv_r[il] || !c->cp4_heads[il] ||
+            !c->cp4_residual[il] || !c->cp4_split[il] ||
+            !c->cp4[il] || !c->cp5[il]) {
             ds4_c2b_capture_free(c);
             return false;
         }
@@ -51389,6 +51464,288 @@ static bool ds4_fd_compare_captures(const ds4_c2b_capture *actual,
     return true;
 }
 
+typedef struct {
+    bool read_ok;
+    bool exact;
+    ds4_float_compare_result detail;
+    uint32_t first_actual;
+    uint32_t first_expected;
+} ds4_e2_ab_result;
+
+static ds4_e2_ab_result ds4_e2_compare_f32(
+        const ds4_gpu_tensor *actual,
+        uint64_t actual_offset,
+        const ds4_gpu_tensor *expected,
+        uint64_t expected_offset,
+        size_t values) {
+    ds4_e2_ab_result out = {0};
+    const uint64_t bytes = (uint64_t)values * sizeof(float);
+    if (!actual || !expected || values == 0 ||
+        actual_offset > ds4_gpu_tensor_bytes(actual) ||
+        expected_offset > ds4_gpu_tensor_bytes(expected) ||
+        bytes > ds4_gpu_tensor_bytes(actual) - actual_offset ||
+        bytes > ds4_gpu_tensor_bytes(expected) - expected_offset) {
+        return out;
+    }
+    float *a = xmalloc((size_t)bytes);
+    float *e = xmalloc((size_t)bytes);
+    out.read_ok =
+        ds4_gpu_tensor_read(actual, actual_offset, a, bytes) != 0 &&
+        ds4_gpu_tensor_read(expected, expected_offset, e, bytes) != 0;
+    if (out.read_ok) {
+        memcpy(&out.first_actual, a, sizeof(out.first_actual));
+        memcpy(&out.first_expected, e, sizeof(out.first_expected));
+        out.exact = ds4_float_compare_exact(a, e, values, &out.detail);
+    }
+    free(a);
+    free(e);
+    return out;
+}
+
+static void ds4_e2_report_input_object(const char *name,
+                                       const char *producer,
+                                       const ds4_e2_ab_result *r,
+                                       size_t values) {
+    if (!r->read_ok) {
+        fprintf(stderr,
+                "CP4_TAIL_INPUT_OBJECT input=%s producer=%s result=ERROR "
+                "elements=%zu\n",
+                name, producer, values);
+        return;
+    }
+    fprintf(stderr,
+            "CP4_TAIL_INPUT_OBJECT input=%s producer=%s result=%s "
+            "elements=%zu mismatch_count=%zu first_index=%zu "
+            "pass_a_bits=0x%08" PRIx32 " pass_b_bits=0x%08" PRIx32 "\n",
+            name, producer, r->exact ? "EXACT" : "MISMATCH", values,
+            r->detail.mismatch_count, r->detail.first_mismatch_index,
+            r->exact ? r->first_actual : r->detail.first_actual_bits,
+            r->exact ? r->first_expected : r->detail.first_expected_bits);
+}
+
+static bool ds4_e2_pass_b_self_replay(
+        const ds4_model *model,
+        const ds4_layer_weights *layer,
+        const ds4_c2b_capture *pass_b,
+        const ds4_c2b_capture *pass_b_probe,
+        uint32_t row,
+        uint32_t il) {
+    const uint64_t heads_values = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t hc_values = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t split_values =
+        2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t low_values =
+        (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_view(
+        pass_b_probe->cp4_heads[il],
+        (uint64_t)row * heads_values * sizeof(float),
+        heads_values * sizeof(float));
+    ds4_gpu_tensor *residual = ds4_gpu_tensor_view(
+        pass_b_probe->cp4_residual[il],
+        (uint64_t)row * hc_values * sizeof(float),
+        hc_values * sizeof(float));
+    ds4_gpu_tensor *split = ds4_gpu_tensor_view(
+        pass_b_probe->cp4_split[il],
+        (uint64_t)row * split_values * sizeof(float),
+        split_values * sizeof(float));
+    ds4_gpu_tensor *low = ds4_gpu_tensor_alloc(low_values * sizeof(float));
+    ds4_gpu_tensor *attn_out =
+        ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(hc_values * sizeof(float));
+    bool ok = heads && residual && split && low && attn_out && out;
+    bool commands_open = false;
+    if (ok) {
+        commands_open = ds4_gpu_begin_commands() != 0;
+        ok = commands_open;
+    }
+    const uint32_t group_dim =
+        DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
+    if (ok) {
+        ok = ds4_gpu_attention_output_low_q8_tensor(
+                 low, model->map, model->size,
+                 layer->attn_output_a->abs_offset,
+                 group_dim, DS4_N_LORA_O, DS4_N_OUT_GROUP, heads) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(
+                 attn_out, model->map, model->size,
+                 layer->attn_output_b->abs_offset,
+                 low_values, DS4_N_EMBD, low, 1) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_hc_expand_split_tensor(
+                 out, attn_out, residual, split,
+                 DS4_N_EMBD, DS4_N_HC) != 0;
+    }
+    if (commands_open && ds4_gpu_end_commands() == 0) {
+        ok = false;
+    }
+    if (ok) ok = ds4_gpu_synchronize() != 0;
+
+    ds4_e2_ab_result replay = {0};
+    if (ok) {
+        replay = ds4_e2_compare_f32(
+            out, 0, pass_b->cp4[il],
+            (uint64_t)row * hc_values * sizeof(float),
+            (size_t)hc_values);
+        ok = replay.read_ok;
+    }
+    const uint32_t required_first = UINT32_C(0xbb9ce2ad);
+    const bool first_exact = ok &&
+        replay.first_actual == required_first &&
+        replay.first_expected == required_first;
+    if (!ok) {
+        fprintf(stderr, "PASS_B_SELF_REPLAY result=ERROR\n");
+    } else {
+        fprintf(stderr,
+                "PASS_B_SELF_REPLAY result=%s elements=%" PRIu64 " "
+                "mismatch_count=%zu first_index=%zu replay_first_bits=0x%08" PRIx32
+                " passb_first_bits=0x%08" PRIx32
+                " required_first_bits=0x%08" PRIx32 " first_element=%s\n",
+                replay.exact && first_exact ? "EXACT" : "MISMATCH",
+                hc_values, replay.detail.mismatch_count,
+                replay.detail.first_mismatch_index,
+                replay.first_actual, replay.first_expected, required_first,
+                first_exact ? "PASS" : "FAIL");
+    }
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(attn_out);
+    ds4_gpu_tensor_free(low);
+    ds4_gpu_tensor_free(split);
+    ds4_gpu_tensor_free(residual);
+    ds4_gpu_tensor_free(heads);
+    return ok && replay.exact && first_exact;
+}
+
+static bool ds4_e2_close_tail_inputs(
+        const ds4_model *model,
+        const ds4_weights *weights,
+        const ds4_c2b_capture *pass_a,
+        const ds4_c2b_capture *pass_b,
+        const ds4_c2b_capture *pass_b_probe) {
+    const uint32_t row = 0;
+    const uint32_t il = 0;
+    const uint64_t heads_values = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t hc_values = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t split_values =
+        2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t heads_off = (uint64_t)row * heads_values * sizeof(float);
+    const uint64_t hc_off = (uint64_t)row * hc_values * sizeof(float);
+    const uint64_t split_off = (uint64_t)row * split_values * sizeof(float);
+    const uint64_t post_off = split_off + (uint64_t)DS4_N_HC * sizeof(float);
+    const uint64_t comb_off = split_off + (uint64_t)(2u * DS4_N_HC) * sizeof(float);
+    if (!model || !weights || !pass_a || !pass_b || !pass_b_probe ||
+        pass_a->n_tokens == 0 || pass_b->n_tokens == 0 ||
+        pass_b_probe->n_tokens == 0) {
+        fprintf(stderr, "CP4_TAIL_INPUT_AB result=ERROR reason=setup\n");
+        return false;
+    }
+
+    ds4_e2_ab_result probe_control = ds4_e2_compare_f32(
+        pass_b_probe->cp4[il], hc_off, pass_b->cp4[il], hc_off,
+        (size_t)hc_values);
+    fprintf(stderr,
+            "PASSB_INPUT_PROBE_CONTROL result=%s elements=%" PRIu64 "\n",
+            probe_control.read_ok && probe_control.exact ? "EXACT" : "FAIL",
+            hc_values);
+    if (!probe_control.read_ok || !probe_control.exact) return false;
+
+    ds4_e2_ab_result heads = ds4_e2_compare_f32(
+        pass_a->cp4_heads[il], heads_off,
+        pass_b_probe->cp4_heads[il], heads_off, (size_t)heads_values);
+    ds4_e2_ab_result residual = ds4_e2_compare_f32(
+        pass_a->cp4_residual[il], hc_off,
+        pass_b_probe->cp4_residual[il], hc_off, (size_t)hc_values);
+    ds4_e2_ab_result post = ds4_e2_compare_f32(
+        pass_a->cp4_split[il], post_off,
+        pass_b_probe->cp4_split[il], post_off, DS4_N_HC);
+    ds4_e2_ab_result comb = ds4_e2_compare_f32(
+        pass_a->cp4_split[il], comb_off,
+        pass_b_probe->cp4_split[il], comb_off,
+        (size_t)DS4_N_HC * DS4_N_HC);
+    ds4_e2_report_input_object("heads", "attention_core_inverse_rope",
+                               &heads, (size_t)heads_values);
+    ds4_e2_report_input_object("cur_hc", "layer_input_HC",
+                               &residual, (size_t)hc_values);
+    ds4_e2_report_input_object("post", "hc_attn_pre_split",
+                               &post, DS4_N_HC);
+    ds4_e2_report_input_object("comb", "hc_attn_pre_split",
+                               &comb, (size_t)DS4_N_HC * DS4_N_HC);
+
+    const ds4_layer_weights *layer = &weights->layer[il];
+    const bool weights_same = layer->attn_output_a && layer->attn_output_b &&
+        layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
+        layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&
+        layer->attn_output_a->ndim == 2 &&
+        layer->attn_output_b->ndim == 2 &&
+        layer->attn_output_a->dim[0] ==
+            DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP) &&
+        layer->attn_output_a->dim[1] ==
+            (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O &&
+        layer->attn_output_b->dim[0] ==
+            (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O &&
+        layer->attn_output_b->dim[1] == DS4_N_EMBD;
+    const bool metadata_same = pass_a->graph == pass_b_probe->graph &&
+        pass_a->start == pass_b_probe->start &&
+        pass_a->q_values[il] == pass_b_probe->q_values[il] &&
+        row < pass_a->n_tokens && row < pass_b_probe->n_tokens;
+    fprintf(stderr,
+            "CP4_TAIL_WEIGHTS_AB output_a_offset=%" PRIu64
+            " output_a_type=%u output_b_offset=%" PRIu64
+            " output_b_type=%u model_map_same=PASS model_size=%" PRIu64
+            " result=%s\n",
+            layer->attn_output_a ? layer->attn_output_a->abs_offset : 0,
+            layer->attn_output_a ? layer->attn_output_a->type : 0,
+            layer->attn_output_b ? layer->attn_output_b->abs_offset : 0,
+            layer->attn_output_b ? layer->attn_output_b->type : 0,
+            model->size, weights_same ? "PASS" : "FAIL");
+    fprintf(stderr,
+            "CP4_TAIL_METADATA_AB row=%u layer=%u pos=%u group0=0 groups=%u "
+            "group_dim=%u rank=%u group_index_base=0 group_index_stride=%u "
+            "head_row=0 residual_row=0 split_row=0 post_index=%u "
+            "comb_index=%u output_row=0 pass_a_batch_extent=%u "
+            "pass_b_extent=1 result=%s\n",
+            row, il, pass_a->start + row, DS4_N_OUT_GROUP,
+            DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP),
+            DS4_N_LORA_O, DS4_N_OUT_GROUP, DS4_N_HC, 2u * DS4_N_HC,
+            pass_a->n_tokens,
+            metadata_same ? "PASS" : "FAIL");
+    fprintf(stderr,
+            "CP4_TAIL_INPUT_AB heads=%s cur_hc=%s post=%s comb=%s "
+            "weights_same=%s metadata_same=%s\n",
+            heads.read_ok && heads.exact ? "EXACT" : "MISMATCH",
+            residual.read_ok && residual.exact ? "EXACT" : "MISMATCH",
+            post.read_ok && post.exact ? "EXACT" : "MISMATCH",
+            comb.read_ok && comb.exact ? "EXACT" : "MISMATCH",
+            weights_same ? "PASS" : "FAIL",
+            metadata_same ? "PASS" : "FAIL");
+
+    const bool reads_ok = heads.read_ok && residual.read_ok &&
+                          post.read_ok && comb.read_ok;
+    const bool inputs_exact = reads_ok && heads.exact && residual.exact &&
+                              post.exact && comb.exact &&
+                              weights_same && metadata_same;
+    if (!inputs_exact) {
+        const char *input = !weights_same ? "weights" :
+                            !residual.exact ? "cur_hc" :
+                            !post.exact ? "post" :
+                            !comb.exact ? "comb" :
+                            !heads.exact ? "heads" : "metadata";
+        const char *producer = !weights_same ? "model_load" :
+            !residual.exact ? "layer_input_HC" :
+            (!post.exact || !comb.exact) ? "hc_attn_pre_split" :
+            !heads.exact ? "attention_core_inverse_rope" : "row_mapping";
+        fprintf(stderr,
+                "CP4_TAIL_INPUT_FIRST_DIVERGENCE input=%s producer=%s\n",
+                input, producer);
+        fprintf(stderr,
+                "PASS_B_SELF_REPLAY result=SKIPPED reason=tail_input_mismatch\n");
+        return reads_ok;
+    }
+    return ds4_e2_pass_b_self_replay(model, layer, pass_b, pass_b_probe,
+                                      row, il);
+}
+
 static bool ds4_fd_run_pass_a(ds4_session *s,
                               const int *tokens,
                               uint32_t n_tokens,
@@ -51401,6 +51758,7 @@ static bool ds4_fd_run_pass_a(ds4_session *s,
     capture->mode = DS4_C2B_CAPTURE_FULL;
     capture->attention_hooks = 0;
     capture->ffn_hooks = 0;
+    capture->tail_input_hooks = 0;
     g_ds4_c2b_capture = capture;
     bool ok = metal_graph_verify_suffix_tops(
         &s->graph, &s->engine->model, &s->engine->weights,
@@ -51408,17 +51766,21 @@ static bool ds4_fd_run_pass_a(ds4_session *s,
         n_tokens > 1u ? row_tops : NULL, NULL, NULL);
     g_ds4_c2b_capture = NULL;
     return ok && capture->attention_hooks == DS4_N_LAYER &&
-           capture->ffn_hooks == DS4_N_LAYER;
+           capture->ffn_hooks == DS4_N_LAYER &&
+           capture->tail_input_hooks == DS4_N_LAYER;
 }
 
 static bool ds4_fd_run_pass_b(ds4_session *s,
                               const int *tokens,
                               uint32_t n_tokens,
                               uint32_t start,
-                              ds4_c2b_capture *capture) {
+                              ds4_c2b_capture *capture,
+                              bool capture_tail_inputs) {
     float *logits = s->spec_row_logits;
     if (!logits) return false;
     capture->attention_hooks = 0;
+    capture->tail_input_hooks = 0;
+    g_ds4_e2_capture_tail_inputs = capture_tail_inputs;
     g_ds4_fd_sequential_capture = capture;
     bool ok = true;
     for (uint32_t r = 0; ok && r < n_tokens; r++) {
@@ -51429,7 +51791,10 @@ static bool ds4_fd_run_pass_b(ds4_session *s,
         if (ok) token_vec_push(&s->checkpoint, tokens[r]);
     }
     g_ds4_fd_sequential_capture = NULL;
-    return ok && capture->attention_hooks == n_tokens * DS4_N_LAYER;
+    g_ds4_e2_capture_tail_inputs = false;
+    return ok && capture->attention_hooks == n_tokens * DS4_N_LAYER &&
+           capture->tail_input_hooks ==
+               (capture_tail_inputs ? n_tokens * DS4_N_LAYER : 0u);
 }
 
 static int ds4_fd_run(ds4_session *s,
@@ -51439,11 +51804,16 @@ static int ds4_fd_run(ds4_session *s,
                       uint32_t start) {
     int tokens[DS4_DSPARK_MAX_BLOCK_SIZE];
     ds4_c2b_raw_s0 raw = {0};
-    ds4_c2b_capture pass_a = {0}, pass_b = {0};
+    ds4_c2b_capture pass_a = {0}, pass_b = {0}, pass_b_probe = {0};
     ds4_gpu_graph *g = &s->graph;
+    const char *e2_env = getenv("DS4_CP4_TAIL_E2");
+    const bool e2_enabled =
+        e2_env && e2_env[0] && strcmp(e2_env, "0") != 0;
     memcpy(tokens, drafts, (size_t)n_tokens * sizeof(tokens[0]));
     ds4_gpu_tensor *batch_cur = g->batch_cur_hc_by_tier[0];
     ds4_gpu_tensor *batch_next = g->batch_next_hc_by_tier[0];
+    ds4_gpu_tensor *seq_cur = g->cur_hc_by_tier[0];
+    ds4_gpu_tensor *seq_after = g->after_ffn_hc_by_tier[0];
     bool setup_ok =
         s->engine->backend == DS4_BACKEND_METAL && !g->placement &&
         !g->ssd_streaming && g->tp_world <= 1u && n_tokens != 0 &&
@@ -51453,6 +51823,10 @@ static int ds4_fd_run(ds4_session *s,
             &pass_a, g, &s->engine->weights, start, n_tokens) &&
             ds4_c2b_capture_alloc(
                 &pass_b, g, &s->engine->weights, start, n_tokens);
+        if (setup_ok && e2_enabled) {
+            setup_ok = ds4_c2b_capture_alloc(
+                &pass_b_probe, g, &s->engine->weights, start, n_tokens);
+        }
     }
     if (setup_ok) {
         setup_ok = ds4_c2b_raw_s0_snapshot(&raw, g, start, n_tokens);
@@ -51461,25 +51835,53 @@ static int ds4_fd_run(ds4_session *s,
         ds4_fd_run_pass_a(s, tokens, n_tokens, start, &pass_a);
     bool restore_ok = pass_a_ok &&
         ds4_c2b_restore_s0(s, frontier, &raw, start, batch_cur, batch_next);
+    if (restore_ok) {
+        g->cur_hc_by_tier[0] = seq_cur;
+        g->after_ffn_hc_by_tier[0] = seq_after;
+    }
     bool pass_b_ok = restore_ok &&
-        ds4_fd_run_pass_b(s, tokens, n_tokens, start, &pass_b);
+        ds4_fd_run_pass_b(s, tokens, n_tokens, start, &pass_b, false);
     bool sync_ok = pass_b_ok && ds4_gpu_synchronize() != 0;
     bool compare_ok = sync_ok && ds4_fd_compare_captures(&pass_a, &pass_b);
+    bool e2_restore_ok = true;
+    bool e2_pass_b_ok = true;
+    bool e2_sync_ok = true;
+    bool e2_ok = true;
+    if (e2_enabled && compare_ok) {
+        e2_restore_ok = ds4_c2b_restore_s0(
+            s, frontier, &raw, start, batch_cur, batch_next);
+        if (e2_restore_ok) {
+            g->cur_hc_by_tier[0] = seq_cur;
+            g->after_ffn_hc_by_tier[0] = seq_after;
+            e2_pass_b_ok = ds4_fd_run_pass_b(
+                s, tokens, n_tokens, start, &pass_b_probe, true);
+        }
+        e2_sync_ok = e2_restore_ok && e2_pass_b_ok &&
+                     ds4_gpu_synchronize() != 0;
+        e2_ok = e2_sync_ok && ds4_e2_close_tail_inputs(
+            &s->engine->model, &s->engine->weights,
+            &pass_a, &pass_b, &pass_b_probe);
+    }
     if (!setup_ok || !pass_a_ok || !restore_ok || !pass_b_ok || !sync_ok ||
-        !compare_ok) {
+        !compare_ok || !e2_ok) {
         fprintf(stderr,
                 "FIRST_DIVERGENCE_ERROR setup=%d pass_a=%d restore=%d "
-                "pass_b=%d sync=%d compare=%d\n",
+                "pass_b=%d sync=%d compare=%d e2_restore=%d "
+                "e2_pass_b=%d e2_sync=%d e2=%d\n",
                 setup_ok ? 1 : 0, pass_a_ok ? 1 : 0,
                 restore_ok ? 1 : 0, pass_b_ok ? 1 : 0,
-                sync_ok ? 1 : 0, compare_ok ? 1 : 0);
+                sync_ok ? 1 : 0, compare_ok ? 1 : 0,
+                e2_restore_ok ? 1 : 0, e2_pass_b_ok ? 1 : 0,
+                e2_sync_ok ? 1 : 0, e2_ok ? 1 : 0);
     }
     g_ds4_c2b_capture = NULL;
     g_ds4_fd_sequential_capture = NULL;
+    g_ds4_e2_capture_tail_inputs = false;
     ds4_c2b_capture_free(&pass_a);
     ds4_c2b_capture_free(&pass_b);
+    ds4_c2b_capture_free(&pass_b_probe);
     ds4_c2b_raw_s0_free(&raw);
-    return compare_ok ? 0 : 1;
+    return compare_ok && e2_ok ? 0 : 1;
 }
 
 /* Commit an intermediate state captured by a tiny speculative verifier.
@@ -63078,8 +63480,11 @@ static int ds4_session_eval_dspark_speculative_argmax(
     const bool c2b_enabled =
         c2b_env && c2b_env[0] && strcmp(c2b_env, "0") != 0;
     const char *fd_env = getenv("DS4_FIRST_DIVERGENCE");
+    const char *e2_env = getenv("DS4_CP4_TAIL_E2");
+    const bool e2_enabled =
+        e2_env && e2_env[0] && strcmp(e2_env, "0") != 0;
     const bool fd_enabled =
-        fd_env && fd_env[0] && strcmp(fd_env, "0") != 0;
+        e2_enabled || (fd_env && fd_env[0] && strcmp(fd_env, "0") != 0);
     const bool diagnostic_enabled = c2b_enabled || fd_enabled;
     const int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
     if (target_top != drafts[0] && !diagnostic_enabled) {
