@@ -806,3 +806,54 @@ grep -E '^(C2B_|CP3F_|FIRST_DIVERGENCE |CP4_TO_CP5_SWEEP)' \
 The family is proven only when the isolated same-input A/B executes, all four
 trial gates pass, the selected component substitutions repair the layer-2
 CP3-P objects, and T3 advances the global first divergence beyond CP3-P.
+
+## Compressed zero-prefix attention forward sweep
+
+`DS4_MIXED_ATTN_FAMILY_SWEEP=1` starts from the proven T3 compressor result
+and audits the layer-2 static-mixed attention boundary.  It is valid only with
+the CP3 family and CP4→CP5 sweep enabled.
+
+The diagnostic performs:
+
+1. a bitwise replay of the real generic attention wrapper;
+2. a semantic input comparison over Q and the visible F16 raw/compressed KV
+   sequence (physical masked slots are ignored);
+3. a same-input comparison against ordinary gathered decode, row by row;
+4. a layer-2-only causal substitution;
+5. up to two further natural compressed zero-prefix attention sites, each
+   with its own primitive replay, input gate, A0/A1/A2 gate, and substitution.
+
+For the diagnostic block size (`n_tokens <= 5`), the Metal static-mixed
+wrapper selects the vector FlashAttention kernel plus reduce.  The source
+audit prints the selected runtime topology; family adjudication must use that
+line rather than the wrapper name.
+
+Run:
+
+```sh
+DS4_FIRST_DIVERGENCE=1 \
+DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB,ATTN-RAW \
+DS4_CP4_TO_CP5_SWEEP=1 \
+DS4_CP3F_INPUT_AUDIT=1 \
+DS4_CP3F_FAMILY_SWEEP=1 \
+DS4_MIXED_ATTN_FAMILY_SWEEP=1 \
+DS4_DSPARK_SCHEDULER=0 \
+./ds4 --dspark --dspark-confidence 0 \
+  -m ./ds4flash.gguf \
+  --mtp ./gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --tokens 16 --temp 0 --nothink \
+  -p 'Explain Redis in one sentence.' \
+  >canonical-sweep-mixed-attn-family.log 2>&1
+```
+
+Inspect:
+
+```sh
+grep -E '^(C2B_|CP3F_|MIXED_|CAUSAL_SUBSTITUTION_FRONTIER|GLOBAL_BOOKKEEPING|FIRST_DIVERGENCE |CP4_TO_CP5_SWEEP)' \
+  canonical-sweep-mixed-attn-family.log
+```
+
+No family result is admissible unless
+`MIXED_ATTN_GENERIC_RUNTIME_REPLAY result=EXACT`, the semantic input line is
+fully exact/pass, the same-input primitive A/B mismatches, and the relevant
+causal substitution advances the frontier with all C2B gates passing.

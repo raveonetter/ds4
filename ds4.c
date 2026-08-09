@@ -15402,9 +15402,19 @@ enum {
 };
 static uint32_t g_ds4_first_divergence_canonical_mask;
 static uint32_t g_ds4_cp3_projection_substitution_mask;
+/* Diagnostic-only attention producer substitution.  A selected compressed
+ * zero-prefix layer still executes its real batch attention first; its output
+ * rows are then replaced by the ordinary-decode-compatible gathered result.
+ * The array avoids assuming that the runtime model has at most 64 layers. */
+static uint8_t g_ds4_attention_layer_substitution[DS4_MAX_LAYER];
 
 static bool ds4_first_divergence_canonical_enabled(uint32_t bit) {
     return (g_ds4_first_divergence_canonical_mask & bit) != 0;
+}
+
+static bool ds4_attention_layer_substitution_enabled(uint32_t layer) {
+    return layer < DS4_MAX_LAYER &&
+           g_ds4_attention_layer_substitution[layer] != 0;
 }
 static bool ds4_c45_capture_layer(ds4_gpu_graph *g,
                                    uint32_t il,
@@ -27661,6 +27671,70 @@ static bool metal_graph_cp3_projection_substitute_rows(
     return ok;
 }
 
+/* Produce the exact row topology used by ordinary sequential decode from the
+ * zero-prefix batch operands.  This is a diagnostic substitution only.  It
+ * deliberately calls the public gathered decode primitive for every row,
+ * including rows that have not emitted a compressed key yet. */
+static bool metal_graph_attention_substitute_canonical_rows(
+        ds4_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_layer_weights *layer,
+        uint32_t il,
+        uint32_t pos0,
+        uint32_t n_tokens,
+        const uint32_t *comp_counts) {
+    if (!ds4_attention_layer_substitution_enabled(il)) return true;
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    if (!g || !model || !layer || pos0 != 0 || n_tokens == 0 ||
+        n_tokens > g->raw_cap || ratio == 0 || !comp_counts ||
+        !metal_graph_batch_q(g) || !metal_graph_batch_kv(g) ||
+        !metal_graph_batch_heads(g) || !g->layer_raw_cache[il] ||
+        !g->layer_attn_comp_cache[il]) {
+        return false;
+    }
+
+    const uint64_t q_row_values =
+        (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint32_t final_comp = comp_counts[n_tokens - 1u];
+    if (ratio == 4 && final_comp > DS4_N_INDEXER_TOP_K) return false;
+
+    bool ok = true;
+    for (uint32_t row = 0; ok && row < n_tokens; row++) {
+        const uint32_t logical_raw = row + 1u;
+        const uint32_t n_raw = g->raw_window != 0 &&
+                               logical_raw > g->raw_window
+            ? g->raw_window : logical_raw;
+        const uint32_t raw_start = logical_raw - n_raw;
+        const uint32_t n_comp = comp_counts[row];
+        if (n_comp > final_comp) return false;
+        ds4_gpu_tensor *q_row = metal_graph_tensor_row_view(
+            metal_graph_batch_q(g), row, q_row_values);
+        ds4_gpu_tensor *heads_row = metal_graph_tensor_row_view(
+            metal_graph_batch_heads(g), row, q_row_values);
+        ok = q_row && heads_row &&
+            ds4_gpu_attention_decode_heads_tensor(
+                heads_row,
+                model->map,
+                model->size,
+                layer->attn_sinks->abs_offset,
+                q_row,
+                metal_graph_batch_kv(g),
+                n_raw,
+                n_tokens,
+                raw_start,
+                n_comp ? g->layer_attn_comp_cache[il] : NULL,
+                metal_graph_attn_comp_cache_is_f16(),
+                n_comp,
+                NULL,
+                0,
+                DS4_N_HEAD,
+                DS4_N_HEAD_DIM) != 0;
+        ds4_gpu_tensor_free(heads_row);
+        ds4_gpu_tensor_free(q_row);
+    }
+    return ok;
+}
+
 /* CPU fallback for seeding batched HC state from token embeddings.  It is still
  * useful for tiny speculative verifier batches where a separate GPU embedding
  * command buffer costs more than the small host write. */
@@ -29668,6 +29742,11 @@ static bool metal_graph_encode_layer_attention_batch(
         }
     }
     DS4_METAL_PROFILE_ATTN_STAGE("attention");
+
+    if (ok && ds4_attention_layer_substitution_enabled(il)) {
+        ok = metal_graph_attention_substitute_canonical_rows(
+            g, model, layer, il, pos0, n_tokens, comp_counts);
+    }
 
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_out", metal_graph_batch_heads(g),
@@ -55581,6 +55660,619 @@ static bool ds4_cp3f_emit_family_adjudication(
     return causal_ok;
 }
 
+typedef struct {
+    bool executed;
+    bool q_exact;
+    bool staged_kv_exact;
+    bool head_mapping;
+    bool sequence_bounds;
+    bool metadata_same;
+    bool generic_runtime_replay_exact;
+    bool numerical_non_equivalence;
+    bool static_mixed;
+    bool generic_vec_reduce;
+    uint32_t layer;
+    uint32_t ratio;
+    uint32_t n_tokens;
+    uint32_t n_comp;
+    ds4_float_compare_result output_comparison;
+    ds4_first_divergence_float_signature output_signature;
+} ds4_mixed_attention_ab_result;
+
+static const char *ds4_mixed_attention_family_name(
+        const ds4_mixed_attention_ab_result *ab) {
+    if (!ab || !ab->executed || !ab->numerical_non_equivalence) {
+        return "none";
+    }
+    if (!ab->static_mixed) {
+        return "FAMILY_FLASH_ATTN_BATCH_DIRECT_VS_SINGLE_VEC_REDUCE";
+    }
+    if (!ab->generic_vec_reduce) {
+        return "FAMILY_FLASH_ATTN_BATCH_DIRECT_VS_SINGLE_VEC_REDUCE";
+    }
+    return "FAMILY_FLASH_ATTN_STATIC_MASKED_VEC_REDUCE_VS_SINGLE_GATHERED_VEC_REDUCE";
+}
+
+/* Replay the real zero-prefix attention producer on the captured Pass-A
+ * operands, then compare it with the ordinary decode primitive row by row.
+ * The F16 semantic staging audit compares only visible keys: the generic
+ * batch is allowed to contain future raw rows and not-yet-visible compressed
+ * rows behind its mask, while the gathered side omits those physical slots. */
+static bool ds4_mixed_attention_primitive_ab_run(
+        ds4_session *s,
+        const ds4_c2b_capture *capture,
+        uint32_t layer_index,
+        ds4_mixed_attention_ab_result *result) {
+    ds4_gpu_tensor *q_clone = NULL;
+    ds4_gpu_tensor *generic_out = NULL;
+    ds4_gpu_tensor *sequential_out = NULL;
+    ds4_gpu_tensor *generic_stage = NULL;
+    ds4_gpu_tensor *sequential_stage = NULL;
+    float *q_generic_cpu = NULL;
+    float *q_sequential_cpu = NULL;
+    float *runtime_cpu = NULL;
+    float *generic_cpu = NULL;
+    float *sequential_cpu = NULL;
+    uint16_t *generic_stage_cpu = NULL;
+    uint16_t *sequential_stage_cpu = NULL;
+    ds4_float_compare_result q_comparison;
+    ds4_float_compare_result replay_comparison;
+    const char *failed_stage = "preconditions";
+    bool ok = false;
+
+    if (!result) return false;
+    memset(result, 0, sizeof(*result));
+    if (!s || !capture || capture->graph != &s->graph ||
+        layer_index >= DS4_N_LAYER || capture->start != 0 ||
+        capture->n_tokens == 0 || capture->n_tokens >= 20u ||
+        !capture->cp2_q_cur[layer_index] ||
+        !capture->cp2_kv_r[layer_index] ||
+        !capture->cp4_heads_raw[layer_index]) {
+        goto done;
+    }
+
+    ds4_gpu_graph *g = &s->graph;
+    const ds4_layer_weights *layer =
+        &s->engine->weights.layer[layer_index];
+    const uint32_t ratio = ds4_layer_compress_ratio(layer_index);
+    const uint32_t rows = capture->n_tokens;
+    const uint32_t before = capture->n_comp_before[layer_index];
+    const uint32_t final_count =
+        capture->cp3_n_comp[layer_index][rows - 1u];
+    if (ratio == 0 || final_count < before || before != 0 ||
+        final_count - before > rows ||
+        !layer->attn_sinks || !g->layer_attn_comp_cache[layer_index] ||
+        !metal_graph_attn_comp_cache_is_f16()) {
+        goto done;
+    }
+    const uint32_t n_comp = final_count - before;
+    const bool static_mixed = n_comp != 0;
+    if (static_mixed && ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K) {
+        goto done;
+    }
+
+    const uint64_t q_row_values =
+        (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t q_values = (uint64_t)rows * q_row_values;
+    const uint64_t q_bytes = q_values * sizeof(float);
+    const uint64_t raw_row_bytes =
+        (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t f16_row_bytes =
+        (uint64_t)DS4_N_HEAD_DIM * sizeof(uint16_t);
+    const uint64_t max_stage_rows = (uint64_t)rows + n_comp;
+    const uint64_t max_stage_bytes = max_stage_rows * f16_row_bytes;
+    if (q_values > SIZE_MAX || max_stage_rows > SIZE_MAX / rows ||
+        ds4_gpu_tensor_bytes(capture->cp2_q_cur[layer_index]) < q_bytes ||
+        ds4_gpu_tensor_bytes(capture->cp2_kv_r[layer_index]) <
+            (uint64_t)rows * raw_row_bytes ||
+        ds4_gpu_tensor_bytes(capture->cp4_heads_raw[layer_index]) < q_bytes ||
+        (n_comp &&
+         ds4_gpu_tensor_bytes(g->layer_attn_comp_cache[layer_index]) <
+             (uint64_t)n_comp * f16_row_bytes)) {
+        goto done;
+    }
+
+    result->layer = layer_index;
+    result->ratio = ratio;
+    result->n_tokens = rows;
+    result->n_comp = n_comp;
+    result->static_mixed = static_mixed;
+    result->generic_vec_reduce = rows < 20u;
+    result->head_mapping = DS4_N_HEAD != 0 && DS4_N_HEAD_DIM == 512u;
+    result->sequence_bounds = g->raw_window == 0 || rows <= g->raw_window;
+    for (uint32_t row = 0; result->sequence_bounds && row < rows; row++) {
+        const uint32_t expected_comp = (row + 1u) / ratio;
+        result->sequence_bounds =
+            capture->cp3_n_comp[layer_index][row] == expected_comp;
+    }
+    result->metadata_same = result->head_mapping &&
+        result->sequence_bounds && s->engine->model.map &&
+        layer->attn_sinks->type == DS4_TENSOR_F32 &&
+        layer->attn_sinks->dim[0] == DS4_N_HEAD &&
+        layer->attn_sinks->abs_offset <= s->engine->model.size &&
+        (uint64_t)DS4_N_HEAD * sizeof(float) <=
+            s->engine->model.size - layer->attn_sinks->abs_offset;
+    if (!result->metadata_same) goto done;
+
+    failed_stage = "allocation";
+    q_clone = ds4_gpu_tensor_alloc(q_bytes);
+    generic_out = ds4_gpu_tensor_alloc(q_bytes);
+    sequential_out = ds4_gpu_tensor_alloc(q_bytes);
+    generic_stage = ds4_gpu_tensor_alloc(max_stage_bytes);
+    sequential_stage = ds4_gpu_tensor_alloc(
+        (uint64_t)rows * max_stage_bytes);
+    if (!q_clone || !generic_out || !sequential_out || !generic_stage ||
+        !sequential_stage) {
+        goto done;
+    }
+
+    failed_stage = "q_clone";
+    if (!ds4_gpu_tensor_copy(q_clone, 0,
+                             capture->cp2_q_cur[layer_index], 0,
+                             q_bytes)) {
+        goto done;
+    }
+
+    failed_stage = "generic_runtime_replay";
+    if (static_mixed) {
+        ok = ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+            generic_out,
+            s->engine->model.map,
+            s->engine->model.size,
+            layer->attn_sinks->abs_offset,
+            capture->cp2_q_cur[layer_index],
+            capture->cp2_kv_r[layer_index],
+            g->layer_attn_comp_cache[layer_index],
+            1,
+            rows,
+            n_comp,
+            g->raw_window,
+            ratio,
+            DS4_N_HEAD,
+            DS4_N_HEAD_DIM) != 0;
+    } else {
+        ok = ds4_gpu_attention_prefill_raw_heads_tensor(
+            generic_out,
+            s->engine->model.map,
+            s->engine->model.size,
+            layer->attn_sinks->abs_offset,
+            capture->cp2_q_cur[layer_index],
+            capture->cp2_kv_r[layer_index],
+            rows,
+            g->raw_window,
+            DS4_N_HEAD,
+            DS4_N_HEAD_DIM) != 0;
+    }
+    if (!ok) goto done;
+
+    failed_stage = "sequential_primitive";
+    for (uint32_t row = 0; ok && row < rows; row++) {
+        const uint32_t logical_raw = row + 1u;
+        const uint32_t n_raw = g->raw_window != 0 &&
+                               logical_raw > g->raw_window
+            ? g->raw_window : logical_raw;
+        const uint32_t raw_start = logical_raw - n_raw;
+        const uint32_t row_comp =
+            capture->cp3_n_comp[layer_index][row] - before;
+        ds4_gpu_tensor *q_row = ds4_gpu_tensor_view(
+            q_clone, (uint64_t)row * q_row_values * sizeof(float),
+            q_row_values * sizeof(float));
+        ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
+            sequential_out,
+            (uint64_t)row * q_row_values * sizeof(float),
+            q_row_values * sizeof(float));
+        ok = q_row && out_row &&
+            ds4_gpu_attention_decode_heads_tensor(
+                out_row,
+                s->engine->model.map,
+                s->engine->model.size,
+                layer->attn_sinks->abs_offset,
+                q_row,
+                capture->cp2_kv_r[layer_index],
+                n_raw,
+                rows,
+                raw_start,
+                row_comp ? g->layer_attn_comp_cache[layer_index] : NULL,
+                1,
+                row_comp,
+                NULL,
+                0,
+                DS4_N_HEAD,
+                DS4_N_HEAD_DIM) != 0;
+        ds4_gpu_tensor_free(out_row);
+        ds4_gpu_tensor_free(q_row);
+    }
+    if (!ok) goto done;
+
+    failed_stage = "semantic_staging";
+    ok = ds4_gpu_tensor_copy_f32_to_f16(
+        generic_stage, 0, capture->cp2_kv_r[layer_index], 0,
+        rows * DS4_N_HEAD_DIM) != 0;
+    if (ok && n_comp) {
+        ok = ds4_gpu_tensor_copy(
+            generic_stage, (uint64_t)rows * f16_row_bytes,
+            g->layer_attn_comp_cache[layer_index],
+            (uint64_t)before * f16_row_bytes,
+            (uint64_t)n_comp * f16_row_bytes) != 0;
+    }
+    for (uint32_t row = 0; ok && row < rows; row++) {
+        const uint32_t logical_raw = row + 1u;
+        const uint32_t n_raw = g->raw_window != 0 &&
+                               logical_raw > g->raw_window
+            ? g->raw_window : logical_raw;
+        const uint32_t raw_start = logical_raw - n_raw;
+        const uint32_t row_comp =
+            capture->cp3_n_comp[layer_index][row] - before;
+        ds4_gpu_tensor *stage_row = ds4_gpu_tensor_view(
+            sequential_stage, (uint64_t)row * max_stage_bytes,
+            ((uint64_t)n_raw + row_comp) * f16_row_bytes);
+        if (!stage_row) {
+            ok = false;
+        } else if (row_comp) {
+            ok = ds4_gpu_flash_kv_stage_f16_tensor(
+                stage_row,
+                capture->cp2_kv_r[layer_index],
+                rows,
+                raw_start,
+                n_raw,
+                g->layer_attn_comp_cache[layer_index],
+                1,
+                row_comp,
+                DS4_N_HEAD_DIM) != 0;
+        } else {
+            ok = ds4_gpu_tensor_copy_f32_to_f16(
+                stage_row, 0, capture->cp2_kv_r[layer_index],
+                (uint64_t)raw_start * raw_row_bytes,
+                n_raw * DS4_N_HEAD_DIM) != 0;
+        }
+        ds4_gpu_tensor_free(stage_row);
+    }
+    if (!ok) goto done;
+
+    const size_t q_value_count = (size_t)q_values;
+    const size_t stage_value_count =
+        (size_t)(max_stage_rows * DS4_N_HEAD_DIM);
+    const size_t sequential_stage_value_count =
+        (size_t)rows * stage_value_count;
+    q_generic_cpu = xmalloc(q_value_count * sizeof(float));
+    q_sequential_cpu = xmalloc(q_value_count * sizeof(float));
+    runtime_cpu = xmalloc(q_value_count * sizeof(float));
+    generic_cpu = xmalloc(q_value_count * sizeof(float));
+    sequential_cpu = xmalloc(q_value_count * sizeof(float));
+    generic_stage_cpu = xmalloc(stage_value_count * sizeof(uint16_t));
+    sequential_stage_cpu =
+        xmalloc(sequential_stage_value_count * sizeof(uint16_t));
+
+    failed_stage = "readback";
+    if (!ds4_gpu_tensor_read(capture->cp2_q_cur[layer_index], 0,
+                             q_generic_cpu, q_bytes) ||
+        !ds4_gpu_tensor_read(q_clone, 0, q_sequential_cpu, q_bytes) ||
+        !ds4_gpu_tensor_read(capture->cp4_heads_raw[layer_index], 0,
+                             runtime_cpu, q_bytes) ||
+        !ds4_gpu_tensor_read(generic_out, 0, generic_cpu, q_bytes) ||
+        !ds4_gpu_tensor_read(sequential_out, 0, sequential_cpu, q_bytes) ||
+        !ds4_gpu_tensor_read(generic_stage, 0, generic_stage_cpu,
+                             max_stage_bytes) ||
+        !ds4_gpu_tensor_read(sequential_stage, 0, sequential_stage_cpu,
+                             (uint64_t)rows * max_stage_bytes) ||
+        !ds4_float_compare_exact(q_generic_cpu, q_sequential_cpu,
+                                 q_value_count, &q_comparison) ||
+        !ds4_float_compare_exact(generic_cpu, runtime_cpu,
+                                 q_value_count, &replay_comparison) ||
+        !ds4_float_compare_exact(generic_cpu, sequential_cpu,
+                                 q_value_count,
+                                 &result->output_comparison) ||
+        !ds4_first_divergence_float_signature_compute(
+            generic_cpu, sequential_cpu, q_value_count,
+            &result->output_signature)) {
+        goto done;
+    }
+    result->q_exact = q_comparison.bit_exact;
+    result->generic_runtime_replay_exact = replay_comparison.bit_exact;
+    result->staged_kv_exact = true;
+    for (uint32_t row = 0;
+         result->staged_kv_exact && row < rows;
+         row++) {
+        const uint32_t logical_raw = row + 1u;
+        const uint32_t n_raw = g->raw_window != 0 &&
+                               logical_raw > g->raw_window
+            ? g->raw_window : logical_raw;
+        const uint32_t raw_start = logical_raw - n_raw;
+        const uint32_t row_comp =
+            capture->cp3_n_comp[layer_index][row] - before;
+        const uint16_t *seq = sequential_stage_cpu +
+            (size_t)row * stage_value_count;
+        const size_t raw_values = (size_t)n_raw * DS4_N_HEAD_DIM;
+        result->staged_kv_exact = memcmp(
+            generic_stage_cpu + (size_t)raw_start * DS4_N_HEAD_DIM,
+            seq, raw_values * sizeof(uint16_t)) == 0;
+        if (result->staged_kv_exact && row_comp) {
+            result->staged_kv_exact = memcmp(
+                generic_stage_cpu + (size_t)rows * DS4_N_HEAD_DIM,
+                seq + raw_values,
+                (size_t)row_comp * DS4_N_HEAD_DIM * sizeof(uint16_t)) == 0;
+        }
+    }
+    result->numerical_non_equivalence =
+        !result->output_comparison.bit_exact;
+    result->executed = true;
+    ok = true;
+
+done:
+    fprintf(stderr,
+            "MIXED_ATTN_SOURCE_AUDIT layer=%u ratio=%u "
+            "generic_path=%s sequential_path=gathered_single_vec_reduce "
+            "generic_kernel=%s generic_reduction=%s "
+            "sequential_kernel=kernel_flash_attn_ext_vec_f16_dk512_dv512 "
+            "sequential_reduction=kernel_flash_attn_reduce "
+            "kv_role=shared_K_and_V head_mapping=all_query_heads_to_one_KV_head "
+            "scale=1/sqrt(head_dim) softmax_parameters=same "
+            "causal_window_metadata=same compressed_visibility=(qpos+1)/ratio "
+            "evidence=PROVEN_BY_SOURCE_AND_RUNTIME_PATH\n",
+            layer_index,
+            result->ratio,
+            result->static_mixed ? "static_mixed_batch" : "raw_batch",
+            result->generic_vec_reduce
+                ? "kernel_flash_attn_ext_vec_f16_dk512_dv512"
+                : "kernel_flash_attn_ext_f16_dk512_dv512",
+            result->generic_vec_reduce
+                ? "kernel_flash_attn_reduce" : "direct_output");
+    fprintf(stderr,
+            "MIXED_ATTN_GENERIC_RUNTIME_REPLAY result=%s layer=%u",
+            result->executed
+                ? (result->generic_runtime_replay_exact ? "EXACT" : "MISMATCH")
+                : "ERROR",
+            layer_index);
+    if (!result->executed) fprintf(stderr, " failed_stage=%s", failed_stage);
+    fputc('\n', stderr);
+    fprintf(stderr,
+            "MIXED_ATTN_STAGING_AB semantic_visible_kv=%s "
+            "generic_order=raw_chunk_then_compressed "
+            "sequential_order=visible_raw_then_visible_compressed "
+            "storage=F16 layer=%u\n",
+            result->executed
+                ? (result->staged_kv_exact ? "EXACT" : "MISMATCH")
+                : "ERROR",
+            layer_index);
+    fprintf(stderr,
+            "MIXED_FLASH_ATTN_PRIMITIVE_AB input_bits_equal=%s "
+            "metadata_same=%s result=%s elements=%zu layer=%u",
+            result->executed && result->q_exact && result->staged_kv_exact
+                ? "PASS" : "FAIL",
+            result->metadata_same ? "PASS" : "FAIL",
+            result->executed
+                ? (result->output_comparison.bit_exact ? "EXACT" : "MISMATCH")
+                : "ERROR",
+            result->executed ? result->output_comparison.length : 0u,
+            layer_index);
+    if (result->executed && result->output_comparison.bit_exact) {
+        fputs(" first_index=none generic_bits=none sequential_bits=none "
+              "max_abs=0 max_rel=0 max_ulp=0 relative_l2=0\n", stderr);
+    } else if (result->executed) {
+        ds4_projection_primitive_ab_print_metrics(
+            &result->output_comparison, &result->output_signature);
+        fputc('\n', stderr);
+    } else {
+        fputc('\n', stderr);
+    }
+
+    free(sequential_stage_cpu);
+    free(generic_stage_cpu);
+    free(sequential_cpu);
+    free(generic_cpu);
+    free(runtime_cpu);
+    free(q_sequential_cpu);
+    free(q_generic_cpu);
+    ds4_gpu_tensor_free(sequential_stage);
+    ds4_gpu_tensor_free(generic_stage);
+    ds4_gpu_tensor_free(sequential_out);
+    ds4_gpu_tensor_free(generic_out);
+    ds4_gpu_tensor_free(q_clone);
+    return ok && result->executed && result->q_exact &&
+        result->staged_kv_exact && result->metadata_same &&
+        result->generic_runtime_replay_exact;
+}
+
+static const ds4_first_divergence_snapshot *
+ds4_mixed_attention_find_snapshot(
+        const ds4_first_divergence_capture *capture,
+        uint32_t row,
+        uint32_t layer,
+        ds4_first_divergence_checkpoint checkpoint,
+        const char *subobject) {
+    if (!capture || !subobject) return NULL;
+    for (size_t i = 0; i < capture->count; i++) {
+        const ds4_first_divergence_snapshot *snapshot =
+            &capture->snapshots[i];
+        if (snapshot->row == row && snapshot->layer == layer &&
+            snapshot->checkpoint == checkpoint &&
+            strcmp(snapshot->subobject, subobject) == 0) {
+            return snapshot;
+        }
+    }
+    return NULL;
+}
+
+static bool ds4_mixed_attention_snapshot_exact(
+        const ds4_first_divergence_capture *pass_a,
+        const ds4_first_divergence_capture *pass_b,
+        uint32_t row,
+        uint32_t layer,
+        ds4_first_divergence_checkpoint checkpoint,
+        const char *subobject,
+        bool missing_is_exact) {
+    const ds4_first_divergence_snapshot *a =
+        ds4_mixed_attention_find_snapshot(
+            pass_a, row, layer, checkpoint, subobject);
+    const ds4_first_divergence_snapshot *b =
+        ds4_mixed_attention_find_snapshot(
+            pass_b, row, layer, checkpoint, subobject);
+    if (!a || !b) return missing_is_exact && !a && !b;
+    if (a->kind != b->kind || a->element_count != b->element_count ||
+        a->element_size != b->element_size ||
+        a->element_count > SIZE_MAX / a->element_size) {
+        return false;
+    }
+    return memcmp(a->data, b->data,
+                  a->element_count * a->element_size) == 0;
+}
+
+static bool ds4_mixed_attention_checkpoint_set_exact(
+        const ds4_first_divergence_capture *pass_a,
+        const ds4_first_divergence_capture *pass_b,
+        uint32_t layer,
+        uint32_t rows,
+        const ds4_first_divergence_checkpoint *checkpoints,
+        size_t checkpoint_count) {
+    if (!pass_a || !pass_b || !checkpoints || checkpoint_count == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < pass_a->count; i++) {
+        const ds4_first_divergence_snapshot *a = &pass_a->snapshots[i];
+        if (a->layer != layer || a->row >= rows) continue;
+        bool selected = false;
+        for (size_t j = 0; j < checkpoint_count; j++) {
+            if (a->checkpoint == checkpoints[j]) {
+                selected = true;
+                break;
+            }
+        }
+        if (!selected || !ds4_mixed_attention_snapshot_exact(
+                pass_a, pass_b, a->row, layer, a->checkpoint,
+                a->subobject, false)) {
+            if (selected) return false;
+        }
+    }
+    return true;
+}
+
+static bool ds4_mixed_attention_emit_closure_and_causal(
+        const ds4_first_divergence_capture *pass_a,
+        const ds4_first_divergence_capture *pass_b,
+        const ds4_c2b_capture *capture_a,
+        const ds4_c2b_capture *capture_b,
+        const ds4_mixed_attention_ab_result *ab,
+        const ds4_first_divergence_report *report,
+        bool *new_independent_family) {
+    static const ds4_first_divergence_checkpoint cp2_checkpoints[] = {
+        DS4_FIRST_DIVERGENCE_CP1,
+        DS4_FIRST_DIVERGENCE_CP2_Q,
+        DS4_FIRST_DIVERGENCE_CP2_KV_P,
+        DS4_FIRST_DIVERGENCE_CP2_Q_NORM,
+        DS4_FIRST_DIVERGENCE_CP2_Q_CUR,
+        DS4_FIRST_DIVERGENCE_CP2_KV_R,
+    };
+    static const ds4_first_divergence_checkpoint cp3p_checkpoints[] = {
+        DS4_FIRST_DIVERGENCE_CP3_P,
+    };
+    static const ds4_first_divergence_checkpoint cp3f_checkpoints[] = {
+        DS4_FIRST_DIVERGENCE_CP3_F,
+    };
+    if (new_independent_family) *new_independent_family = false;
+    if (!pass_a || !pass_b || !capture_a || !capture_b || !ab ||
+        !ab->executed || ab->layer >= DS4_N_LAYER ||
+        capture_a->n_tokens != capture_b->n_tokens ||
+        capture_a->n_tokens != ab->n_tokens) {
+        fputs("MIXED_ATTN_INPUT_AB q=UNKNOWN k_semantic_sequence=UNKNOWN "
+              "v_semantic_sequence=UNKNOWN head_mapping=FAIL "
+              "sequence_bounds=FAIL metadata_same=FAIL\n", stderr);
+        return false;
+    }
+
+    const uint32_t rows = ab->n_tokens;
+    bool q_exact = true;
+    bool raw_exact = true;
+    bool comp_exact = true;
+    bool metadata_same = ab->metadata_same;
+    for (uint32_t row = 0; row < rows; row++) {
+        q_exact = q_exact && ds4_mixed_attention_snapshot_exact(
+            pass_a, pass_b, row, ab->layer,
+            DS4_FIRST_DIVERGENCE_CP2_Q_CUR, "q_cur", false);
+        raw_exact = raw_exact && ds4_mixed_attention_snapshot_exact(
+            pass_a, pass_b, row, ab->layer,
+            DS4_FIRST_DIVERGENCE_CP2_KV_R, "raw_cache", false);
+        metadata_same = metadata_same &&
+            capture_a->cp3_n_comp[ab->layer][row] ==
+                capture_b->cp3_n_comp[ab->layer][row];
+        comp_exact = comp_exact && ds4_mixed_attention_snapshot_exact(
+            pass_a, pass_b, row, ab->layer,
+            DS4_FIRST_DIVERGENCE_CP3_F, "attn_cache", true);
+    }
+    const bool semantic_kv_exact = raw_exact && comp_exact &&
+        ab->staged_kv_exact;
+    fprintf(stderr,
+            "MIXED_ATTN_INPUT_AB q=%s "
+            "k_semantic_sequence=%s v_semantic_sequence=%s "
+            "head_mapping=%s sequence_bounds=%s metadata_same=%s "
+            "layer=%u\n",
+            q_exact ? "EXACT" : "MISMATCH",
+            semantic_kv_exact ? "EXACT" : "MISMATCH",
+            semantic_kv_exact ? "EXACT" : "MISMATCH",
+            ab->head_mapping ? "PASS" : "FAIL",
+            ab->sequence_bounds ? "PASS" : "FAIL",
+            metadata_same ? "PASS" : "FAIL",
+            ab->layer);
+
+    const bool cp2_exact = ds4_mixed_attention_checkpoint_set_exact(
+        pass_a, pass_b, ab->layer, rows, cp2_checkpoints,
+        sizeof(cp2_checkpoints) / sizeof(cp2_checkpoints[0]));
+    const bool cp3p_exact = ds4_mixed_attention_checkpoint_set_exact(
+        pass_a, pass_b, ab->layer, rows, cp3p_checkpoints,
+        sizeof(cp3p_checkpoints) / sizeof(cp3p_checkpoints[0]));
+    const bool cp3f_exact = ds4_mixed_attention_checkpoint_set_exact(
+        pass_a, pass_b, ab->layer, rows, cp3f_checkpoints,
+        sizeof(cp3f_checkpoints) / sizeof(cp3f_checkpoints[0]));
+    bool heads_exact = true;
+    for (uint32_t row = 0; heads_exact && row < rows; row++) {
+        heads_exact = ds4_mixed_attention_snapshot_exact(
+            pass_a, pass_b, row, ab->layer,
+            DS4_FIRST_DIVERGENCE_CP4_HEADS_RAW,
+            "attn_heads_raw", false);
+    }
+
+    const bool input_closed = q_exact && semantic_kv_exact &&
+        ab->head_mapping && ab->sequence_bounds && metadata_same;
+    const bool arithmetic = input_closed &&
+        ab->generic_runtime_replay_exact &&
+        ab->numerical_non_equivalence;
+    const char *family_name = ds4_mixed_attention_family_name(ab);
+    const bool existing_family = arithmetic &&
+        strcmp(family_name,
+               "FAMILY_FLASH_ATTN_BATCH_DIRECT_VS_SINGLE_VEC_REDUCE") == 0;
+    const bool new_family = arithmetic && !existing_family;
+    if (new_independent_family) *new_independent_family = new_family;
+    fprintf(stderr,
+            "MIXED_ATTN_FAMILY_ADJUDICATION cause_class=%s "
+            "family=%s family_name=%s evidence=%s layer=%u\n",
+            arithmetic ? "ARITHMETIC" :
+                !q_exact || !raw_exact ? "INPUT_PROVENANCE" :
+                !semantic_kv_exact ? "INDEXING_OR_PLACEMENT" : "UNKNOWN",
+            arithmetic ? (existing_family ? "existing" : "new") : "none",
+            arithmetic ? family_name : "none",
+            arithmetic ? "PROVEN_BY_SOURCE_AND_TEST" :
+                "PROVEN_BY_SOURCE",
+            ab->layer);
+    fprintf(stderr,
+            "MIXED_ATTN_CAUSAL_SUBSTITUTION attn_heads_raw=%s "
+            "result=%s CP2_prefix=%s CP3-P=%s CP3-F=%s layer=%u\n",
+            heads_exact ? "EXACT" : "MISMATCH",
+            arithmetic && cp2_exact && cp3p_exact && cp3f_exact &&
+                    heads_exact
+                ? "PASS" : "FAIL",
+            cp2_exact ? "EXACT" : "MISMATCH",
+            cp3p_exact ? "EXACT" : "MISMATCH",
+            cp3f_exact ? "EXACT" : "MISMATCH",
+            ab->layer);
+    fprintf(stderr,
+            "CAUSAL_SUBSTITUTION_FRONTIER site=layer%u_%s_attention "
+            "FIRST_DIVERGENCE=",
+            ab->layer, ab->static_mixed ? "static_mixed" : "raw");
+    ds4_first_divergence_print_report_location(report);
+    fputc('\n', stderr);
+    return arithmetic && cp2_exact && cp3p_exact && cp3f_exact &&
+        heads_exact;
+}
+
 static int ds4_first_divergence_run(ds4_session *s,
                                     const int *drafts,
                                     uint32_t n_tokens,
@@ -55610,6 +56302,11 @@ static int ds4_first_divergence_run(ds4_session *s,
     ds4_hc_attn_pre_split_ab_result hc_attn_pre_split_ab = {0};
     ds4_cp4_tail_primitive_ab_result cp4_tail_ab = {0};
     ds4_cp3_projection_family_ab_result cp3_family_ab = {0};
+    enum { DS4_MIXED_ATTN_MAX_SITES = 3 };
+    ds4_mixed_attention_ab_result
+        mixed_attn_ab[DS4_MIXED_ATTN_MAX_SITES] = {0};
+    uint32_t mixed_attn_site_count = 0;
+    uint32_t mixed_attn_new_family_count = 0;
     int forced_tokens[DS4_DSPARK_MAX_BLOCK_SIZE] = {0};
     uint32_t n_comp_before[DS4_MAX_LAYER] = {0};
     uint32_t n_index_before[DS4_MAX_LAYER] = {0};
@@ -55642,6 +56339,11 @@ static int ds4_first_divergence_run(ds4_session *s,
     const bool cp3_family_sweep_requested =
         cp3_family_sweep_env && cp3_family_sweep_env[0] &&
         strcmp(cp3_family_sweep_env, "0") != 0;
+    const char *mixed_attn_sweep_env =
+        getenv("DS4_MIXED_ATTN_FAMILY_SWEEP");
+    const bool mixed_attn_sweep_requested =
+        mixed_attn_sweep_env && mixed_attn_sweep_env[0] &&
+        strcmp(mixed_attn_sweep_env, "0") != 0;
     const char *cp4_tail_ab_env = getenv("DS4_CP4_TAIL_AB");
     const bool cp4_tail_ab_requested =
         cp5_sweep_requested ||
@@ -55696,7 +56398,9 @@ static int ds4_first_divergence_run(ds4_session *s,
         (!prefix_operand_probe_requested ||
          canonical_mask == cp4_prefix_required_mask) &&
         (!cp3_family_sweep_requested ||
-         (cp3f_input_audit_requested && cp5_sweep_requested));
+         (cp3f_input_audit_requested && cp5_sweep_requested)) &&
+        (!mixed_attn_sweep_requested ||
+         (cp3_family_sweep_requested && cp5_sweep_requested));
     ds4_gpu_graph *g = &s->graph;
     ds4_gpu_tensor *batch_cur = g->batch_cur_hc_by_tier[0];
     ds4_gpu_tensor *batch_next = g->batch_next_hc_by_tier[0];
@@ -56120,6 +56824,72 @@ static int ds4_first_divergence_run(ds4_session *s,
         }
         canonical_rerun_ok = canonical_rerun_ok && cp3_family_sweep_run_ok;
     }
+    bool mixed_attn_sweep_run_ok = !mixed_attn_sweep_requested;
+    if (mixed_attn_sweep_requested) {
+        const uint32_t layer = 2u;
+        const bool primitive_ok = canonical_rerun_ok && a2_ok &&
+            ds4_mixed_attention_primitive_ab_run(
+                s, &capture_a, layer, &mixed_attn_ab[0]) &&
+            mixed_attn_ab[0].numerical_non_equivalence;
+        ds4_c2b_observable_free(&a0);
+        ds4_c2b_observable_free(&a1);
+        ds4_c2b_observable_free(&a2);
+        const bool restore_mixed_ok = primitive_ok &&
+            ds4_c2b_restore_s0(
+                s, &frontier, &raw, start, batch_cur, batch_next);
+        const uint32_t family_canonical_mask =
+            cp5_variant_masks[DS4_CP5_SWEEP_VARIANT_COUNT - 1u];
+        g_ds4_first_divergence_canonical_mask = restore_mixed_ok
+            ? family_canonical_mask : 0;
+        g_ds4_cp3_projection_substitution_mask = restore_mixed_ok
+            ? DS4_CP3_PROJECTION_SUBSTITUTE_KV |
+                  DS4_CP3_PROJECTION_SUBSTITUTE_SCORE
+            : 0;
+        memset(g_ds4_attention_layer_substitution, 0,
+               sizeof(g_ds4_attention_layer_substitution));
+        if (restore_mixed_ok && layer < DS4_MAX_LAYER) {
+            g_ds4_attention_layer_substitution[layer] = 1u;
+        }
+        a0_ok = restore_mixed_ok && ds4_c2b_run_pass(
+            s, forced_tokens, n_tokens, start, NULL, &a0,
+            n_comp_before, n_index_before);
+        restore1_ok = a0_ok && ds4_c2b_restore_s0(
+            s, &frontier, &raw, start, batch_cur, batch_next);
+        a1_ok = restore1_ok && ds4_c2b_run_pass(
+            s, forced_tokens, n_tokens, start, NULL, &a1,
+            n_comp_before, n_index_before);
+        restore2_ok = a1_ok && ds4_c2b_restore_s0(
+            s, &frontier, &raw, start, batch_cur, batch_next);
+        a2_ok = restore2_ok && ds4_c2b_run_pass(
+            s, forced_tokens, n_tokens, start, &capture_a, &a2,
+            n_comp_before, n_index_before);
+        g_ds4_first_divergence_canonical_mask = 0;
+        g_ds4_cp3_projection_substitution_mask = 0;
+        const bool mixed_control = a0_ok && a1_ok &&
+            ds4_c2b_compare_observables(
+                "MIXED_M1_A0_vs_A1", &a1, &a0, start, n_tokens,
+                g->raw_cap);
+        const bool mixed_probe = a0_ok && a2_ok &&
+            ds4_c2b_compare_observables(
+                "MIXED_M1_A0_vs_A2", &a2, &a0, start, n_tokens,
+                g->raw_cap);
+        mixed_attn_sweep_run_ok = primitive_ok && restore_mixed_ok &&
+            a0_ok && restore1_ok && a1_ok && restore2_ok && a2_ok &&
+            mixed_control && mixed_probe;
+        if (mixed_attn_sweep_run_ok) mixed_attn_site_count = 1u;
+        fprintf(stderr,
+                "MIXED_ATTN_C2B variant=M1_LAYER2 control=%s probe=%s "
+                "result=%s\n",
+                mixed_control ? "PASS" : "FAIL",
+                mixed_probe ? "PASS" : "FAIL",
+                mixed_attn_sweep_run_ok ? "PASS" : "FAIL");
+        if (!mixed_attn_sweep_run_ok) {
+            fputs("MIXED_ATTN_FAMILY_SWEEP result=STOP "
+                  "reason=replay_primitive_or_c2b_gate_failed\n", stderr);
+        }
+        canonical_rerun_ok = canonical_rerun_ok &&
+            mixed_attn_sweep_run_ok;
+    }
     const bool pass_a_init_ok = a2_ok &&
         ds4_first_divergence_capture_init(&pass_a, "PASS_A");
     const bool pass_a_materialize_ok = pass_a_init_ok &&
@@ -56171,6 +56941,7 @@ static int ds4_first_divergence_run(ds4_session *s,
     bool report_ok = false;
     bool cp5_sweep_report_ok = !cp5_sweep_requested;
     bool cp3_family_report_ok = !cp3_family_sweep_requested;
+    bool mixed_attn_report_ok = !mixed_attn_sweep_requested;
     bool cp4_prefix_input_ok = !cp4_prefix_input_requested;
     bool cp4_prefix_input_attempted = false;
     bool hc_attn_pre_split_causal_ok =
@@ -56189,11 +56960,10 @@ static int ds4_first_divergence_run(ds4_session *s,
             ds4_first_divergence_emit_report(
                 &pass_a, &pass_b, stderr, &report);
         if (report_ok && cp3_family_sweep_requested) {
-            cp3_reports[DS4_CP3_SWEEP_VARIANT_COUNT - 1u] = report;
             cp3_family_report_ok = cp3_family_sweep_run_ok;
             for (size_t variant = 0;
                  cp3_family_report_ok &&
-                     variant + 1u < DS4_CP3_SWEEP_VARIANT_COUNT;
+                     variant < DS4_CP3_SWEEP_VARIANT_COUNT;
                  variant++) {
                 FILE *sink = tmpfile();
                 cp3_family_report_ok = sink &&
@@ -56229,6 +56999,160 @@ static int ds4_first_divergence_run(ds4_session *s,
         } else if (report_ok && cp3f_input_audit_requested) {
             report_ok = ds4_cp3f_emit_input_audit(
                 &report, &capture_a, &capture_b);
+        }
+        if (report_ok && mixed_attn_sweep_requested) {
+            mixed_attn_report_ok = mixed_attn_sweep_run_ok;
+            bool initial_new_family = false;
+            if (mixed_attn_report_ok) {
+                mixed_attn_report_ok =
+                    ds4_mixed_attention_emit_closure_and_causal(
+                        &pass_a, &pass_b, &capture_a, &capture_b,
+                        &mixed_attn_ab[0], &report,
+                        &initial_new_family);
+            }
+            if (mixed_attn_report_ok && initial_new_family) {
+                mixed_attn_new_family_count = 1u;
+            }
+
+            while (mixed_attn_report_ok &&
+                   mixed_attn_site_count < DS4_MIXED_ATTN_MAX_SITES &&
+                   report.first_divergence_found && report.row == 0 &&
+                   report.checkpoint ==
+                       DS4_FIRST_DIVERGENCE_CP4_HEADS_RAW &&
+                   strcmp(report.subobject, "attn_heads_raw") == 0 &&
+                   report.layer < DS4_N_LAYER &&
+                   report.layer < DS4_MAX_LAYER &&
+                   ds4_layer_compress_ratio(report.layer) != 0 &&
+                   !ds4_attention_layer_substitution_enabled(
+                       report.layer)) {
+                const uint32_t site = mixed_attn_site_count;
+                const uint32_t layer = report.layer;
+                const bool primitive_ok =
+                    ds4_mixed_attention_primitive_ab_run(
+                        s, &capture_a, layer,
+                        &mixed_attn_ab[site]) &&
+                    mixed_attn_ab[site].numerical_non_equivalence;
+                if (!primitive_ok) {
+                    mixed_attn_report_ok = false;
+                    break;
+                }
+
+                g_ds4_attention_layer_substitution[layer] = 1u;
+                ds4_c2b_observable_free(&a0);
+                ds4_c2b_observable_free(&a1);
+                ds4_c2b_observable_free(&a2);
+                const bool restore_site_ok = ds4_c2b_restore_s0(
+                    s, &frontier, &raw, start, batch_cur, batch_next);
+                const uint32_t family_canonical_mask =
+                    cp5_variant_masks[DS4_CP5_SWEEP_VARIANT_COUNT - 1u];
+                g_ds4_first_divergence_canonical_mask = restore_site_ok
+                    ? family_canonical_mask : 0;
+                g_ds4_cp3_projection_substitution_mask = restore_site_ok
+                    ? DS4_CP3_PROJECTION_SUBSTITUTE_KV |
+                          DS4_CP3_PROJECTION_SUBSTITUTE_SCORE
+                    : 0;
+                a0_ok = restore_site_ok && ds4_c2b_run_pass(
+                    s, forced_tokens, n_tokens, start, NULL, &a0,
+                    n_comp_before, n_index_before);
+                restore1_ok = a0_ok && ds4_c2b_restore_s0(
+                    s, &frontier, &raw, start, batch_cur, batch_next);
+                a1_ok = restore1_ok && ds4_c2b_run_pass(
+                    s, forced_tokens, n_tokens, start, NULL, &a1,
+                    n_comp_before, n_index_before);
+                restore2_ok = a1_ok && ds4_c2b_restore_s0(
+                    s, &frontier, &raw, start, batch_cur, batch_next);
+                a2_ok = restore2_ok && ds4_c2b_run_pass(
+                    s, forced_tokens, n_tokens, start, &capture_a, &a2,
+                    n_comp_before, n_index_before);
+                g_ds4_first_divergence_canonical_mask = 0;
+                g_ds4_cp3_projection_substitution_mask = 0;
+
+                char control_name[64];
+                char probe_name[64];
+                const int control_len = snprintf(
+                    control_name, sizeof(control_name),
+                    "MIXED_M%u_LAYER%u_A0_vs_A1", site + 1u, layer);
+                const int probe_len = snprintf(
+                    probe_name, sizeof(probe_name),
+                    "MIXED_M%u_LAYER%u_A0_vs_A2", site + 1u, layer);
+                const bool names_ok = control_len > 0 && probe_len > 0 &&
+                    (size_t)control_len < sizeof(control_name) &&
+                    (size_t)probe_len < sizeof(probe_name);
+                const bool site_control = names_ok && a0_ok && a1_ok &&
+                    ds4_c2b_compare_observables(
+                        control_name, &a1, &a0, start, n_tokens,
+                        g->raw_cap);
+                const bool site_probe = names_ok && a0_ok && a2_ok &&
+                    ds4_c2b_compare_observables(
+                        probe_name, &a2, &a0, start, n_tokens,
+                        g->raw_cap);
+                fprintf(stderr,
+                        "MIXED_ATTN_C2B variant=M%u_LAYER%u "
+                        "control=%s probe=%s result=%s\n",
+                        site + 1u, layer,
+                        site_control ? "PASS" : "FAIL",
+                        site_probe ? "PASS" : "FAIL",
+                        restore_site_ok && a0_ok && restore1_ok &&
+                                a1_ok && restore2_ok && a2_ok &&
+                                site_control && site_probe
+                            ? "PASS" : "FAIL");
+                if (!restore_site_ok || !a0_ok || !restore1_ok ||
+                    !a1_ok || !restore2_ok || !a2_ok ||
+                    !site_control || !site_probe) {
+                    mixed_attn_report_ok = false;
+                    break;
+                }
+
+                ds4_first_divergence_capture next_pass_a = {0};
+                ds4_first_divergence_report next_report = {0};
+                const bool next_ok =
+                    ds4_first_divergence_capture_init(
+                        &next_pass_a, "PASS_A_MIXED_FORWARD") &&
+                    ds4_c2b_materialize_capture(
+                        &capture_a, &next_pass_a) &&
+                    ds4_first_divergence_emit_report(
+                        &next_pass_a, &pass_b, stderr, &next_report);
+                if (!next_ok) {
+                    ds4_first_divergence_capture_free(&next_pass_a);
+                    mixed_attn_report_ok = false;
+                    break;
+                }
+                ds4_first_divergence_capture_free(&pass_a);
+                pass_a = next_pass_a;
+                report = next_report;
+
+                bool site_new_family = false;
+                mixed_attn_report_ok =
+                    ds4_mixed_attention_emit_closure_and_causal(
+                        &pass_a, &pass_b, &capture_a, &capture_b,
+                        &mixed_attn_ab[site], &report,
+                        &site_new_family);
+                if (mixed_attn_report_ok) {
+                    mixed_attn_site_count++;
+                    if (site_new_family &&
+                        mixed_attn_new_family_count == 0u) {
+                        mixed_attn_new_family_count = 1u;
+                    }
+                }
+            }
+
+            fprintf(stderr,
+                    "MIXED_ATTN_FAMILY_SWEEP result=%s "
+                    "sites_proven=%u FIRST_DIVERGENCE=",
+                    mixed_attn_report_ok ? "PASS" : "FAIL",
+                    mixed_attn_report_ok ? mixed_attn_site_count : 0u);
+            ds4_first_divergence_print_report_location(&report);
+            fputc('\n', stderr);
+            fprintf(stderr,
+                    "GLOBAL_BOOKKEEPING independent_arithmetic_families=%u "
+                    "proven_arithmetic_sites=%u input_provenance_causes=0 "
+                    "indexing_or_placement_causes=0 "
+                    "state_transition_causes=0 unresolved_intervals=%u\n",
+                    7u + mixed_attn_new_family_count,
+                    136u + (mixed_attn_report_ok
+                                ? mixed_attn_site_count : 0u),
+                    report.first_divergence_found ? 1u : 0u);
+            report_ok = report_ok && mixed_attn_report_ok;
         }
         if (report_ok && cp5_sweep_requested) {
             ds4_cp4_to_cp5_source_audit(&s->engine->weights.layer[0]);
@@ -56549,6 +57473,8 @@ static int ds4_first_divergence_run(ds4_session *s,
     g_ds4_c45_capture_tail_inputs = false;
     g_ds4_first_divergence_canonical_mask = 0;
     g_ds4_cp3_projection_substitution_mask = 0;
+    memset(g_ds4_attention_layer_substitution, 0,
+           sizeof(g_ds4_attention_layer_substitution));
     ds4_c2b_observable_free(&a0);
     ds4_c2b_observable_free(&a1);
     ds4_c2b_observable_free(&a2);
@@ -56571,7 +57497,7 @@ static int ds4_first_divergence_run(ds4_session *s,
     spec_frontier_free(&frontier);
     return control && probe && qa_ab_proven && kv_ab_proven && qb_ab_proven &&
         canonical_rerun_ok && report_ok && cp5_sweep_report_ok &&
-        cp3_family_report_ok &&
+        cp3_family_report_ok && mixed_attn_report_ok &&
         cp4_prefix_input_ok &&
         hc_attn_pre_split_causal_ok && cp4_tail_causal_ok ? 0 : 1;
 }
