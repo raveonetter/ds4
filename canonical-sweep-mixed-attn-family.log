@@ -2,9 +2,9 @@ ds4: DSpark support model detected: ./gguf/DeepSeek-V4-Flash-DSpark-support-0731
 ds4: Metal device Apple M4 Max, 128.00 GiB RAM
 ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
 ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
-ds4: Metal model views created in 3.457 ms, residency requested in 636.430 ms, warmup 4.539 ms (mapped 93065.67 MiB from offset 5.09 MiB)
+ds4: Metal model views created in 3.451 ms, residency requested in 599.569 ms, warmup 4.642 ms (mapped 93065.67 MiB from offset 5.09 MiB)
 ds4: Metal mapped mmaped model as 2 overlapping shared buffers
-ds4: Metal model views created in 0.146 ms, residency requested in 639.876 ms, warmup 1.223 ms (mapped 5711.67 MiB from offset 0.01 MiB)
+ds4: Metal model views created in 0.187 ms, residency requested in 779.363 ms, warmup 0.818 ms (mapped 5711.67 MiB from offset 0.01 MiB)
 ds4: Metal mapped mmaped model as 3 overlapping shared buffers
 ds4: metal backend initialized for graph diagnostics
 ds4: memory: KV 0.61 GiB (raw 0.36 + compressed 0.25) + buffers 0.25 GiB + resident model 90.88 GiB = 91.74 GiB planned
@@ -164,10 +164,10 @@ CP3F_C2B variant=T0_BASELINE control=PASS probe=PASS result=PASS
 CP3F_C2B variant=T1_KV control=PASS probe=PASS result=PASS
 CP3F_C2B variant=T2_SCORE control=PASS probe=PASS result=PASS
 CP3F_C2B variant=T3_KV_SCORE control=PASS probe=PASS result=PASS
-MIXED_ATTN_SOURCE_AUDIT layer=2 ratio=0 generic_path=raw_batch sequential_path=gathered_single_vec_reduce generic_kernel=kernel_flash_attn_ext_f16_dk512_dv512 generic_reduction=direct_output sequential_kernel=kernel_flash_attn_ext_vec_f16_dk512_dv512 sequential_reduction=kernel_flash_attn_reduce kv_role=shared_K_and_V head_mapping=all_query_heads_to_one_KV_head scale=1/sqrt(head_dim) softmax_parameters=same causal_window_metadata=same compressed_visibility=(qpos+1)/ratio evidence=PROVEN_BY_SOURCE_AND_RUNTIME_PATH
-MIXED_ATTN_GENERIC_RUNTIME_REPLAY result=ERROR layer=2 failed_stage=preconditions
-MIXED_ATTN_STAGING_AB semantic_visible_kv=ERROR generic_order=raw_chunk_then_compressed sequential_order=visible_raw_then_visible_compressed storage=F16 layer=2
-MIXED_FLASH_ATTN_PRIMITIVE_AB input_bits_equal=FAIL metadata_same=FAIL result=ERROR elements=0 layer=2
+MIXED_ATTN_SOURCE_AUDIT layer=2 ratio=4 pos0=16 n_tokens=5 n_raw=21 raw_start=0 n_comp_before=4 n_comp=5 generic_path=prefixed_mixed_batch sequential_path=gathered_single_vec_reduce generic_kernel=UNKNOWN generic_reduction=UNKNOWN sequential_kernel=kernel_flash_attn_ext_vec_f16_dk512_dv512 sequential_reduction=kernel_flash_attn_reduce kv_role=shared_K_and_V head_mapping=all_query_heads_to_one_KV_head scale=1/sqrt(head_dim) softmax_parameters=same causal_window_metadata=same compressed_visibility=(qpos+1)/ratio evidence=UNKNOWN
+MIXED_ATTN_GENERIC_RUNTIME_REPLAY result=ERROR layer=2 failed_stage=q_clone
+MIXED_ATTN_STAGING_AB semantic_visible_kv=ERROR generic_order=chronological_raw_ring_then_compressed sequential_order=visible_raw_then_visible_compressed storage=F16 layer=2
+MIXED_FLASH_ATTN_PRIMITIVE_AB input_bits_equal=FAIL metadata_same=PASS result=ERROR elements=0 layer=2
 MIXED_ATTN_C2B variant=M1_LAYER2 control=FAIL probe=FAIL result=FAIL
 MIXED_ATTN_FAMILY_SWEEP result=STOP reason=replay_primitive_or_c2b_gate_failed
 C2B_ERROR config=1 alloc_a=1 alloc_b=1 alloc_b_probe=1 raw_snapshot=1 frontier=1 A0=0 restore1=0 A1=0 restore2=0 A2=0 materialize_a=0 pass_b_restore=1 canonical_rerun=0
