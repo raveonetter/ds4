@@ -40773,6 +40773,94 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
     return 1;
 }
 
+int ds4_gpu_shared_down_hc_expand_q8_0_rows_exact_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *shared_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *shared_mid,
+        const ds4_gpu_tensor *routed_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_rows) {
+    const uint64_t hc_values = (uint64_t)n_hc * n_embd;
+    const uint64_t split_values =
+        2ull * n_hc + (uint64_t)n_hc * n_hc;
+    if (!out_hc || !shared_out || !model_map || !shared_mid ||
+        !routed_out || !residual_hc || !split || n_rows == 0 ||
+        in_dim == 0 || n_embd == 0 || n_hc == 0 || out_dim != n_embd ||
+        in_dim > UINT64_MAX / sizeof(float) ||
+        out_dim > UINT64_MAX / sizeof(float) ||
+        hc_values > UINT64_MAX / sizeof(float) ||
+        split_values > UINT64_MAX / sizeof(float)) {
+        return 0;
+    }
+
+    const uint64_t mid_row_bytes = in_dim * sizeof(float);
+    const uint64_t embd_row_bytes = out_dim * sizeof(float);
+    const uint64_t hc_row_bytes = hc_values * sizeof(float);
+    const uint64_t split_row_bytes = split_values * sizeof(float);
+    if (n_rows > UINT64_MAX / mid_row_bytes ||
+        n_rows > UINT64_MAX / embd_row_bytes ||
+        n_rows > UINT64_MAX / hc_row_bytes ||
+        n_rows > UINT64_MAX / split_row_bytes ||
+        ds4_gpu_tensor_bytes(shared_mid) <
+            (uint64_t)n_rows * mid_row_bytes ||
+        ds4_gpu_tensor_bytes(shared_out) <
+            (uint64_t)n_rows * embd_row_bytes ||
+        ds4_gpu_tensor_bytes(routed_out) <
+            (uint64_t)n_rows * embd_row_bytes ||
+        ds4_gpu_tensor_bytes(residual_hc) <
+            (uint64_t)n_rows * hc_row_bytes ||
+        ds4_gpu_tensor_bytes(split) <
+            (uint64_t)n_rows * split_row_bytes ||
+        ds4_gpu_tensor_bytes(out_hc) <
+            (uint64_t)n_rows * hc_row_bytes) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        for (uint32_t row = 0; row < n_rows; row++) {
+            const uint64_t mid_offset = (uint64_t)row * mid_row_bytes;
+            const uint64_t embd_offset = (uint64_t)row * embd_row_bytes;
+            const uint64_t hc_offset = (uint64_t)row * hc_row_bytes;
+            const uint64_t split_offset = (uint64_t)row * split_row_bytes;
+            ds4_gpu_tensor *out_row =
+                ds4_gpu_tensor_view(out_hc, hc_offset, hc_row_bytes);
+            ds4_gpu_tensor *shared_out_row = ds4_gpu_tensor_view(
+                shared_out, embd_offset, embd_row_bytes);
+            ds4_gpu_tensor *mid_row = ds4_gpu_tensor_view(
+                shared_mid, mid_offset, mid_row_bytes);
+            ds4_gpu_tensor *routed_row = ds4_gpu_tensor_view(
+                routed_out, embd_offset, embd_row_bytes);
+            ds4_gpu_tensor *residual_row = ds4_gpu_tensor_view(
+                residual_hc, hc_offset, hc_row_bytes);
+            ds4_gpu_tensor *split_row = ds4_gpu_tensor_view(
+                split, split_offset, split_row_bytes);
+            const int ok = out_row && shared_out_row && mid_row &&
+                routed_row && residual_row && split_row &&
+                ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+                    out_row, shared_out_row, model_map, model_size,
+                    weight_offset, in_dim, out_dim, mid_row, routed_row,
+                    residual_row, split_row, n_embd, n_hc);
+            ds4_gpu_tensor_free(split_row);
+            ds4_gpu_tensor_free(residual_row);
+            ds4_gpu_tensor_free(routed_row);
+            ds4_gpu_tensor_free(mid_row);
+            ds4_gpu_tensor_free(shared_out_row);
+            ds4_gpu_tensor_free(out_row);
+            if (!ok) return 0;
+        }
+    }
+
+    return 1;
+}
+
 int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,

@@ -9,8 +9,8 @@
     ((1u << (unsigned)DS4_REPAIR_FAMILY_COUNT) - 1u)
 
 /* Frozen from the completed 177-site canonical sweep.  P2 repairs the four
- * pure projection/reduction families; P3 owns the remaining mixed families.
- * The site taxonomy and proven-site counts stay unchanged. */
+ * pure projection/reduction families; P3 repairs the remaining mixed
+ * families.  The site taxonomy and proven-site counts stay unchanged. */
 static const ds4_family_repair_manifest_entry g_family_manifest[] = {
     {
         DS4_REPAIR_FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV,
@@ -76,7 +76,7 @@ static const ds4_family_repair_manifest_entry g_family_manifest[] = {
         "q8_0 single fused shared-down HC expand",
         DS4_FAMILY_REPAIR_ENTRY_Q8_SHARED_DOWN_BATCH_F32_HC_ADD,
         "ds4_repair_q8_shared_down_batch_f32_hc_add",
-        DS4_FAMILY_REPAIR_NOT_IMPLEMENTED,
+        DS4_FAMILY_REPAIR_EXACT,
     },
     {
         DS4_REPAIR_FAMILY_F16_BATCH_EXT_VS_SINGLE_PAIR_MV,

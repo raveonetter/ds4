@@ -16,6 +16,10 @@ enum {
     TEST_Q8_OUT = 1024,
     TEST_F16_OUT = 256,
     TEST_PAIR_OUT = 512,
+    TEST_CP5_IN = 1024,
+    TEST_CP5_EMBD = 4096,
+    TEST_CP5_HC = 4,
+    TEST_CP5_SPLIT = 2 * TEST_CP5_HC + TEST_CP5_HC * TEST_CP5_HC,
     TEST_ROUTER_EXPERTS = 256,
     TEST_ROUTER_TOPK = 6,
 };
@@ -43,9 +47,9 @@ static uint16_t half_bits(float value) {
     return bits;
 }
 
-static void fill_q8_matrix(test_block_q8_0 *matrix, uint32_t out_dim,
-                           uint32_t salt) {
-    const uint32_t blocks = TEST_IN / 32u;
+static void fill_q8_matrix(test_block_q8_0 *matrix, uint32_t in_dim,
+                           uint32_t out_dim, uint32_t salt) {
+    const uint32_t blocks = in_dim / 32u;
     for (uint32_t row = 0; row < out_dim; row++) {
         for (uint32_t block = 0; block < blocks; block++) {
             test_block_q8_0 *q = matrix + (uint64_t)row * blocks + block;
@@ -334,6 +338,149 @@ static unsigned run_f16_contracts(const void *model, uint64_t model_size,
     return (single_ok ? 1u : 0u) | (pair_ok ? 2u : 0u);
 }
 
+static int run_cp5_tail_contract(const void *model, uint64_t model_size,
+                                 uint64_t weight_offset) {
+    const uint64_t mid_count = (uint64_t)TEST_ROWS * TEST_CP5_IN;
+    const uint64_t embd_count = (uint64_t)TEST_ROWS * TEST_CP5_EMBD;
+    const uint64_t hc_count = embd_count * TEST_CP5_HC;
+    const uint64_t split_count =
+        (uint64_t)TEST_ROWS * TEST_CP5_SPLIT;
+    float *mid_host = calloc((size_t)mid_count, sizeof(float));
+    float *routed_host = calloc((size_t)embd_count, sizeof(float));
+    float *residual_host = calloc((size_t)hc_count, sizeof(float));
+    float *split_host = calloc((size_t)split_count, sizeof(float));
+    float *actual = calloc((size_t)hc_count, sizeof(float));
+    float *expected = calloc((size_t)hc_count, sizeof(float));
+    float *shared_actual = calloc((size_t)embd_count, sizeof(float));
+    float *shared_expected = calloc((size_t)embd_count, sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
+    ds4_gpu_tensor *routed =
+        ds4_gpu_tensor_alloc(embd_count * sizeof(float));
+    ds4_gpu_tensor *residual =
+        ds4_gpu_tensor_alloc(hc_count * sizeof(float));
+    ds4_gpu_tensor *split =
+        ds4_gpu_tensor_alloc(split_count * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(hc_count * sizeof(float));
+    ds4_gpu_tensor *out_ref =
+        ds4_gpu_tensor_alloc(hc_count * sizeof(float));
+    ds4_gpu_tensor *shared =
+        ds4_gpu_tensor_alloc(embd_count * sizeof(float));
+    ds4_gpu_tensor *shared_ref =
+        ds4_gpu_tensor_alloc(embd_count * sizeof(float));
+    int ok = mid_host && routed_host && residual_host && split_host &&
+             actual && expected && shared_actual && shared_expected &&
+             mid && routed && residual && split && out && out_ref &&
+             shared && shared_ref;
+
+    for (uint64_t i = 0; ok && i < mid_count; i++) {
+        mid_host[i] = (float)((int32_t)((i * 17u + 5u) % 127u) - 63) /
+                      256.0f;
+    }
+    for (uint64_t i = 0; ok && i < embd_count; i++) {
+        routed_host[i] =
+            (float)((int32_t)((i * 23u + 11u) % 193u) - 96) / 512.0f;
+    }
+    for (uint64_t i = 0; ok && i < hc_count; i++) {
+        residual_host[i] =
+            (float)((int32_t)((i * 29u + 7u) % 251u) - 125) / 1024.0f;
+    }
+    for (uint64_t i = 0; ok && i < split_count; i++) {
+        split_host[i] =
+            (float)((int32_t)((i * 31u + 13u) % 61u) - 30) / 64.0f;
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_write(mid, 0, mid_host,
+                                  mid_count * sizeof(float)) &&
+             ds4_gpu_tensor_write(routed, 0, routed_host,
+                                  embd_count * sizeof(float)) &&
+             ds4_gpu_tensor_write(residual, 0, residual_host,
+                                  hc_count * sizeof(float)) &&
+             ds4_gpu_tensor_write(split, 0, split_host,
+                                  split_count * sizeof(float)) &&
+             ds4_gpu_shared_down_hc_expand_q8_0_rows_exact_tensor(
+                 out, shared, model, model_size, weight_offset,
+                 TEST_CP5_IN, TEST_CP5_EMBD, mid, routed, residual, split,
+                 TEST_CP5_EMBD, TEST_CP5_HC, TEST_ROWS) != 0;
+    }
+    for (uint32_t row = 0; ok && row < TEST_ROWS; row++) {
+        const uint64_t mid_offset =
+            (uint64_t)row * TEST_CP5_IN * sizeof(float);
+        const uint64_t embd_offset =
+            (uint64_t)row * TEST_CP5_EMBD * sizeof(float);
+        const uint64_t hc_offset =
+            (uint64_t)row * TEST_CP5_HC * TEST_CP5_EMBD * sizeof(float);
+        const uint64_t split_offset =
+            (uint64_t)row * TEST_CP5_SPLIT * sizeof(float);
+        ds4_gpu_tensor *mid_row = ds4_gpu_tensor_view(
+            mid, mid_offset, (uint64_t)TEST_CP5_IN * sizeof(float));
+        ds4_gpu_tensor *routed_row = ds4_gpu_tensor_view(
+            routed, embd_offset,
+            (uint64_t)TEST_CP5_EMBD * sizeof(float));
+        ds4_gpu_tensor *residual_row = ds4_gpu_tensor_view(
+            residual, hc_offset,
+            (uint64_t)TEST_CP5_HC * TEST_CP5_EMBD * sizeof(float));
+        ds4_gpu_tensor *split_row = ds4_gpu_tensor_view(
+            split, split_offset,
+            (uint64_t)TEST_CP5_SPLIT * sizeof(float));
+        ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
+            out_ref, hc_offset,
+            (uint64_t)TEST_CP5_HC * TEST_CP5_EMBD * sizeof(float));
+        ds4_gpu_tensor *shared_row = ds4_gpu_tensor_view(
+            shared_ref, embd_offset,
+            (uint64_t)TEST_CP5_EMBD * sizeof(float));
+        ok = mid_row && routed_row && residual_row && split_row && out_row &&
+             shared_row &&
+             ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+                 out_row, shared_row, model, model_size, weight_offset,
+                 TEST_CP5_IN, TEST_CP5_EMBD, mid_row, routed_row,
+                 residual_row, split_row, TEST_CP5_EMBD, TEST_CP5_HC) != 0;
+        ds4_gpu_tensor_free(shared_row);
+        ds4_gpu_tensor_free(out_row);
+        ds4_gpu_tensor_free(split_row);
+        ds4_gpu_tensor_free(residual_row);
+        ds4_gpu_tensor_free(routed_row);
+        ds4_gpu_tensor_free(mid_row);
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_read(out, 0, actual,
+                                 hc_count * sizeof(float)) &&
+             ds4_gpu_tensor_read(out_ref, 0, expected,
+                                 hc_count * sizeof(float)) &&
+             ds4_gpu_tensor_read(shared, 0, shared_actual,
+                                 embd_count * sizeof(float)) &&
+             ds4_gpu_tensor_read(shared_ref, 0, shared_expected,
+                                 embd_count * sizeof(float)) &&
+             compare_exact("cp5_tail_hc", actual, expected,
+                           (size_t)hc_count) &&
+             compare_exact("cp5_tail_shared_out", shared_actual,
+                           shared_expected, (size_t)embd_count);
+    }
+
+    printf("PRODUCTION_FAMILY_AB "
+           "family=FAMILY_Q8_SHARED_DOWN_BATCH_F32_HC_ADD_VS_SINGLE_FUSED_HC "
+           "rows=%u sites=cp5_tail input_bits_equal=PASS weights_same=PASS "
+           "metadata_same=PASS result=%s\n",
+           TEST_ROWS, ok ? "EXACT" : "MISMATCH");
+
+    ds4_gpu_tensor_free(shared_ref);
+    ds4_gpu_tensor_free(shared);
+    ds4_gpu_tensor_free(out_ref);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(split);
+    ds4_gpu_tensor_free(residual);
+    ds4_gpu_tensor_free(routed);
+    ds4_gpu_tensor_free(mid);
+    free(shared_expected);
+    free(shared_actual);
+    free(expected);
+    free(actual);
+    free(split_host);
+    free(residual_host);
+    free(routed_host);
+    free(mid_host);
+    return ok;
+}
+
 static int run_router_contract(void) {
     const uint64_t probs_count =
         (uint64_t)TEST_ROWS * TEST_ROUTER_EXPERTS;
@@ -423,17 +570,24 @@ int main(void) {
         (uint64_t)TEST_Q8_OUT * (TEST_IN / 32u) * sizeof(test_block_q8_0);
     const uint64_t f16_bytes =
         (uint64_t)TEST_PAIR_OUT * TEST_IN * sizeof(uint16_t);
+    const uint64_t cp5_q8_bytes =
+        (uint64_t)TEST_CP5_EMBD * (TEST_CP5_IN / 32u) *
+        sizeof(test_block_q8_0);
     const uint64_t q8_gate_offset = 0;
     const uint64_t q8_up_offset = align_up(q8_bytes, page);
     const uint64_t f16_a_offset = align_up(q8_up_offset + q8_bytes, page);
     const uint64_t f16_b_offset = align_up(f16_a_offset + f16_bytes, page);
-    const uint64_t model_size = align_up(f16_b_offset + f16_bytes, page);
+    const uint64_t cp5_q8_offset =
+        align_up(f16_b_offset + f16_bytes, page);
+    const uint64_t model_size =
+        align_up(cp5_q8_offset + cp5_q8_bytes, page);
     void *model = NULL;
     float *input_host = calloc(
         (size_t)TEST_ROWS * TEST_IN, sizeof(float));
     ds4_gpu_tensor *input = NULL;
     int initialized = 0;
     int q8_ok = 0;
+    int cp5_ok = 0;
     int router_ok = 0;
     unsigned f16_results = 0;
     int ok = input_host != NULL &&
@@ -443,16 +597,19 @@ int main(void) {
         memset(model, 0, (size_t)model_size);
         fill_q8_matrix((test_block_q8_0 *)
                        ((uint8_t *)model + q8_gate_offset),
-                       TEST_Q8_OUT, 3u);
+                       TEST_IN, TEST_Q8_OUT, 3u);
         fill_q8_matrix((test_block_q8_0 *)
                        ((uint8_t *)model + q8_up_offset),
-                       TEST_Q8_OUT, 11u);
+                       TEST_IN, TEST_Q8_OUT, 11u);
         fill_f16_matrix((uint16_t *)
                         ((uint8_t *)model + f16_a_offset),
                         TEST_PAIR_OUT, 5u);
         fill_f16_matrix((uint16_t *)
                         ((uint8_t *)model + f16_b_offset),
                         TEST_PAIR_OUT, 17u);
+        fill_q8_matrix((test_block_q8_0 *)
+                       ((uint8_t *)model + cp5_q8_offset),
+                       TEST_CP5_IN, TEST_CP5_EMBD, 19u);
         for (uint32_t row = 0; row < TEST_ROWS; row++) {
             for (uint32_t col = 0; col < TEST_IN; col++) {
                 const int32_t raw =
@@ -483,17 +640,19 @@ int main(void) {
     if (ok) {
         q8_ok = run_q8_contract(model, model_size,
                                 q8_gate_offset, q8_up_offset, input);
+        cp5_ok = run_cp5_tail_contract(model, model_size, cp5_q8_offset);
         f16_results = run_f16_contracts(model, model_size,
                                          f16_a_offset, f16_b_offset, input);
         router_ok = run_router_contract();
-        ok = q8_ok && f16_results == 3u && router_ok;
+        ok = q8_ok && cp5_ok && f16_results == 3u && router_ok;
     }
 
     const unsigned families_exact = (q8_ok ? 1u : 0u) +
+        (cp5_ok ? 1u : 0u) +
         ((f16_results & 1u) ? 1u : 0u) +
         ((f16_results & 2u) ? 1u : 0u) + (router_ok ? 1u : 0u);
-    printf("PROJECTION_REPAIR_STATUS families_total=4 families_exact=%u "
-           "families_failed=%u\n", families_exact, 4u - families_exact);
+    printf("PROJECTION_REPAIR_STATUS families_total=5 families_exact=%u "
+           "families_failed=%u\n", families_exact, 5u - families_exact);
     ds4_gpu_tensor_free(input);
     if (initialized) ds4_gpu_cleanup();
     free(input_host);

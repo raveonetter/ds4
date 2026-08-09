@@ -2620,6 +2620,22 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+int ds4_gpu_shared_down_hc_expand_q8_0_rows_exact_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *shared_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *shared_mid,
+        const ds4_gpu_tensor *routed_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_rows);
+
 int ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *shared_out,

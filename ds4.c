@@ -252,6 +252,21 @@ int ds4_gpu_matmul_f16_router_rows_exact_tensor(
             out, model_map, model_size, weight_offset,
             4096u, 256u, x, n_rows);
 }
+int ds4_gpu_shared_down_hc_expand_q8_0_rows_exact_tensor(
+        ds4_gpu_tensor *out_hc, ds4_gpu_tensor *shared_out,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *shared_mid,
+        const ds4_gpu_tensor *routed_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t n_embd, uint32_t n_hc, uint32_t n_rows) {
+    (void)out_hc; (void)shared_out; (void)model_map; (void)model_size;
+    (void)weight_offset; (void)in_dim; (void)out_dim; (void)shared_mid;
+    (void)routed_out; (void)residual_hc; (void)split; (void)n_embd;
+    (void)n_hc; (void)n_rows;
+    return 0;
+}
 int ds4_gpu_q8_cache_suppressed(void) { return 0; }
 void ds4_gpu_set_q8_cache_suppressed(int suppressed) { (void)suppressed; }
 int ds4_gpu_set_decode_fast_attention(int enabled) { (void)enabled; return 0; }
@@ -26211,43 +26226,13 @@ static bool metal_graph_cp5_tail_canonical_rows(
         return false;
     }
 
-    bool ok = true;
-    for (uint32_t row = 0; ok && row < rows; row++) {
-        ds4_gpu_tensor *after_row = ds4_gpu_tensor_view(
-            after_ffn_hc, (uint64_t)row * hc_values * sizeof(float),
-            hc_values * sizeof(float));
-        ds4_gpu_tensor *shared_out_row = ds4_gpu_tensor_view(
-            shared_out, (uint64_t)row * DS4_N_EMBD * sizeof(float),
-            (uint64_t)DS4_N_EMBD * sizeof(float));
-        ds4_gpu_tensor *shared_mid_row = ds4_gpu_tensor_view(
-            shared_mid, (uint64_t)row * shared_dim * sizeof(float),
-            shared_dim * sizeof(float));
-        ds4_gpu_tensor *routed_row = ds4_gpu_tensor_view(
-            routed_out, (uint64_t)row * DS4_N_EMBD * sizeof(float),
-            (uint64_t)DS4_N_EMBD * sizeof(float));
-        ds4_gpu_tensor *attn_hc_row = ds4_gpu_tensor_view(
-            after_attn_hc, (uint64_t)row * hc_values * sizeof(float),
-            hc_values * sizeof(float));
-        ds4_gpu_tensor *split_row = ds4_gpu_tensor_view(
-            hc_split, (uint64_t)row * split_values * sizeof(float),
-            split_values * sizeof(float));
-        ok = after_row && shared_out_row && shared_mid_row && routed_row &&
-             attn_hc_row && split_row &&
-             ds4_gpu_shared_down_hc_expand_q8_0_tensor(
-                 after_row, shared_out_row,
-                 model->map, model->size,
-                 layer->ffn_down_shexp->abs_offset,
-                 shared_dim, DS4_N_EMBD,
-                 shared_mid_row, routed_row, attn_hc_row, split_row,
-                 DS4_N_EMBD, DS4_N_HC) != 0;
-        ds4_gpu_tensor_free(split_row);
-        ds4_gpu_tensor_free(attn_hc_row);
-        ds4_gpu_tensor_free(routed_row);
-        ds4_gpu_tensor_free(shared_mid_row);
-        ds4_gpu_tensor_free(shared_out_row);
-        ds4_gpu_tensor_free(after_row);
-    }
-    return ok;
+    return ds4_gpu_shared_down_hc_expand_q8_0_rows_exact_tensor(
+               after_ffn_hc, shared_out,
+               model->map, model->size,
+               layer->ffn_down_shexp->abs_offset,
+               shared_dim, DS4_N_EMBD,
+               shared_mid, routed_out, after_attn_hc, hc_split,
+               DS4_N_EMBD, DS4_N_HC, rows) != 0;
 }
 
 static bool metal_graph_matmul_named_or_canonical_rows(
@@ -30345,7 +30330,8 @@ static bool metal_graph_encode_layer_ffn_batch(
     bool shared_down_f16 = false;
 
 #define DS4_METAL_TRY_SHARED_DOWN_F16() do { \
-        if (ok && !canonical_cp5_tail && !tp_row_split_ffn && !keep_ffn_out && \
+        if (ok && !canonical_cp5_tail && !repair_cp5_tail && \
+            !tp_row_split_ffn && !keep_ffn_out && \
             !metal_graph_debug_wants("ffn_shexp", il, pos0)) { \
             shared_down_f16 = ds4_gpu_matmul_q8_0_f16_out_tensor(g->batch_q_half, \
                                                                  model->map, \
@@ -30413,7 +30399,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                              DS4_SWIGLU_CLAMP_EXP, \
                                              1.0f) != 0; \
         DS4_METAL_TRY_SHARED_DOWN_F16(); \
-        if (ok && !canonical_cp5_tail && !shared_down_f16) ok = metal_graph_matmul_q8_0_named_tensor("shared_down", \
+        if (ok && !canonical_cp5_tail && !repair_cp5_tail && !shared_down_f16) ok = metal_graph_matmul_q8_0_named_tensor("shared_down", \
                                                                               il, \
                                                                               pos0, \
                                                                               metal_graph_batch_shared_out(g), \
@@ -30424,7 +30410,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                                               metal_graph_batch_shared_mid(g), \
                                                                               tp_rows); \
         DS4_METAL_PROFILE_FFN_STAGE("shared_down"); \
-        if (ok && !canonical_cp5_tail && !shared_down_f16) { \
+        if (ok && !canonical_cp5_tail && !repair_cp5_tail && !shared_down_f16) { \
             metal_graph_debug_dump_tensor("ffn_shexp", metal_graph_batch_shared_out(g), \
                                           (uint64_t)n_tokens * DS4_N_EMBD, il, pos0); \
         } \
@@ -30449,6 +30435,12 @@ static bool metal_graph_encode_layer_ffn_batch(
             DS4_FIRST_DIVERGENCE_CANON_CP5_TAIL);
     const bool canonical_cp5_tail =
         canonical_cp5_tail_requested &&
+        !tp_split_ffn && !tp_row_split_ffn && !keep_ffn_out &&
+        !metal_graph_directional_steering_ffn_enabled(g) &&
+        layer->ffn_down_shexp->type == DS4_TENSOR_Q8_0;
+    const bool repair_cp5_tail =
+        ds4_family_repair_runtime_enabled(
+            DS4_REPAIR_FAMILY_Q8_SHARED_DOWN_BATCH_F32_HC_ADD_VS_SINGLE_FUSED_HC) &&
         !tp_split_ffn && !tp_row_split_ffn && !keep_ffn_out &&
         !metal_graph_directional_steering_ffn_enabled(g) &&
         layer->ffn_down_shexp->type == DS4_TENSOR_Q8_0;
@@ -30729,7 +30721,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                               DS4_N_EMBD,
                                               DS4_N_HC) != 0;
     }
-    else if (ok && canonical_cp5_tail) {
+    else if (ok && (canonical_cp5_tail || repair_cp5_tail)) {
         ok = metal_graph_cp5_tail_canonical_rows(
             next_hc_view, metal_graph_batch_shared_out(g), model, layer,
             metal_graph_batch_shared_mid(g),
@@ -30770,7 +30762,8 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
     if (ok && g_ds4_c2b_capture && g_ds4_c2b_capture->graph == g &&
         il < DS4_N_LAYER) {
-        g_ds4_c2b_capture->cp5_tail_path[il] = canonical_cp5_tail
+        g_ds4_c2b_capture->cp5_tail_path[il] =
+            (canonical_cp5_tail || repair_cp5_tail)
             ? DS4_CP5_TAIL_PATH_SINGLE_FUSED_Q8
             : shared_down_f16
                 ? DS4_CP5_TAIL_PATH_BATCH_F16_HALF_ADD
