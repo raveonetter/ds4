@@ -210,6 +210,19 @@ bool ds4_first_divergence_emit_cp4_tail_causal_summary(
         bool substituted_after_exact,
         bool first_divergence_beyond_cp4);
 
+bool ds4_first_divergence_emit_router_select_causal_summary(
+        FILE *stream,
+        bool inputs_equal,
+        bool weights_same,
+        bool metadata_same,
+        bool probs_exact_before,
+        bool selected_exact_before,
+        bool router_weights_exact_before,
+        bool substitution_performed,
+        bool probs_exact_after,
+        bool selected_exact_after,
+        bool router_weights_exact_after);
+
 bool ds4_first_divergence_float_signature_compute(
         const float *actual,
         const float *expected,

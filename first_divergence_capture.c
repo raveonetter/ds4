@@ -903,6 +903,63 @@ bool ds4_first_divergence_emit_cp4_tail_causal_summary(
     return ferror(stream) == 0;
 }
 
+bool ds4_first_divergence_emit_router_select_causal_summary(
+        FILE *stream,
+        bool inputs_equal,
+        bool weights_same,
+        bool metadata_same,
+        bool probs_exact_before,
+        bool selected_exact_before,
+        bool router_weights_exact_before,
+        bool substitution_performed,
+        bool probs_exact_after,
+        bool selected_exact_after,
+        bool router_weights_exact_after) {
+    if (!stream) return false;
+    const bool preconditions =
+        inputs_equal && weights_same && metadata_same;
+    const bool mismatch = !probs_exact_before || !selected_exact_before ||
+        !router_weights_exact_before;
+    const bool weights_only = probs_exact_before && selected_exact_before &&
+        !router_weights_exact_before;
+    const bool repaired = substitution_performed && probs_exact_after &&
+        selected_exact_after && router_weights_exact_after;
+    const bool causal_closure = preconditions && mismatch && repaired;
+    const bool substitution_ok = !mismatch || causal_closure;
+    const char *site = weights_only
+        ? "ffn_router_weights" : "ffn_router_select";
+
+    fprintf(stream,
+            "NEW_SOURCE_AB site=%s inputs_equal=%s weights_same=%s "
+            "metadata_same=%s result=%s\n",
+            site,
+            inputs_equal ? "PASS" : "FAIL",
+            weights_same ? "PASS" : "FAIL",
+            metadata_same ? "PASS" : "FAIL",
+            mismatch ? "MISMATCH" : "EXACT");
+    fprintf(stream,
+            "DRIFT_SOURCE site=%s family=%s generic=%s sequential=%s "
+            "evidence=%s\n",
+            site,
+            weights_only && causal_closure
+                ? "FAMILY_ROUTER_WEIGHT_NORMALIZATION_BATCH_REDUCE_VS_SINGLE_KERNEL"
+                : "UNKNOWN",
+            weights_only
+                ? "get_rows+sum_rows+div_row+mul_scalar"
+                : "router_select_batch",
+            weights_only
+                ? "kernel_dsv4_router_weights_one"
+                : "router_select_single",
+            causal_closure
+                ? "PROVEN_BY_SOURCE_AND_TEST" : "PROVEN_BY_SOURCE");
+    fprintf(stream,
+            "CAUSAL_SUBSTITUTION site=%s repaired_stage=%s result=%s\n",
+            site,
+            (!mismatch || repaired) ? "EXACT" : "MISMATCH",
+            substitution_ok ? "PASS" : "FAIL");
+    return ferror(stream) == 0;
+}
+
 bool ds4_first_divergence_emit_report(
         const ds4_first_divergence_capture *pass_a,
         const ds4_first_divergence_capture *pass_b,

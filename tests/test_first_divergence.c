@@ -458,6 +458,42 @@ int main(void) {
                    "CP4_TAIL_ADJUDICATION status=REJECTED family=UNCLASSIFIED reason=same_input_tail_exact") != NULL);
     REQUIRE(fclose(q_log) == 0);
 
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_router_select_causal_summary(
+        q_log, true, true, true,
+        true, true, false, true,
+        true, true, true));
+    REQUIRE(fflush(q_log) == 0);
+    REQUIRE(fseek(q_log, 0, SEEK_SET) == 0);
+    q_log_bytes = fread(q_log_text, 1, sizeof(q_log_text) - 1, q_log);
+    q_log_text[q_log_bytes] = '\0';
+    REQUIRE(strstr(q_log_text,
+                   "NEW_SOURCE_AB site=ffn_router_weights inputs_equal=PASS weights_same=PASS metadata_same=PASS result=MISMATCH") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "family=FAMILY_ROUTER_WEIGHT_NORMALIZATION_BATCH_REDUCE_VS_SINGLE_KERNEL") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "generic=get_rows+sum_rows+div_row+mul_scalar sequential=kernel_dsv4_router_weights_one evidence=PROVEN_BY_SOURCE_AND_TEST") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "CAUSAL_SUBSTITUTION site=ffn_router_weights repaired_stage=EXACT result=PASS") != NULL);
+    REQUIRE(fclose(q_log) == 0);
+
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_router_select_causal_summary(
+        q_log, true, true, true,
+        true, true, false, false,
+        true, true, false));
+    REQUIRE(fflush(q_log) == 0);
+    REQUIRE(fseek(q_log, 0, SEEK_SET) == 0);
+    q_log_bytes = fread(q_log_text, 1, sizeof(q_log_text) - 1, q_log);
+    q_log_text[q_log_bytes] = '\0';
+    REQUIRE(strstr(q_log_text,
+                   "DRIFT_SOURCE site=ffn_router_weights family=UNKNOWN") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "CAUSAL_SUBSTITUTION site=ffn_router_weights repaired_stage=MISMATCH result=FAIL") != NULL);
+    REQUIRE(fclose(q_log) == 0);
+
     puts("first-divergence forced pair: OK");
     return 0;
 }

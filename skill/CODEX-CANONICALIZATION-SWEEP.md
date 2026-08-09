@@ -126,8 +126,16 @@ The diagnostic tests these cumulative row-wise substitutions:
 
 1. ordinary single-row HC-FFN pre-sublayer arithmetic;
 2. ordinary single-row router projection arithmetic;
-3. the existing fused single-row Q8 shared gate/up/SwiGLU primitive;
-4. the existing single-row routed-MoE primitive.
+3. ordinary single-row router selection and weight normalization;
+4. the existing fused single-row Q8 shared gate/up/SwiGLU primitive;
+5. the existing single-row routed-MoE primitive.
+
+The router-selection variant is separate from router projection. On the M4
+path, exact logits/probabilities/top-k with mismatching router weights isolate
+the generic `get_rows + sum_rows + div_row + mul_scalar` normalization from
+the sequential `kernel_dsv4_router_weights_one` producer. The row-wise
+diagnostic keeps logits and token IDs in their existing GPU tensors and
+invokes the natural N=1 router producer without a CPU readback.
 
 Each variant has its own A0/A1 and A0/A2 C2b gate. A mismatch is assigned to
 an arithmetic family only when its incoming semantic object is exact, source
