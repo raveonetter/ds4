@@ -471,6 +471,9 @@ int main(void) {
         initialized = ok;
     }
     if (ok) {
+        ok = ds4_gpu_set_model_map(model, model_size) != 0;
+    }
+    if (ok) {
         input = ds4_gpu_tensor_alloc(
             (uint64_t)TEST_ROWS * TEST_IN * sizeof(float));
         ok = input != NULL && ds4_gpu_tensor_write(
