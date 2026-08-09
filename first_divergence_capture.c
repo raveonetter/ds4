@@ -216,7 +216,11 @@ static int cp3_p_subobject_rank(const char *name) {
         "attn_state_kv_before",
         "attn_state_score_before",
         "attn_comp_kv_raw",
-        "attn_comp_score_raw"
+        "attn_comp_score_raw",
+        "index_state_kv_before",
+        "index_state_score_before",
+        "index_comp_kv_raw",
+        "index_comp_score_raw"
     };
     size_t i;
 

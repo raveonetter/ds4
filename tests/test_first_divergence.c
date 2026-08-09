@@ -198,6 +198,10 @@ int main(void) {
     CAPTURE_CP3_PAIR(DS4_FIRST_DIVERGENCE_CP3_F,
                      "attn_state_kv", cp3_exact, cp3_mismatch);
     CAPTURE_CP3_PAIR(DS4_FIRST_DIVERGENCE_CP3_P,
+                     "index_comp_kv_raw", cp3_exact, cp3_mismatch);
+    CAPTURE_CP3_PAIR(DS4_FIRST_DIVERGENCE_CP3_P,
+                     "index_state_kv_before", cp3_exact, cp3_mismatch);
+    CAPTURE_CP3_PAIR(DS4_FIRST_DIVERGENCE_CP3_P,
                      "attn_comp_kv_raw", cp3_exact, cp3_mismatch);
     CAPTURE_CP3_PAIR(DS4_FIRST_DIVERGENCE_CP3_P,
                      "attn_state_kv_before", cp3_exact, cp3_mismatch);
@@ -225,6 +229,32 @@ int main(void) {
     for (size_t i = 0; i < cp3_pass_b.count; i++) {
         ds4_first_divergence_snapshot *b = &cp3_pass_b.snapshots[i];
         if (strcmp(b->subobject, "attn_comp_kv_raw") == 0) {
+            memcpy(b->data, cp3_exact, sizeof(cp3_exact));
+        }
+    }
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_report(
+        &cp3_pass_a, &cp3_pass_b, q_log, &report));
+    REQUIRE(report.checkpoint == DS4_FIRST_DIVERGENCE_CP3_P);
+    REQUIRE(strcmp(report.subobject, "index_state_kv_before") == 0);
+    REQUIRE(fclose(q_log) == 0);
+    for (size_t i = 0; i < cp3_pass_b.count; i++) {
+        ds4_first_divergence_snapshot *b = &cp3_pass_b.snapshots[i];
+        if (strcmp(b->subobject, "index_state_kv_before") == 0) {
+            memcpy(b->data, cp3_exact, sizeof(cp3_exact));
+        }
+    }
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_report(
+        &cp3_pass_a, &cp3_pass_b, q_log, &report));
+    REQUIRE(report.checkpoint == DS4_FIRST_DIVERGENCE_CP3_P);
+    REQUIRE(strcmp(report.subobject, "index_comp_kv_raw") == 0);
+    REQUIRE(fclose(q_log) == 0);
+    for (size_t i = 0; i < cp3_pass_b.count; i++) {
+        ds4_first_divergence_snapshot *b = &cp3_pass_b.snapshots[i];
+        if (strcmp(b->subobject, "index_comp_kv_raw") == 0) {
             memcpy(b->data, cp3_exact, sizeof(cp3_exact));
         }
     }

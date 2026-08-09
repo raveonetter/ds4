@@ -752,3 +752,57 @@ grep -E '^(C2B_|FIRST_DIVERGENCE |CP3F_|CP4_TO_CP5_SWEEP)' \
 
 A result is admissible only when `C2B_CONTROL`, `C2B_PROBE`, and
 `C2B_RESULT` all pass and `CP4_TO_CP5_SWEEP result=PASS`.
+
+
+## Compressor projection family sweep
+
+`DS4_CP3F_FAMILY_SWEEP=1` closes the complete projection family in one
+invocation.  It requires the proven CP4→CP5 sweep and the CP3-P input audit.
+The isolated primitive A/B uses each compressed layer's captured CP1 rows and
+the same F16 weights for:
+
+- attention compressor KV and score;
+- ratio-4 indexer compressor KV and score;
+- every later compressed layer, not only layer 2.
+
+Four independent generic trials restore the same S0 and retain the full
+canonical prefix:
+
+```text
+T0_BASELINE  batch KV + batch score
+T1_KV        single-pair KV + batch score
+T2_SCORE     batch KV + single-pair score
+T3_KV_SCORE  single-pair KV + single-pair score
+```
+
+Each trial runs its own A0/A1/A2 non-perturbation gate.  CP3-P also captures
+the ratio-4 indexer pre-state and raw projection rows, so the T3 global report
+can expose an indexer boundary directly.
+
+Run:
+
+```sh
+DS4_FIRST_DIVERGENCE=1 \
+DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB,ATTN-RAW \
+DS4_CP4_TO_CP5_SWEEP=1 \
+DS4_CP3F_INPUT_AUDIT=1 \
+DS4_CP3F_FAMILY_SWEEP=1 \
+DS4_DSPARK_SCHEDULER=0 \
+./ds4 --dspark --dspark-confidence 0 \
+  -m ./ds4flash.gguf \
+  --mtp ./gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --tokens 16 --temp 0 --nothink \
+  -p 'Explain Redis in one sentence.' \
+  >canonical-sweep-cp3f-family.log 2>&1
+```
+
+Inspect:
+
+```sh
+grep -E '^(C2B_|CP3F_|FIRST_DIVERGENCE |CP4_TO_CP5_SWEEP)' \
+  canonical-sweep-cp3f-family.log
+```
+
+The family is proven only when the isolated same-input A/B executes, all four
+trial gates pass, the selected component substitutions repair the layer-2
+CP3-P objects, and T3 advances the global first divergence beyond CP3-P.
