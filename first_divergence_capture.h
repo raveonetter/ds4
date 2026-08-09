@@ -6,7 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define DS4_FIRST_DIVERGENCE_LABEL_MAX 16
+#define DS4_FIRST_DIVERGENCE_LABEL_MAX 32
 #define DS4_FIRST_DIVERGENCE_SUBOBJECT_MAX 48
 
 typedef enum {

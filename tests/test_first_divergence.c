@@ -109,6 +109,11 @@ int main(void) {
         run_pass_b_token
     };
 
+    REQUIRE(ds4_first_divergence_capture_init(
+        &capture, "CP5_ROUTER_SELECT"));
+    REQUIRE(strcmp(capture.label, "CP5_ROUTER_SELECT") == 0);
+    ds4_first_divergence_capture_free(&capture);
+
     REQUIRE(ds4_first_divergence_capture_init(&capture, "PASS_A"));
     REQUIRE(ds4_first_divergence_capture_f32(
         &capture, 0, 0, DS4_FIRST_DIVERGENCE_CP1, "attn_norm",
