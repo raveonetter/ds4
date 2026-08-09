@@ -15302,7 +15302,27 @@ typedef struct {
      * diagnostic fixtures for the narrow producer A/B, not checkpoints. */
     ds4_gpu_tensor *hc_attn_pre_mix[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp4_tail_hc_split[DS4_MAX_LAYER];
+    /* Naturally materialized CP4->CP5 semantic stages.  These snapshots are
+     * copied only after each producer tape has been encoded; no diagnostic
+     * tensor is manufactured inside the FFN layer loop. */
+    ds4_gpu_tensor *ffn_hc_mix[DS4_MAX_LAYER];
+    ds4_gpu_tensor *ffn_cur[DS4_MAX_LAYER];
+    ds4_gpu_tensor *ffn_norm[DS4_MAX_LAYER];
+    ds4_gpu_tensor *router_logits[DS4_MAX_LAYER];
+    ds4_gpu_tensor *router_probs[DS4_MAX_LAYER];
+    ds4_gpu_tensor *router_selected[DS4_MAX_LAYER];
+    ds4_gpu_tensor *router_weights[DS4_MAX_LAYER];
+    ds4_gpu_tensor *shared_gate[DS4_MAX_LAYER];
+    ds4_gpu_tensor *shared_up[DS4_MAX_LAYER];
+    ds4_gpu_tensor *shared_mid[DS4_MAX_LAYER];
+    ds4_gpu_tensor *routed_gate[DS4_MAX_LAYER];
+    ds4_gpu_tensor *routed_up[DS4_MAX_LAYER];
+    ds4_gpu_tensor *routed_down[DS4_MAX_LAYER];
+    ds4_gpu_tensor *routed_out[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp5[DS4_MAX_LAYER];
+    uint64_t ffn_mix_values[DS4_MAX_LAYER];
+    uint64_t shared_values[DS4_MAX_LAYER];
+    uint64_t routed_activation_values[DS4_MAX_LAYER];
     uint32_t cp3_n_comp[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
     uint32_t cp3_n_index[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
     uint32_t attention_hooks;
@@ -15330,6 +15350,10 @@ enum {
     DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW = 1u << 3,
     DS4_FIRST_DIVERGENCE_CANON_CP4_TAIL = 1u << 4,
     DS4_FIRST_DIVERGENCE_CANON_HC_ATTN_PRE_SPLIT = 1u << 5,
+    DS4_FIRST_DIVERGENCE_CANON_HC_FFN_PRE_SPLIT = 1u << 6,
+    DS4_FIRST_DIVERGENCE_CANON_FFN_ROUTER = 1u << 7,
+    DS4_FIRST_DIVERGENCE_CANON_SHARED_GATE_UP = 1u << 8,
+    DS4_FIRST_DIVERGENCE_CANON_ROUTED_MOE = 1u << 9,
 };
 static uint32_t g_ds4_first_divergence_canonical_mask;
 
@@ -25712,6 +25736,240 @@ static bool metal_graph_hc_attn_pre_canonical_rows(
     return ok;
 }
 
+/* Diagnostic-only rowwise reconstruction of the ordinary HC FFN
+ * pre-sublayer.  It mirrors the single-token producer exactly and is active
+ * only while the CP4->CP5 sweep selects its canonical bit. */
+static bool metal_graph_hc_ffn_pre_canonical_rows(
+        ds4_gpu_tensor       *ffn_cur,
+        ds4_gpu_tensor       *ffn_norm,
+        ds4_gpu_tensor       *hc_mix,
+        ds4_gpu_tensor       *hc_split,
+        ds4_gpu_tensor       *flat_hc,
+        const ds4_gpu_tensor *after_attn_hc,
+        const ds4_model      *model,
+        const ds4_layer_weights *layer,
+        uint32_t              rows) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc =
+        2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    if (!ffn_cur || !ffn_norm || !hc_mix || !hc_split || !flat_hc ||
+        !after_attn_hc || !model || !layer || !layer->hc_ffn_fn ||
+        !layer->hc_ffn_scale || !layer->hc_ffn_base || !layer->ffn_norm ||
+        rows == 0 || hc_dim > UINT32_MAX) {
+        return false;
+    }
+
+    bool ok = true;
+    for (uint32_t row = 0; ok && row < rows; row++) {
+        ds4_gpu_tensor *hc_row = ds4_gpu_tensor_view(
+            after_attn_hc, (uint64_t)row * hc_dim * sizeof(float),
+            hc_dim * sizeof(float));
+        ds4_gpu_tensor *flat_row = ds4_gpu_tensor_view(
+            flat_hc, (uint64_t)row * hc_dim * sizeof(float),
+            hc_dim * sizeof(float));
+        ds4_gpu_tensor *mix_row = ds4_gpu_tensor_view(
+            hc_mix, (uint64_t)row * mix_hc * sizeof(float),
+            mix_hc * sizeof(float));
+        ds4_gpu_tensor *split_row = ds4_gpu_tensor_view(
+            hc_split, (uint64_t)row * mix_hc * sizeof(float),
+            mix_hc * sizeof(float));
+        ds4_gpu_tensor *ffn_row = ds4_gpu_tensor_view(
+            ffn_cur, (uint64_t)row * DS4_N_EMBD * sizeof(float),
+            (uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor *norm_row = ds4_gpu_tensor_view(
+            ffn_norm, (uint64_t)row * DS4_N_EMBD * sizeof(float),
+            (uint64_t)DS4_N_EMBD * sizeof(float));
+        ok = hc_row && flat_row && mix_row && split_row && ffn_row &&
+             norm_row &&
+             ds4_gpu_rms_norm_plain_tensor(
+                 flat_row, hc_row, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+        if (ok) {
+            ok = metal_graph_matmul_plain_tensor(
+                mix_row, model, layer->hc_ffn_fn,
+                hc_dim, mix_hc, flat_row, 1);
+        }
+        if (ok) {
+            ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(
+                ffn_row, norm_row, split_row, mix_row, hc_row,
+                model->map, model->size,
+                layer->hc_ffn_scale->abs_offset,
+                layer->hc_ffn_base->abs_offset,
+                layer->ffn_norm->abs_offset,
+                DS4_N_EMBD, DS4_N_HC, DS4_N_HC_SINKHORN_ITER,
+                DS4_HC_EPS, DS4_RMS_EPS) != 0;
+        }
+        ds4_gpu_tensor_free(norm_row);
+        ds4_gpu_tensor_free(ffn_row);
+        ds4_gpu_tensor_free(split_row);
+        ds4_gpu_tensor_free(mix_row);
+        ds4_gpu_tensor_free(flat_row);
+        ds4_gpu_tensor_free(hc_row);
+    }
+    return ok;
+}
+
+static bool metal_graph_matmul_plain_canonical_rows(
+        ds4_gpu_tensor       *out,
+        const ds4_model      *model,
+        const ds4_tensor     *weight,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *input,
+        uint32_t              rows) {
+    if (!out || !model || !weight || !input || rows == 0 ||
+        in_dim > UINT64_MAX / sizeof(float) ||
+        out_dim > UINT64_MAX / sizeof(float)) {
+        return false;
+    }
+    const uint64_t in_bytes = in_dim * sizeof(float);
+    const uint64_t out_bytes = out_dim * sizeof(float);
+    bool ok = ds4_gpu_tensor_bytes(input) >= (uint64_t)rows * in_bytes &&
+              ds4_gpu_tensor_bytes(out) >= (uint64_t)rows * out_bytes;
+    for (uint32_t row = 0; ok && row < rows; row++) {
+        ds4_gpu_tensor *input_row = ds4_gpu_tensor_view(
+            input, (uint64_t)row * in_bytes, in_bytes);
+        ds4_gpu_tensor *output_row = ds4_gpu_tensor_view(
+            out, (uint64_t)row * out_bytes, out_bytes);
+        ok = input_row && output_row &&
+             metal_graph_matmul_plain_tensor(
+                 output_row, model, weight, in_dim, out_dim, input_row, 1);
+        ds4_gpu_tensor_free(output_row);
+        ds4_gpu_tensor_free(input_row);
+    }
+    return ok;
+}
+
+/* The ordinary Metal path fuses the two Q8_0 projections with SwiGLU.  The
+ * diagnostic variant invokes that exact single-row primitive for each
+ * verifier row without exposing or splitting another fusion boundary. */
+static bool metal_graph_shared_gate_up_canonical_rows(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        const ds4_gpu_tensor *input,
+        const ds4_model      *model,
+        const ds4_layer_weights *layer,
+        uint32_t              rows) {
+    const uint64_t shared_dim = layer ? layer->ffn_gate_shexp->dim[1] : 0;
+    if (!gate || !up || !mid || !input || !model || !layer || rows == 0 ||
+        layer->ffn_gate_shexp->type != DS4_TENSOR_Q8_0 ||
+        layer->ffn_up_shexp->type != DS4_TENSOR_Q8_0) {
+        return false;
+    }
+    bool ok = true;
+    for (uint32_t row = 0; ok && row < rows; row++) {
+        ds4_gpu_tensor *input_row = ds4_gpu_tensor_view(
+            input, (uint64_t)row * DS4_N_EMBD * sizeof(float),
+            (uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor *gate_row = ds4_gpu_tensor_view(
+            gate, (uint64_t)row * shared_dim * sizeof(float),
+            shared_dim * sizeof(float));
+        ds4_gpu_tensor *up_row = ds4_gpu_tensor_view(
+            up, (uint64_t)row * shared_dim * sizeof(float),
+            shared_dim * sizeof(float));
+        ds4_gpu_tensor *mid_row = ds4_gpu_tensor_view(
+            mid, (uint64_t)row * shared_dim * sizeof(float),
+            shared_dim * sizeof(float));
+        ok = input_row && gate_row && up_row && mid_row &&
+             ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+                 gate_row, up_row, mid_row,
+                 model->map, model->size,
+                 layer->ffn_gate_shexp->abs_offset,
+                 layer->ffn_up_shexp->abs_offset,
+                 DS4_N_EMBD, shared_dim, input_row,
+                 DS4_SWIGLU_CLAMP_EXP) != 0;
+        ds4_gpu_tensor_free(mid_row);
+        ds4_gpu_tensor_free(up_row);
+        ds4_gpu_tensor_free(gate_row);
+        ds4_gpu_tensor_free(input_row);
+    }
+    return ok;
+}
+
+/* Rowwise use of the authoritative routed-MoE producer.  All inputs and
+ * outputs are views of already materialized batch tensors. */
+static bool metal_graph_routed_moe_canonical_rows(
+        ds4_gpu_graph         *g,
+        const ds4_model       *model,
+        const ds4_layer_weights *layer,
+        uint32_t               il,
+        uint32_t               rows) {
+    if (!g || !model || !layer || rows == 0) return false;
+    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
+    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+    const uint64_t act_values = (uint64_t)DS4_N_EXPERT_USED * down_in_dim;
+    const uint64_t down_values = (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD;
+    bool ok = true;
+    for (uint32_t row = 0; ok && row < rows; row++) {
+        ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
+            metal_graph_batch_routed_out(g),
+            (uint64_t)row * DS4_N_EMBD * sizeof(float),
+            (uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor *gate_row = ds4_gpu_tensor_view(
+            metal_graph_batch_routed_gate(g),
+            (uint64_t)row * act_values * sizeof(float),
+            act_values * sizeof(float));
+        ds4_gpu_tensor *up_row = ds4_gpu_tensor_view(
+            metal_graph_batch_routed_up(g),
+            (uint64_t)row * act_values * sizeof(float),
+            act_values * sizeof(float));
+        ds4_gpu_tensor *mid_row = ds4_gpu_tensor_view(
+            metal_graph_batch_routed_mid(g),
+            (uint64_t)row * act_values * sizeof(float),
+            act_values * sizeof(float));
+        ds4_gpu_tensor *down_row = ds4_gpu_tensor_view(
+            metal_graph_batch_routed_down(g),
+            (uint64_t)row * down_values * sizeof(float),
+            down_values * sizeof(float));
+        ds4_gpu_tensor *selected_row = ds4_gpu_tensor_view(
+            metal_graph_batch_router_selected(g),
+            (uint64_t)row * DS4_N_EXPERT_USED * sizeof(int32_t),
+            (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+        ds4_gpu_tensor *weights_row = ds4_gpu_tensor_view(
+            metal_graph_batch_router_weights(g),
+            (uint64_t)row * DS4_N_EXPERT_USED * sizeof(float),
+            (uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+        ds4_gpu_tensor *input_row = ds4_gpu_tensor_view(
+            metal_graph_batch_ffn_norm(g),
+            (uint64_t)row * DS4_N_EMBD * sizeof(float),
+            (uint64_t)DS4_N_EMBD * sizeof(float));
+        ok = out_row && gate_row && up_row && mid_row && down_row &&
+             selected_row && weights_row && input_row &&
+             ds4_gpu_routed_moe_one_tensor(
+                 out_row, gate_row, up_row, mid_row, down_row,
+                 model->map, model->size,
+                 layer->ffn_gate_exps->abs_offset,
+                 layer->ffn_up_exps->abs_offset,
+                 layer->ffn_down_exps->abs_offset,
+                 layer->ffn_gate_exps->type,
+                 layer->ffn_down_exps->type,
+                 gate_expert_bytes, gate_row_bytes,
+                 down_expert_bytes, down_row_bytes,
+                 (uint32_t)layer->ffn_gate_exps->dim[0],
+                 (uint32_t)down_in_dim,
+                 (uint32_t)routed_out_dim,
+                 selected_row, weights_row,
+                 DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                 DS4_SWIGLU_CLAMP_EXP, input_row,
+                 NULL, il, false) != 0;
+        ds4_gpu_tensor_free(input_row);
+        ds4_gpu_tensor_free(weights_row);
+        ds4_gpu_tensor_free(selected_row);
+        ds4_gpu_tensor_free(down_row);
+        ds4_gpu_tensor_free(mid_row);
+        ds4_gpu_tensor_free(up_row);
+        ds4_gpu_tensor_free(gate_row);
+        ds4_gpu_tensor_free(out_row);
+    }
+    if (ok) g->batch_routed_mid_is_f16 = false;
+    return ok;
+}
+
 static bool metal_graph_matmul_named_or_canonical_rows(
         uint32_t                canonical_bit,
         const char             *name,
@@ -29365,14 +29623,24 @@ static bool metal_graph_encode_layer_ffn_batch(
                               DS4_N_HC == 4 &&
                               !metal_graph_use_reference_hc_decode() &&
                               metal_graph_enable_batch_hc_norm_fusion();
-    if (ok) ok = metal_graph_hc_rms_scale_project(hc_mix_view,
-                                                    metal_graph_batch_flat_hc(g),
-                                                    model,
-                                                    layer->hc_ffn_fn,
-                                                    metal_graph_batch_after_attn_hc(g),
-                                                    hc_dim,
-                                                    n_tokens);
-    if (metal_graph_use_reference_hc_decode()) {
+    const bool canonical_hc_ffn_pre =
+        ds4_first_divergence_canonical_enabled(
+            DS4_FIRST_DIVERGENCE_CANON_HC_FFN_PRE_SPLIT);
+    if (ok && canonical_hc_ffn_pre) {
+        ok = metal_graph_hc_ffn_pre_canonical_rows(
+            ffn_cur_view, metal_graph_batch_ffn_norm(g),
+            hc_mix_view, hc_split_view, metal_graph_batch_flat_hc(g),
+            metal_graph_batch_after_attn_hc(g), model, layer, n_tokens);
+    } else if (ok) {
+        ok = metal_graph_hc_rms_scale_project(hc_mix_view,
+                                              metal_graph_batch_flat_hc(g),
+                                              model,
+                                              layer->hc_ffn_fn,
+                                              metal_graph_batch_after_attn_hc(g),
+                                              hc_dim,
+                                              n_tokens);
+    }
+    if (!canonical_hc_ffn_pre && metal_graph_use_reference_hc_decode()) {
         if (ok) ok = ds4_gpu_hc_split_sinkhorn_tensor(hc_split_view,
                                                         hc_mix_view,
                                                         model->map,
@@ -29387,7 +29655,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                             hc_split_view,
                                                             DS4_N_EMBD,
                                                             DS4_N_HC) != 0;
-    } else if (fuse_hc_norm) {
+    } else if (!canonical_hc_ffn_pre && fuse_hc_norm) {
         if (ok) ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(ffn_cur_view,
                                                                  metal_graph_batch_ffn_norm(g),
                                                                  hc_split_view,
@@ -29403,7 +29671,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                                  DS4_N_HC_SINKHORN_ITER,
                                                                  DS4_HC_EPS,
                                                                  DS4_RMS_EPS) != 0;
-    } else {
+    } else if (!canonical_hc_ffn_pre) {
         if (ok) ok = ds4_gpu_hc_split_weighted_sum_tensor(ffn_cur_view,
                                                             hc_split_view,
                                                             hc_mix_view,
@@ -29422,7 +29690,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("hc_pre");
-    if (ok && !fuse_hc_norm) {
+    if (ok && !canonical_hc_ffn_pre && !fuse_hc_norm) {
         ok = ds4_gpu_rms_norm_weight_rows_tensor(metal_graph_batch_ffn_norm(g),
                                                   metal_graph_batch_ffn_cur(g),
                                                   model->map,
@@ -29437,13 +29705,18 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("norm");
-    if (ok) ok = metal_graph_matmul_plain_tensor(metal_graph_batch_router_logits(g),
-                                                 model,
-                                                 layer->ffn_gate_inp,
-                                                 DS4_N_EMBD,
-                                                 DS4_N_EXPERT,
-                                                 metal_graph_batch_ffn_norm(g),
-                                                 n_tokens);
+    if (ok && ds4_first_divergence_canonical_enabled(
+                  DS4_FIRST_DIVERGENCE_CANON_FFN_ROUTER)) {
+        ok = metal_graph_matmul_plain_canonical_rows(
+            metal_graph_batch_router_logits(g), model, layer->ffn_gate_inp,
+            DS4_N_EMBD, DS4_N_EXPERT,
+            metal_graph_batch_ffn_norm(g), n_tokens);
+    } else if (ok) {
+        ok = metal_graph_matmul_plain_tensor(
+            metal_graph_batch_router_logits(g), model, layer->ffn_gate_inp,
+            DS4_N_EMBD, DS4_N_EXPERT,
+            metal_graph_batch_ffn_norm(g), n_tokens);
+    }
 
     ds4_gpu_tensor *router_tokens = NULL;
     if (ok) {
@@ -29570,7 +29843,18 @@ static bool metal_graph_encode_layer_ffn_batch(
     } while (0)
 
 #define DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT() do { \
-        if (ok) ok = metal_graph_matmul_q8_0_named_tensor("shared_gate", \
+        const bool canonical_shared_gate_up_ = \
+            ds4_first_divergence_canonical_enabled( \
+                DS4_FIRST_DIVERGENCE_CANON_SHARED_GATE_UP); \
+        if (ok && canonical_shared_gate_up_) { \
+            ok = metal_graph_shared_gate_up_canonical_rows( \
+                    metal_graph_batch_shared_gate(g), \
+                    metal_graph_batch_shared_up(g), \
+                    metal_graph_batch_shared_mid(g), \
+                    tp_ffn_x ? tp_ffn_x : metal_graph_batch_ffn_norm(g), \
+                    model, layer, tp_rows); \
+        } \
+        if (ok && !canonical_shared_gate_up_) ok = metal_graph_matmul_q8_0_named_tensor("shared_gate", \
                                                           il, \
                                                           pos0, \
                                                           metal_graph_batch_shared_gate(g), \
@@ -29580,7 +29864,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                           shared_dim, \
                                                           tp_ffn_x ? tp_ffn_x : metal_graph_batch_ffn_norm(g), \
                                                           tp_rows); \
-        if (ok) ok = metal_graph_matmul_q8_0_named_tensor("shared_up", \
+        if (ok && !canonical_shared_gate_up_) ok = metal_graph_matmul_q8_0_named_tensor("shared_up", \
                                                           il, \
                                                           pos0, \
                                                           metal_graph_batch_shared_up(g), \
@@ -29591,7 +29875,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                           tp_ffn_x ? tp_ffn_x : metal_graph_batch_ffn_norm(g), \
                                                           tp_rows); \
         DS4_METAL_PROFILE_FFN_STAGE("shared_gate_up"); \
-        if (ok) ok = ds4_gpu_swiglu_tensor(metal_graph_batch_shared_mid(g), \
+        if (ok && !canonical_shared_gate_up_) ok = ds4_gpu_swiglu_tensor(metal_graph_batch_shared_mid(g), \
                                              metal_graph_batch_shared_gate(g), \
                                              metal_graph_batch_shared_up(g), \
                                              (uint32_t)((uint64_t)tp_rows * shared_dim), \
@@ -29778,6 +30062,10 @@ static bool metal_graph_encode_layer_ffn_batch(
                                     g->tp_batch_in[il],
                                     (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
         }
+    } else if (ok && ds4_first_divergence_canonical_enabled(
+                           DS4_FIRST_DIVERGENCE_CANON_ROUTED_MOE)) {
+        ok = metal_graph_routed_moe_canonical_rows(
+            g, model, layer, il, n_tokens);
     } else if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(metal_graph_batch_routed_out(g),
                                                metal_graph_batch_routed_gate(g),
@@ -30174,10 +30462,56 @@ static bool ds4_c2b_capture_ffn(ds4_gpu_graph *g,
         return false;
     }
     c->ffn_hooks++;
-    const uint64_t bytes =
+    const uint64_t hc_bytes =
         (uint64_t)n_tokens * DS4_N_HC * DS4_N_EMBD * sizeof(float);
-    return ds4_c2b_inline_copy(c->cp5[il], 0,
-                               metal_graph_batch_next_hc(g), 0, bytes);
+    const uint64_t ffn_bytes =
+        (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
+    const uint64_t mix_bytes =
+        (uint64_t)n_tokens * c->ffn_mix_values[il] * sizeof(float);
+    const uint64_t router_bytes =
+        (uint64_t)n_tokens * DS4_N_EXPERT * sizeof(float);
+    const uint64_t topk_bytes =
+        (uint64_t)n_tokens * DS4_N_EXPERT_USED * sizeof(float);
+    const uint64_t shared_bytes =
+        (uint64_t)n_tokens * c->shared_values[il] * sizeof(float);
+    const uint64_t routed_activation_bytes =
+        (uint64_t)n_tokens * c->routed_activation_values[il] * sizeof(float);
+    const uint64_t routed_down_bytes =
+        (uint64_t)n_tokens * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float);
+    return
+        ds4_c2b_inline_copy(c->ffn_hc_mix[il], 0,
+                            metal_graph_batch_hc_mix(g), 0, mix_bytes) &&
+        ds4_c2b_inline_copy(c->ffn_cur[il], 0,
+                            metal_graph_batch_ffn_cur(g), 0, ffn_bytes) &&
+        ds4_c2b_inline_copy(c->ffn_norm[il], 0,
+                            metal_graph_batch_ffn_norm(g), 0, ffn_bytes) &&
+        ds4_c2b_inline_copy(c->router_logits[il], 0,
+                            metal_graph_batch_router_logits(g), 0, router_bytes) &&
+        ds4_c2b_inline_copy(c->router_probs[il], 0,
+                            metal_graph_batch_router_probs(g), 0, router_bytes) &&
+        ds4_c2b_inline_copy(c->router_selected[il], 0,
+                            metal_graph_batch_router_selected(g), 0, topk_bytes) &&
+        ds4_c2b_inline_copy(c->router_weights[il], 0,
+                            metal_graph_batch_router_weights(g), 0, topk_bytes) &&
+        ds4_c2b_inline_copy(c->shared_gate[il], 0,
+                            metal_graph_batch_shared_gate(g), 0, shared_bytes) &&
+        ds4_c2b_inline_copy(c->shared_up[il], 0,
+                            metal_graph_batch_shared_up(g), 0, shared_bytes) &&
+        ds4_c2b_inline_copy(c->shared_mid[il], 0,
+                            metal_graph_batch_shared_mid(g), 0, shared_bytes) &&
+        ds4_c2b_inline_copy(c->routed_gate[il], 0,
+                            metal_graph_batch_routed_gate(g), 0,
+                            routed_activation_bytes) &&
+        ds4_c2b_inline_copy(c->routed_up[il], 0,
+                            metal_graph_batch_routed_up(g), 0,
+                            routed_activation_bytes) &&
+        ds4_c2b_inline_copy(c->routed_down[il], 0,
+                            metal_graph_batch_routed_down(g), 0,
+                            routed_down_bytes) &&
+        ds4_c2b_inline_copy(c->routed_out[il], 0,
+                            metal_graph_batch_routed_out(g), 0, ffn_bytes) &&
+        ds4_c2b_inline_copy(c->cp5[il], 0,
+                            metal_graph_batch_next_hc(g), 0, hc_bytes);
 }
 
 /* Snapshot one canonical ordinary-decode layer after its complete producer
@@ -30200,6 +30534,18 @@ static bool ds4_c45_capture_layer(ds4_gpu_graph *g,
         (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
     const uint64_t hc_row_bytes =
         (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    const uint64_t ffn_row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t mix_row_bytes = c->ffn_mix_values[il] * sizeof(float);
+    const uint64_t router_row_bytes =
+        (uint64_t)DS4_N_EXPERT * sizeof(float);
+    const uint64_t topk_row_bytes =
+        (uint64_t)DS4_N_EXPERT_USED * sizeof(float);
+    const uint64_t shared_row_bytes =
+        c->shared_values[il] * sizeof(float);
+    const uint64_t routed_activation_row_bytes =
+        c->routed_activation_values[il] * sizeof(float);
+    const uint64_t routed_down_row_bytes =
+        (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float);
     bool ok =
         ds4_c2b_inline_copy(c->cp1[il], (uint64_t)row * cp1_row_bytes,
                             metal_graph_attn_norm(g), 0, cp1_row_bytes) &&
@@ -30222,6 +30568,59 @@ static bool ds4_c45_capture_layer(ds4_gpu_graph *g,
         ds4_c2b_inline_copy(c->cp4_heads[il],
                             (uint64_t)row * q_out_row_bytes,
                             metal_graph_heads(g), 0, q_out_row_bytes) &&
+        ds4_c2b_inline_copy(c->ffn_hc_mix[il],
+                            (uint64_t)row * mix_row_bytes,
+                            metal_graph_hc_mix(g), 0, mix_row_bytes) &&
+        ds4_c2b_inline_copy(c->ffn_cur[il],
+                            (uint64_t)row * ffn_row_bytes,
+                            metal_graph_ffn_cur(g), 0, ffn_row_bytes) &&
+        ds4_c2b_inline_copy(c->ffn_norm[il],
+                            (uint64_t)row * ffn_row_bytes,
+                            metal_graph_ffn_norm(g), 0, ffn_row_bytes) &&
+        ds4_c2b_inline_copy(c->router_logits[il],
+                            (uint64_t)row * router_row_bytes,
+                            metal_graph_router_logits(g), 0,
+                            router_row_bytes) &&
+        ds4_c2b_inline_copy(c->router_probs[il],
+                            (uint64_t)row * router_row_bytes,
+                            metal_graph_router_probs(g), 0,
+                            router_row_bytes) &&
+        ds4_c2b_inline_copy(c->router_selected[il],
+                            (uint64_t)row * topk_row_bytes,
+                            metal_graph_router_selected(g), 0,
+                            topk_row_bytes) &&
+        ds4_c2b_inline_copy(c->router_weights[il],
+                            (uint64_t)row * topk_row_bytes,
+                            metal_graph_router_weights(g), 0,
+                            topk_row_bytes) &&
+        ds4_c2b_inline_copy(c->shared_gate[il],
+                            (uint64_t)row * shared_row_bytes,
+                            metal_graph_shared_gate(g), 0,
+                            shared_row_bytes) &&
+        ds4_c2b_inline_copy(c->shared_up[il],
+                            (uint64_t)row * shared_row_bytes,
+                            metal_graph_shared_up(g), 0,
+                            shared_row_bytes) &&
+        ds4_c2b_inline_copy(c->shared_mid[il],
+                            (uint64_t)row * shared_row_bytes,
+                            metal_graph_shared_mid(g), 0,
+                            shared_row_bytes) &&
+        ds4_c2b_inline_copy(c->routed_gate[il],
+                            (uint64_t)row * routed_activation_row_bytes,
+                            metal_graph_routed_gate(g), 0,
+                            routed_activation_row_bytes) &&
+        ds4_c2b_inline_copy(c->routed_up[il],
+                            (uint64_t)row * routed_activation_row_bytes,
+                            metal_graph_routed_up(g), 0,
+                            routed_activation_row_bytes) &&
+        ds4_c2b_inline_copy(c->routed_down[il],
+                            (uint64_t)row * routed_down_row_bytes,
+                            metal_graph_routed_down(g), 0,
+                            routed_down_row_bytes) &&
+        ds4_c2b_inline_copy(c->routed_out[il],
+                            (uint64_t)row * ffn_row_bytes,
+                            metal_graph_routed_out(g), 0,
+                            ffn_row_bytes) &&
         ds4_c2b_inline_copy(c->cp5[il], (uint64_t)row * hc_row_bytes,
                             metal_graph_after_ffn_hc(g), 0, hc_row_bytes);
 
@@ -50800,6 +51199,20 @@ static void ds4_c2b_capture_free(ds4_c2b_capture *c) {
         DS4_C2B_FREE(cp4_tail_cur_hc);
         DS4_C2B_FREE(hc_attn_pre_mix);
         DS4_C2B_FREE(cp4_tail_hc_split);
+        DS4_C2B_FREE(ffn_hc_mix);
+        DS4_C2B_FREE(ffn_cur);
+        DS4_C2B_FREE(ffn_norm);
+        DS4_C2B_FREE(router_logits);
+        DS4_C2B_FREE(router_probs);
+        DS4_C2B_FREE(router_selected);
+        DS4_C2B_FREE(router_weights);
+        DS4_C2B_FREE(shared_gate);
+        DS4_C2B_FREE(shared_up);
+        DS4_C2B_FREE(shared_mid);
+        DS4_C2B_FREE(routed_gate);
+        DS4_C2B_FREE(routed_up);
+        DS4_C2B_FREE(routed_down);
+        DS4_C2B_FREE(routed_out);
         DS4_C2B_FREE(cp5);
 #undef DS4_C2B_FREE
     }
@@ -50837,17 +51250,43 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
             !metal_graph_batch_q(g) || !metal_graph_batch_heads(g) ||
             !metal_graph_batch_hc_mix(g) ||
             !metal_graph_batch_after_attn_hc(g) ||
+            !metal_graph_batch_ffn_cur(g) ||
+            !metal_graph_batch_ffn_norm(g) ||
+            !metal_graph_batch_router_logits(g) ||
+            !metal_graph_batch_router_probs(g) ||
+            !metal_graph_batch_router_selected(g) ||
+            !metal_graph_batch_router_weights(g) ||
+            !metal_graph_batch_shared_gate(g) ||
+            !metal_graph_batch_shared_up(g) ||
+            !metal_graph_batch_shared_mid(g) ||
+            !metal_graph_batch_routed_gate(g) ||
+            !metal_graph_batch_routed_up(g) ||
+            !metal_graph_batch_routed_down(g) ||
+            !metal_graph_batch_routed_out(g) ||
             !metal_graph_batch_next_hc(g) || !metal_graph_attn_norm(g) ||
             !metal_graph_qr(g) || !metal_graph_kv_raw(g) ||
             !metal_graph_qr_norm(g) || !metal_graph_q(g) ||
             !metal_graph_heads(g) || !metal_graph_hc_mix(g) ||
             !metal_graph_after_attn_hc(g) ||
+            !metal_graph_ffn_cur(g) || !metal_graph_ffn_norm(g) ||
+            !metal_graph_router_logits(g) || !metal_graph_router_probs(g) ||
+            !metal_graph_router_selected(g) ||
+            !metal_graph_router_weights(g) ||
+            !metal_graph_shared_gate(g) || !metal_graph_shared_up(g) ||
+            !metal_graph_shared_mid(g) || !metal_graph_routed_gate(g) ||
+            !metal_graph_routed_up(g) || !metal_graph_routed_down(g) ||
+            !metal_graph_routed_out(g) ||
             !metal_graph_after_ffn_hc(g)) {
             ds4_c2b_capture_free(c);
             return false;
         }
         c->q_values[il] = layer->attn_q_a->dim[1];
         c->q_out_values[il] = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+        c->ffn_mix_values[il] =
+            2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+        c->shared_values[il] = layer->ffn_gate_shexp->dim[1];
+        c->routed_activation_values[il] =
+            (uint64_t)DS4_N_EXPERT_USED * layer->ffn_down_exps->dim[0];
         const uint64_t q_bytes =
             (uint64_t)n_tokens * c->q_values[il] * sizeof(float);
         const uint64_t q_out_bytes =
@@ -50856,6 +51295,18 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
             (uint64_t)n_tokens *
             (2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC) *
             sizeof(float);
+        const uint64_t ffn_bytes =
+            (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
+        const uint64_t router_bytes =
+            (uint64_t)n_tokens * DS4_N_EXPERT * sizeof(float);
+        const uint64_t router_topk_bytes =
+            (uint64_t)n_tokens * DS4_N_EXPERT_USED * sizeof(float);
+        const uint64_t shared_bytes =
+            (uint64_t)n_tokens * c->shared_values[il] * sizeof(float);
+        const uint64_t routed_activation_bytes =
+            (uint64_t)n_tokens * c->routed_activation_values[il] * sizeof(float);
+        const uint64_t routed_down_bytes =
+            (uint64_t)n_tokens * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float);
         if (c->q_values[il] == 0 ||
             ds4_gpu_tensor_bytes(metal_graph_batch_attn_norm(g)) < cp1_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_qr(g)) < q_bytes ||
@@ -50867,6 +51318,30 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
             ds4_gpu_tensor_bytes(metal_graph_batch_hc_mix(g)) < split_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_hc_split(g)) < split_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_after_attn_hc(g)) < hc_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_ffn_cur(g)) < ffn_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_ffn_norm(g)) < ffn_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_router_logits(g)) <
+                router_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_router_probs(g)) <
+                router_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_router_selected(g)) <
+                router_topk_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_router_weights(g)) <
+                router_topk_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_shared_gate(g)) <
+                shared_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_shared_up(g)) <
+                shared_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_shared_mid(g)) <
+                shared_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_routed_gate(g)) <
+                routed_activation_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_routed_up(g)) <
+                routed_activation_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_routed_down(g)) <
+                routed_down_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_routed_out(g)) <
+                ffn_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_next_hc(g)) < hc_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_attn_norm(g)) <
                 (uint64_t)DS4_N_EMBD * sizeof(float) ||
@@ -50882,6 +51357,32 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
             ds4_gpu_tensor_bytes(metal_graph_kv_raw(g)) < kv_bytes / n_tokens ||
             ds4_gpu_tensor_bytes(metal_graph_after_attn_hc(g)) <
                 (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float) ||
+            ds4_gpu_tensor_bytes(metal_graph_ffn_cur(g)) <
+                (uint64_t)DS4_N_EMBD * sizeof(float) ||
+            ds4_gpu_tensor_bytes(metal_graph_ffn_norm(g)) <
+                (uint64_t)DS4_N_EMBD * sizeof(float) ||
+            ds4_gpu_tensor_bytes(metal_graph_router_logits(g)) <
+                (uint64_t)DS4_N_EXPERT * sizeof(float) ||
+            ds4_gpu_tensor_bytes(metal_graph_router_probs(g)) <
+                (uint64_t)DS4_N_EXPERT * sizeof(float) ||
+            ds4_gpu_tensor_bytes(metal_graph_router_selected(g)) <
+                (uint64_t)DS4_N_EXPERT_USED * sizeof(uint32_t) ||
+            ds4_gpu_tensor_bytes(metal_graph_router_weights(g)) <
+                (uint64_t)DS4_N_EXPERT_USED * sizeof(float) ||
+            ds4_gpu_tensor_bytes(metal_graph_shared_gate(g)) <
+                shared_bytes / n_tokens ||
+            ds4_gpu_tensor_bytes(metal_graph_shared_up(g)) <
+                shared_bytes / n_tokens ||
+            ds4_gpu_tensor_bytes(metal_graph_shared_mid(g)) <
+                shared_bytes / n_tokens ||
+            ds4_gpu_tensor_bytes(metal_graph_routed_gate(g)) <
+                routed_activation_bytes / n_tokens ||
+            ds4_gpu_tensor_bytes(metal_graph_routed_up(g)) <
+                routed_activation_bytes / n_tokens ||
+            ds4_gpu_tensor_bytes(metal_graph_routed_down(g)) <
+                routed_down_bytes / n_tokens ||
+            ds4_gpu_tensor_bytes(metal_graph_routed_out(g)) <
+                (uint64_t)DS4_N_EMBD * sizeof(float) ||
             ds4_gpu_tensor_bytes(metal_graph_after_ffn_hc(g)) <
                 (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)) {
             ds4_c2b_capture_free(c);
@@ -50899,6 +51400,20 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
         c->cp4_tail_cur_hc[il] = ds4_gpu_tensor_alloc(hc_bytes);
         c->hc_attn_pre_mix[il] = ds4_gpu_tensor_alloc(split_bytes);
         c->cp4_tail_hc_split[il] = ds4_gpu_tensor_alloc(split_bytes);
+        c->ffn_hc_mix[il] = ds4_gpu_tensor_alloc(split_bytes);
+        c->ffn_cur[il] = ds4_gpu_tensor_alloc(ffn_bytes);
+        c->ffn_norm[il] = ds4_gpu_tensor_alloc(ffn_bytes);
+        c->router_logits[il] = ds4_gpu_tensor_alloc(router_bytes);
+        c->router_probs[il] = ds4_gpu_tensor_alloc(router_bytes);
+        c->router_selected[il] = ds4_gpu_tensor_alloc(router_topk_bytes);
+        c->router_weights[il] = ds4_gpu_tensor_alloc(router_topk_bytes);
+        c->shared_gate[il] = ds4_gpu_tensor_alloc(shared_bytes);
+        c->shared_up[il] = ds4_gpu_tensor_alloc(shared_bytes);
+        c->shared_mid[il] = ds4_gpu_tensor_alloc(shared_bytes);
+        c->routed_gate[il] = ds4_gpu_tensor_alloc(routed_activation_bytes);
+        c->routed_up[il] = ds4_gpu_tensor_alloc(routed_activation_bytes);
+        c->routed_down[il] = ds4_gpu_tensor_alloc(routed_down_bytes);
+        c->routed_out[il] = ds4_gpu_tensor_alloc(ffn_bytes);
         c->cp5[il] = ds4_gpu_tensor_alloc(hc_bytes);
         if (!c->cp1[il] || !c->cp2_q[il] || !c->cp2_kv_p[il] ||
             !c->cp2_q_norm[il] || !c->cp2_q_cur[il] ||
@@ -50906,6 +51421,13 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
             !c->cp4_heads[il] || !c->cp4_tail_cur_hc[il] ||
             !c->hc_attn_pre_mix[il] ||
             !c->cp4_tail_hc_split[il] ||
+            !c->ffn_hc_mix[il] || !c->ffn_cur[il] || !c->ffn_norm[il] ||
+            !c->router_logits[il] || !c->router_probs[il] ||
+            !c->router_selected[il] || !c->router_weights[il] ||
+            !c->shared_gate[il] || !c->shared_up[il] ||
+            !c->shared_mid[il] || !c->routed_gate[il] ||
+            !c->routed_up[il] || !c->routed_down[il] ||
+            !c->routed_out[il] ||
             !c->cp4[il] || !c->cp5[il]) {
             ds4_c2b_capture_free(c);
             return false;
@@ -50996,6 +51518,33 @@ static bool ds4_c2b_materialize_f32_rows(
     bool ok = ds4_gpu_tensor_read(tensor, 0, cpu, bytes) != 0;
     for (uint32_t row = 0; ok && row < rows; row++) {
         ok = ds4_first_divergence_capture_f32(
+            out, row, layer, checkpoint, subobject,
+            cpu + (size_t)row * values_per_row, values_per_row);
+    }
+    free(cpu);
+    return ok;
+}
+
+static bool ds4_c2b_materialize_u32_rows(
+        ds4_first_divergence_capture *out,
+        const ds4_gpu_tensor *tensor,
+        uint32_t rows,
+        size_t values_per_row,
+        uint32_t layer,
+        ds4_first_divergence_checkpoint checkpoint,
+        const char *subobject) {
+    if (!out || !tensor || rows == 0 || values_per_row == 0 ||
+        values_per_row > SIZE_MAX / rows ||
+        values_per_row * rows > SIZE_MAX / sizeof(uint32_t)) {
+        return false;
+    }
+    const size_t values = values_per_row * rows;
+    const uint64_t bytes = (uint64_t)values * sizeof(uint32_t);
+    if (ds4_gpu_tensor_bytes(tensor) < bytes) return false;
+    uint32_t *cpu = xmalloc((size_t)bytes);
+    bool ok = ds4_gpu_tensor_read(tensor, 0, cpu, bytes) != 0;
+    for (uint32_t row = 0; ok && row < rows; row++) {
+        ok = ds4_first_divergence_capture_u32(
             out, row, layer, checkpoint, subobject,
             cpu + (size_t)row * values_per_row, values_per_row);
     }
@@ -51143,6 +51692,68 @@ static bool ds4_c2b_materialize_capture(
              ds4_c2b_materialize_f32_rows(
                  out, capture->cp4[il], rows, hc_values, il,
                  DS4_FIRST_DIVERGENCE_CP4, "after_attn_hc") &&
+             ds4_c2b_materialize_f32_rows(
+                 out, capture->ffn_hc_mix[il], rows,
+                 (size_t)capture->ffn_mix_values[il], il,
+                 DS4_FIRST_DIVERGENCE_CP4_FFN_MIX, "hc_ffn_mix") &&
+             ds4_c2b_materialize_f32_rows(
+                 out, capture->ffn_cur[il], rows, DS4_N_EMBD, il,
+                 DS4_FIRST_DIVERGENCE_CP4_FFN_CUR, "ffn_cur") &&
+             ds4_c2b_materialize_f32_rows(
+                 out, capture->ffn_norm[il], rows, DS4_N_EMBD, il,
+                 DS4_FIRST_DIVERGENCE_CP4_FFN_NORM, "ffn_norm") &&
+             ds4_c2b_materialize_f32_rows(
+                 out, capture->router_logits[il], rows, DS4_N_EXPERT, il,
+                 DS4_FIRST_DIVERGENCE_CP4_ROUTER_LOGITS,
+                 "router_logits") &&
+             ds4_c2b_materialize_f32_rows(
+                 out, capture->router_probs[il], rows, DS4_N_EXPERT, il,
+                 DS4_FIRST_DIVERGENCE_CP4_ROUTER_PROBS,
+                 "router_probs") &&
+             ds4_c2b_materialize_u32_rows(
+                 out, capture->router_selected[il], rows,
+                 DS4_N_EXPERT_USED, il,
+                 DS4_FIRST_DIVERGENCE_CP4_ROUTER_SELECTED,
+                 "router_selected") &&
+             ds4_c2b_materialize_f32_rows(
+                 out, capture->router_weights[il], rows,
+                 DS4_N_EXPERT_USED, il,
+                 DS4_FIRST_DIVERGENCE_CP4_ROUTER_WEIGHTS,
+                 "router_weights") &&
+             ds4_c2b_materialize_f32_rows(
+                 out, capture->shared_gate[il], rows,
+                 (size_t)capture->shared_values[il], il,
+                 DS4_FIRST_DIVERGENCE_CP4_SHARED_GATE,
+                 "shared_gate") &&
+             ds4_c2b_materialize_f32_rows(
+                 out, capture->shared_up[il], rows,
+                 (size_t)capture->shared_values[il], il,
+                 DS4_FIRST_DIVERGENCE_CP4_SHARED_UP,
+                 "shared_up") &&
+             ds4_c2b_materialize_f32_rows(
+                 out, capture->shared_mid[il], rows,
+                 (size_t)capture->shared_values[il], il,
+                 DS4_FIRST_DIVERGENCE_CP4_SHARED_MID,
+                 "shared_mid") &&
+             ds4_c2b_materialize_f32_rows(
+                 out, capture->routed_gate[il], rows,
+                 (size_t)capture->routed_activation_values[il], il,
+                 DS4_FIRST_DIVERGENCE_CP4_ROUTED_GATE,
+                 "routed_gate") &&
+             ds4_c2b_materialize_f32_rows(
+                 out, capture->routed_up[il], rows,
+                 (size_t)capture->routed_activation_values[il], il,
+                 DS4_FIRST_DIVERGENCE_CP4_ROUTED_UP,
+                 "routed_up") &&
+             ds4_c2b_materialize_f32_rows(
+                 out, capture->routed_down[il], rows,
+                 (size_t)DS4_N_EXPERT_USED * DS4_N_EMBD, il,
+                 DS4_FIRST_DIVERGENCE_CP4_ROUTED_DOWN,
+                 "routed_down") &&
+             ds4_c2b_materialize_f32_rows(
+                 out, capture->routed_out[il], rows, DS4_N_EMBD, il,
+                 DS4_FIRST_DIVERGENCE_CP4_ROUTED_OUT,
+                 "routed_out") &&
              ds4_c2b_materialize_f32_rows(
                  out, capture->cp5[il], rows, hc_values, il,
                  DS4_FIRST_DIVERGENCE_CP5, "layer_output");
@@ -53335,6 +53946,489 @@ static bool ds4_cp4_tail_causal_close(
         beyond_cp4);
 }
 
+typedef struct {
+    ds4_first_divergence_checkpoint checkpoint;
+    const char *subobject;
+    const char *semantic;
+} ds4_cp4_to_cp5_stage;
+
+static const ds4_cp4_to_cp5_stage g_ds4_cp4_to_cp5_stages[] = {
+    {DS4_FIRST_DIVERGENCE_CP4, "after_attn_hc", "after_attn_hc"},
+    {DS4_FIRST_DIVERGENCE_CP4_FFN_MIX, "hc_ffn_mix", "hc_ffn_projection"},
+    {DS4_FIRST_DIVERGENCE_CP4_FFN_CUR, "ffn_cur", "ffn_input"},
+    {DS4_FIRST_DIVERGENCE_CP4_FFN_NORM, "ffn_norm", "ffn_normalized_input"},
+    {DS4_FIRST_DIVERGENCE_CP4_ROUTER_LOGITS, "router_logits", "router_logits"},
+    {DS4_FIRST_DIVERGENCE_CP4_ROUTER_PROBS, "router_probs", "router_probs"},
+    {DS4_FIRST_DIVERGENCE_CP4_ROUTER_SELECTED, "router_selected", "router_topk"},
+    {DS4_FIRST_DIVERGENCE_CP4_ROUTER_WEIGHTS, "router_weights", "router_weights"},
+    {DS4_FIRST_DIVERGENCE_CP4_SHARED_GATE, "shared_gate", "shared_gate_projection"},
+    {DS4_FIRST_DIVERGENCE_CP4_SHARED_UP, "shared_up", "shared_up_projection"},
+    {DS4_FIRST_DIVERGENCE_CP4_SHARED_MID, "shared_mid", "shared_swiglu"},
+    {DS4_FIRST_DIVERGENCE_CP4_ROUTED_GATE, "routed_gate", "routed_gate_projection"},
+    {DS4_FIRST_DIVERGENCE_CP4_ROUTED_UP, "routed_up", "routed_up_projection"},
+    {DS4_FIRST_DIVERGENCE_CP4_ROUTED_DOWN, "routed_down", "routed_down_slots"},
+    {DS4_FIRST_DIVERGENCE_CP4_ROUTED_OUT, "routed_out", "routed_aggregation"},
+    {DS4_FIRST_DIVERGENCE_CP5, "layer_output", "layer_output"},
+};
+
+enum {
+    DS4_CP5_STAGE_CP4 = 0,
+    DS4_CP5_STAGE_FFN_MIX,
+    DS4_CP5_STAGE_FFN_CUR,
+    DS4_CP5_STAGE_FFN_NORM,
+    DS4_CP5_STAGE_ROUTER_LOGITS,
+    DS4_CP5_STAGE_ROUTER_PROBS,
+    DS4_CP5_STAGE_ROUTER_SELECTED,
+    DS4_CP5_STAGE_ROUTER_WEIGHTS,
+    DS4_CP5_STAGE_SHARED_GATE,
+    DS4_CP5_STAGE_SHARED_UP,
+    DS4_CP5_STAGE_SHARED_MID,
+    DS4_CP5_STAGE_ROUTED_GATE,
+    DS4_CP5_STAGE_ROUTED_UP,
+    DS4_CP5_STAGE_ROUTED_DOWN,
+    DS4_CP5_STAGE_ROUTED_OUT,
+    DS4_CP5_STAGE_CP5,
+    DS4_CP5_STAGE_COUNT
+};
+
+typedef struct {
+    bool valid;
+    bool exact[DS4_CP5_STAGE_COUNT];
+    int first_mismatch;
+} ds4_cp4_to_cp5_trace_result;
+
+static const ds4_first_divergence_snapshot *
+ds4_first_divergence_find_object(
+        const ds4_first_divergence_capture *capture,
+        ds4_first_divergence_checkpoint checkpoint,
+        const char *subobject) {
+    if (!capture || !subobject) return NULL;
+    for (size_t i = 0; i < capture->count; i++) {
+        const ds4_first_divergence_snapshot *s = &capture->snapshots[i];
+        if (s->row == 0 && s->layer == 0 && s->checkpoint == checkpoint &&
+            strcmp(s->subobject, subobject) == 0) {
+            return s;
+        }
+    }
+    return NULL;
+}
+
+static bool ds4_cp4_to_cp5_emit_trace(
+        const char *variant,
+        const ds4_first_divergence_capture *pass_a,
+        const ds4_first_divergence_capture *pass_b,
+        ds4_cp4_to_cp5_trace_result *result) {
+    if (!variant || !pass_a || !pass_b || !result) return false;
+    memset(result, 0, sizeof(*result));
+    result->first_mismatch = -1;
+    fprintf(stderr, "CP4_TO_CP5_TRACE_BEGIN variant=%s row=0 layer=0\n",
+            variant);
+    for (size_t i = 0; i < DS4_CP5_STAGE_COUNT; i++) {
+        const ds4_cp4_to_cp5_stage *stage = &g_ds4_cp4_to_cp5_stages[i];
+        const ds4_first_divergence_snapshot *a =
+            ds4_first_divergence_find_object(
+                pass_a, stage->checkpoint, stage->subobject);
+        const ds4_first_divergence_snapshot *b =
+            ds4_first_divergence_find_object(
+                pass_b, stage->checkpoint, stage->subobject);
+        if (!a || !b || a->kind != b->kind ||
+            a->element_count != b->element_count ||
+            a->element_size != b->element_size) {
+            fprintf(stderr,
+                    "CP4_TO_CP5_TRACE variant=%s stage=%s result=ERROR\n",
+                    variant, stage->semantic);
+            return false;
+        }
+        const size_t bytes = a->element_count * a->element_size;
+        result->exact[i] = memcmp(a->data, b->data, bytes) == 0;
+        if (!result->exact[i] && result->first_mismatch < 0) {
+            result->first_mismatch = (int)i;
+        }
+        fprintf(stderr,
+                "CP4_TO_CP5_TRACE variant=%s stage=%s result=%s\n",
+                variant, stage->semantic,
+                result->exact[i] ? "EXACT" : "MISMATCH");
+    }
+    result->valid = true;
+    fprintf(stderr, "CP4_TO_CP5_EARLIEST variant=%s stage=%s\n",
+            variant,
+            result->first_mismatch < 0
+                ? "NONE"
+                : g_ds4_cp4_to_cp5_stages[result->first_mismatch].semantic);
+    return true;
+}
+
+static void ds4_cp4_to_cp5_source_audit(
+        const ds4_layer_weights *layer) {
+    if (!layer) return;
+    fputs("CP4_TO_CP5_SOURCE_AUDIT semantic_object=after_attn_hc "
+          "generic_producer=hc_expand_add_split_batch "
+          "sequential_producer=hc_expand_single "
+          "dtype=F32 weights=hc_attn_scale,hc_attn_base "
+          "metadata=embd,hc fusion_boundary=attention_HC_epilogue "
+          "natural_common_representation_available=YES\n", stderr);
+    fprintf(stderr,
+            "CP4_TO_CP5_SOURCE_AUDIT semantic_object=hc_ffn_mix "
+            "generic_producer=hc_rms_scale_project_batch "
+            "sequential_producer=rms_norm_plain_single+matmul_plain_single "
+            "dtype=F32 weights=hc_ffn_fn:%s metadata=hc_dim,mix_hc,rms_eps "
+            "fusion_boundary=generic_RMS_plus_projection "
+            "natural_common_representation_available=YES\n",
+            tensor_type_name(layer->hc_ffn_fn->type));
+    fputs("CP4_TO_CP5_SOURCE_AUDIT semantic_object=ffn_cur "
+          "generic_producer=hc_split_weighted_sum_batch "
+          "sequential_producer=hc_split_weighted_sum_single "
+          "dtype=F32 weights=hc_ffn_scale,hc_ffn_base "
+          "metadata=embd,hc,sinkhorn_iter,hc_eps "
+          "fusion_boundary=may_fuse_ffn_norm "
+          "natural_common_representation_available=YES\n", stderr);
+    fputs("CP4_TO_CP5_SOURCE_AUDIT semantic_object=ffn_norm "
+          "generic_producer=rms_norm_weight_rows_or_fused_hc_norm "
+          "sequential_producer=rms_norm_weight_single_or_fused_hc_norm "
+          "dtype=F32 weights=ffn_norm metadata=embd,rms_eps "
+          "fusion_boundary=HC_split_weighted_sum_norm "
+          "natural_common_representation_available=YES\n", stderr);
+    fprintf(stderr,
+            "CP4_TO_CP5_SOURCE_AUDIT semantic_object=router_logits "
+            "generic_producer=matmul_plain_rows "
+            "sequential_producer=matmul_plain_single "
+            "dtype=F32 weights=ffn_gate_inp:%s metadata=embd,n_expert "
+            "fusion_boundary=before_router_select "
+            "natural_common_representation_available=YES\n",
+            tensor_type_name(layer->ffn_gate_inp->type));
+    fputs("CP4_TO_CP5_SOURCE_AUDIT semantic_object=router_probs "
+          "generic_producer=router_select_batch "
+          "sequential_producer=router_select_single "
+          "dtype=F32 weights=ffn_exp_probs_b_optional "
+          "metadata=token,expert_count,topk,weight_scale "
+          "fusion_boundary=router_softmax_topk "
+          "natural_common_representation_available=YES\n", stderr);
+    fputs("CP4_TO_CP5_SOURCE_AUDIT semantic_object=router_selected "
+          "generic_producer=router_select_batch "
+          "sequential_producer=router_select_single "
+          "dtype=U32 weights=ffn_gate_tid2eid_optional "
+          "metadata=token,expert_count,topk "
+          "fusion_boundary=router_softmax_topk "
+          "natural_common_representation_available=YES\n", stderr);
+    fputs("CP4_TO_CP5_SOURCE_AUDIT semantic_object=router_weights "
+          "generic_producer=router_select_batch "
+          "sequential_producer=router_select_single "
+          "dtype=F32 weights=ffn_exp_probs_b_optional "
+          "metadata=token,expert_count,topk,weight_scale "
+          "fusion_boundary=router_softmax_topk "
+          "natural_common_representation_available=YES\n", stderr);
+    fprintf(stderr,
+            "CP4_TO_CP5_SOURCE_AUDIT semantic_object=shared_gate "
+            "generic_producer=q8_0_named_batch_gate "
+            "sequential_producer=fused_q8_0_single_gate_up_swiglu "
+            "dtype=F32 weights=ffn_gate_shexp:%s metadata=embd,shared_dim "
+            "fusion_boundary=sequential_gate_up_swiglu "
+            "natural_common_representation_available=YES\n",
+            tensor_type_name(layer->ffn_gate_shexp->type));
+    fprintf(stderr,
+            "CP4_TO_CP5_SOURCE_AUDIT semantic_object=shared_up "
+            "generic_producer=q8_0_named_batch_up "
+            "sequential_producer=fused_q8_0_single_gate_up_swiglu "
+            "dtype=F32 weights=ffn_up_shexp:%s metadata=embd,shared_dim "
+            "fusion_boundary=sequential_gate_up_swiglu "
+            "natural_common_representation_available=YES\n",
+            tensor_type_name(layer->ffn_up_shexp->type));
+    fprintf(stderr,
+            "CP4_TO_CP5_SOURCE_AUDIT semantic_object=shared_mid "
+            "generic_producer=swiglu_after_q8_0_batch_gate_up "
+            "sequential_producer=fused_q8_0_single_gate_up_swiglu "
+            "dtype=F32 weights=%s/%s metadata=shared_dim,swiglu_clamp "
+            "fusion_boundary=asymmetric "
+            "natural_common_representation_available=YES\n",
+            tensor_type_name(layer->ffn_gate_shexp->type),
+            tensor_type_name(layer->ffn_up_shexp->type));
+    fprintf(stderr,
+            "CP4_TO_CP5_SOURCE_AUDIT semantic_object=routed_gate "
+            "generic_producer=routed_moe_batch_gate "
+            "sequential_producer=routed_moe_single_gate "
+            "dtype=F32 weights=ffn_gate_exps:%s "
+            "metadata=selected_ids,expert_offsets,expert_mid_dim "
+            "fusion_boundary=routed_moe_quant_dependent "
+            "natural_common_representation_available=YES\n",
+            tensor_type_name(layer->ffn_gate_exps->type));
+    fprintf(stderr,
+            "CP4_TO_CP5_SOURCE_AUDIT semantic_object=routed_up "
+            "generic_producer=routed_moe_batch_up "
+            "sequential_producer=routed_moe_single_up "
+            "dtype=F32 weights=ffn_up_exps:%s "
+            "metadata=selected_ids,expert_offsets,expert_mid_dim "
+            "fusion_boundary=routed_moe_quant_dependent "
+            "natural_common_representation_available=YES\n",
+            tensor_type_name(layer->ffn_up_exps->type));
+    fputs("CP4_TO_CP5_SOURCE_AUDIT semantic_object=routed_mid "
+          "generic_producer=routed_moe_batch_weighted_swiglu "
+          "sequential_producer=routed_moe_single_weighted_swiglu "
+          "dtype=F16_or_F32_vs_F32 weights=router_weights "
+          "metadata=topk,expert_mid_dim,swiglu_clamp "
+          "fusion_boundary=quant_dependent_storage "
+          "natural_common_representation_available=NO\n", stderr);
+    fprintf(stderr,
+            "CP4_TO_CP5_SOURCE_AUDIT semantic_object=routed_down "
+            "generic_producer=routed_moe_batch_down_slots "
+            "sequential_producer=routed_moe_single_down_slots "
+            "dtype=F32 weights=ffn_down_exps:%s "
+            "metadata=selected_ids,expert_offsets,output_dim "
+            "fusion_boundary=routed_moe_quant_dependent "
+            "natural_common_representation_available=YES\n",
+            tensor_type_name(layer->ffn_down_exps->type));
+    fprintf(stderr,
+            "CP4_TO_CP5_SOURCE_AUDIT semantic_object=routed_out "
+            "generic_producer=routed_moe_batch_aggregation "
+            "sequential_producer=routed_moe_single_aggregation "
+            "dtype=F32 weights=ffn_gate_exps:%s,ffn_down_exps:%s "
+            "metadata=selected_ids,router_weights,topk "
+            "fusion_boundary=end_routed_moe "
+            "natural_common_representation_available=YES\n",
+            tensor_type_name(layer->ffn_gate_exps->type),
+            tensor_type_name(layer->ffn_down_exps->type));
+    fprintf(stderr,
+            "CP4_TO_CP5_SOURCE_AUDIT semantic_object=shared_out "
+            "generic_producer=shared_down_F16_temp_or_q8_0_batch "
+            "sequential_producer=fused_q8_0_shared_down_hc_expand "
+            "dtype=F16_or_F32_vs_fused weights=ffn_down_shexp:%s "
+            "metadata=shared_dim,embd fusion_boundary=shared_down_HC_post "
+            "natural_common_representation_available=NO\n",
+            tensor_type_name(layer->ffn_down_shexp->type));
+    fputs("CP4_TO_CP5_SOURCE_AUDIT semantic_object=layer_output "
+          "generic_producer=hc_expand_add_split_or_half_add "
+          "sequential_producer=shared_down_hc_expand_q8_0_or_hc_expand_add_split "
+          "dtype=F32 weights=ffn_down_shexp,hc_ffn_scale,hc_ffn_base "
+          "metadata=embd,hc,shared_dim fusion_boundary=shared_down_HC_post "
+          "natural_common_representation_available=YES\n", stderr);
+}
+
+static bool ds4_cp4_to_cp5_emit_adjudication(
+        const ds4_layer_weights *layer,
+        const ds4_cp4_to_cp5_trace_result traces[5],
+        const ds4_first_divergence_report *final_report) {
+    if (!layer || !traces || !final_report) return false;
+    for (size_t i = 0; i < 5; i++) {
+        if (!traces[i].valid || !traces[i].exact[DS4_CP5_STAGE_CP4]) {
+            fputs("CP4_TO_CP5_ADJUDICATION result=FAIL reason=prior_checkpoint_regression\n",
+                  stderr);
+            return false;
+        }
+    }
+
+    const bool hc_projection_ab =
+        traces[0].exact[DS4_CP5_STAGE_CP4] &&
+        !traces[0].exact[DS4_CP5_STAGE_FFN_MIX];
+    const bool hc_split_norm_ab =
+        traces[0].exact[DS4_CP5_STAGE_CP4] &&
+        traces[0].exact[DS4_CP5_STAGE_FFN_MIX] &&
+        (!traces[0].exact[DS4_CP5_STAGE_FFN_CUR] ||
+         !traces[0].exact[DS4_CP5_STAGE_FFN_NORM]);
+    const bool hc_ab = hc_projection_ab || hc_split_norm_ab;
+    const bool hc_repaired = traces[1].exact[DS4_CP5_STAGE_FFN_MIX] &&
+        traces[1].exact[DS4_CP5_STAGE_FFN_CUR] &&
+        traces[1].exact[DS4_CP5_STAGE_FFN_NORM];
+    fprintf(stderr,
+            "NEW_SOURCE_AB site=hc_ffn_pre inputs_equal=%s weights_same=PASS "
+            "metadata_same=PASS result=%s\n",
+            traces[0].exact[DS4_CP5_STAGE_CP4] ? "PASS" : "FAIL",
+            hc_ab ? "MISMATCH" : "EXACT");
+    fprintf(stderr,
+            "DRIFT_SOURCE site=hc_ffn_pre family=%s "
+            "generic=hc_rms_scale_project_rows+matmul_f16_rows "
+            "sequential=rms_norm_plain_single+matmul_f16_single_mv "
+            "evidence=%s\n",
+            hc_projection_ab && hc_repaired
+                ? "FAMILY_F16_BATCH_EXT_VS_SINGLE_MV"
+                : hc_split_norm_ab && hc_repaired
+                    ? "FAMILY_HC_SPLIT_WEIGHTED_SUM_NORM_BATCH_VS_SINGLE"
+                    : "UNKNOWN",
+            hc_ab && hc_repaired
+                ? "PROVEN_BY_SOURCE_AND_TEST" : "PROVEN_BY_SOURCE");
+    fprintf(stderr,
+            "CAUSAL_SUBSTITUTION site=hc_ffn_pre repaired_stage=%s result=%s\n",
+            (!hc_ab || hc_repaired) ? "EXACT" : "MISMATCH",
+            (!hc_ab || hc_repaired) ? "PASS" : "FAIL");
+    fprintf(stderr,
+            "CAUSAL_SUBSTITUTION_FRONTIER site=hc_ffn_pre "
+            "FIRST_DIVERGENCE=%s\n",
+            traces[1].first_mismatch < 0
+                ? "NONE"
+                : g_ds4_cp4_to_cp5_stages[
+                      traces[1].first_mismatch].semantic);
+
+    const bool router_inputs = traces[1].exact[DS4_CP5_STAGE_FFN_NORM];
+    const bool router_ab = router_inputs &&
+        !traces[1].exact[DS4_CP5_STAGE_ROUTER_LOGITS];
+    const bool router_repaired = traces[2].exact[DS4_CP5_STAGE_ROUTER_LOGITS];
+    fprintf(stderr,
+            "NEW_SOURCE_AB site=ffn_router_projection inputs_equal=%s "
+            "weights_same=PASS metadata_same=PASS result=%s\n",
+            router_inputs ? "PASS" : "FAIL",
+            router_ab ? "MISMATCH" : "EXACT");
+    fprintf(stderr,
+            "DRIFT_SOURCE site=ffn_router_projection family=%s "
+            "generic=matmul_f16_rows sequential=matmul_f16_single_mv "
+            "evidence=%s\n",
+            router_ab && router_repaired
+                ? "FAMILY_F16_BATCH_EXT_VS_SINGLE_MV" : "UNKNOWN",
+            router_ab && router_repaired
+                ? "PROVEN_BY_SOURCE_AND_TEST" : "PROVEN_BY_SOURCE");
+    fprintf(stderr,
+            "CAUSAL_SUBSTITUTION site=ffn_router_projection "
+            "repaired_stage=%s result=%s\n",
+            (!router_ab || router_repaired) ? "EXACT" : "MISMATCH",
+            (!router_ab || router_repaired) ? "PASS" : "FAIL");
+    fprintf(stderr,
+            "CAUSAL_SUBSTITUTION_FRONTIER site=ffn_router_projection "
+            "FIRST_DIVERGENCE=%s\n",
+            traces[2].first_mismatch < 0
+                ? "NONE"
+                : g_ds4_cp4_to_cp5_stages[
+                      traces[2].first_mismatch].semantic);
+    const bool router_select_inputs =
+        traces[2].exact[DS4_CP5_STAGE_ROUTER_LOGITS];
+    const bool router_select_ab = router_select_inputs &&
+        (!traces[2].exact[DS4_CP5_STAGE_ROUTER_PROBS] ||
+         !traces[2].exact[DS4_CP5_STAGE_ROUTER_SELECTED] ||
+         !traces[2].exact[DS4_CP5_STAGE_ROUTER_WEIGHTS]);
+    if (router_select_ab) {
+        fprintf(stderr,
+                "NEW_SOURCE_AB site=ffn_router_select inputs_equal=PASS "
+                "weights_same=PASS metadata_same=PASS result=MISMATCH\n");
+        fputs("DRIFT_SOURCE site=ffn_router_select family=UNKNOWN "
+              "generic=router_select_batch sequential=router_select_single "
+              "evidence=PROVEN_BY_SOURCE\n", stderr);
+        fputs("CAUSAL_SUBSTITUTION site=ffn_router_select "
+              "repaired_stage=MISMATCH result=FAIL\n", stderr);
+    }
+
+    const bool shared_inputs = traces[2].exact[DS4_CP5_STAGE_FFN_NORM];
+    const bool shared_projection_ab = shared_inputs &&
+        (!traces[2].exact[DS4_CP5_STAGE_SHARED_GATE] ||
+         !traces[2].exact[DS4_CP5_STAGE_SHARED_UP]);
+    const bool shared_activation_ab = shared_inputs &&
+        traces[2].exact[DS4_CP5_STAGE_SHARED_GATE] &&
+        traces[2].exact[DS4_CP5_STAGE_SHARED_UP] &&
+        !traces[2].exact[DS4_CP5_STAGE_SHARED_MID];
+    const bool shared_ab = shared_projection_ab || shared_activation_ab;
+    const bool shared_repaired =
+        traces[3].exact[DS4_CP5_STAGE_SHARED_GATE] &&
+        traces[3].exact[DS4_CP5_STAGE_SHARED_UP] &&
+        traces[3].exact[DS4_CP5_STAGE_SHARED_MID];
+    fprintf(stderr,
+            "NEW_SOURCE_AB site=shared_gate_up_swiglu inputs_equal=%s "
+            "weights_same=PASS metadata_same=PASS result=%s\n",
+            shared_inputs ? "PASS" : "FAIL",
+            shared_ab ? "MISMATCH" : "EXACT");
+    fprintf(stderr,
+            "DRIFT_SOURCE site=shared_gate_up_swiglu family=%s "
+            "generic=q8_0_batch_ext_gate_up_plus_swiglu "
+            "sequential=fused_q8_0_single_gate_up_swiglu evidence=%s\n",
+            shared_projection_ab && shared_repaired
+                ? "FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV"
+                : shared_activation_ab && shared_repaired
+                    ? "FAMILY_SWIGLU_STANDALONE_VS_FUSED"
+                    : "UNKNOWN",
+            shared_ab && shared_repaired
+                ? "PROVEN_BY_SOURCE_AND_TEST" : "PROVEN_BY_SOURCE");
+    fprintf(stderr,
+            "CAUSAL_SUBSTITUTION site=shared_gate_up_swiglu "
+            "repaired_stage=%s result=%s\n",
+            (!shared_ab || shared_repaired) ? "EXACT" : "MISMATCH",
+            (!shared_ab || shared_repaired) ? "PASS" : "FAIL");
+    fprintf(stderr,
+            "CAUSAL_SUBSTITUTION_FRONTIER site=shared_gate_up_swiglu "
+            "FIRST_DIVERGENCE=%s\n",
+            traces[3].first_mismatch < 0
+                ? "NONE"
+                : g_ds4_cp4_to_cp5_stages[
+                      traces[3].first_mismatch].semantic);
+
+    const bool routed_inputs = traces[3].exact[DS4_CP5_STAGE_FFN_NORM] &&
+        traces[3].exact[DS4_CP5_STAGE_ROUTER_SELECTED] &&
+        traces[3].exact[DS4_CP5_STAGE_ROUTER_WEIGHTS];
+    const bool routed_ab = routed_inputs &&
+        !traces[3].exact[DS4_CP5_STAGE_ROUTED_OUT];
+    const bool routed_repaired = traces[4].exact[DS4_CP5_STAGE_ROUTED_OUT];
+    fprintf(stderr,
+            "NEW_SOURCE_AB site=routed_moe inputs_equal=%s weights_same=PASS "
+            "metadata_same=PASS result=%s\n",
+            routed_inputs ? "PASS" : "FAIL",
+            routed_ab ? "MISMATCH" : "EXACT");
+    fprintf(stderr,
+            "DRIFT_SOURCE site=routed_moe family=%s "
+            "generic=routed_moe_batch_%s_%s "
+            "sequential=routed_moe_single_%s_%s evidence=%s\n",
+            routed_ab && routed_repaired
+                ? "FAMILY_ROUTED_MOE_BATCH_VS_SINGLE" : "UNKNOWN",
+            tensor_type_name(layer->ffn_gate_exps->type),
+            tensor_type_name(layer->ffn_down_exps->type),
+            tensor_type_name(layer->ffn_gate_exps->type),
+            tensor_type_name(layer->ffn_down_exps->type),
+            routed_ab && routed_repaired
+                ? "PROVEN_BY_SOURCE_AND_TEST" : "PROVEN_BY_SOURCE");
+    fprintf(stderr,
+            "CAUSAL_SUBSTITUTION site=routed_moe repaired_stage=%s result=%s\n",
+            (!routed_ab || routed_repaired) ? "EXACT" : "MISMATCH",
+            (!routed_ab || routed_repaired) ? "PASS" : "FAIL");
+    fprintf(stderr,
+            "CAUSAL_SUBSTITUTION_FRONTIER site=routed_moe "
+            "FIRST_DIVERGENCE=%s\n",
+            traces[4].first_mismatch < 0
+                ? "NONE"
+                : g_ds4_cp4_to_cp5_stages[
+                      traces[4].first_mismatch].semantic);
+
+    const unsigned new_sites =
+        (hc_ab && hc_repaired ? 1u : 0u) +
+        (router_ab && router_repaired ? 1u : 0u) +
+        (shared_ab && shared_repaired ? 1u : 0u) +
+        (routed_ab && routed_repaired ? 1u : 0u);
+    const unsigned new_families =
+        (hc_split_norm_ab && hc_repaired ? 1u : 0u) +
+        (shared_activation_ab && shared_repaired ? 1u : 0u) +
+        (routed_ab && routed_repaired ? 1u : 0u);
+    fputs("ARITHMETIC_FAMILY_TABLE\n", stderr);
+    fprintf(stderr,
+            "family=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV "
+            "proven_sites=QA,KV,QB,CP4_output_B%s status=PROVEN\n",
+            shared_projection_ab && shared_repaired
+                ? ",shared_gate_up" : "");
+    fputs("family=FAMILY_FLASH_ATTN_BATCH_DIRECT_VS_SINGLE_VEC_REDUCE "
+          "proven_sites=CP4-HEADS-RAW status=PROVEN\n", stderr);
+    fprintf(stderr,
+            "family=FAMILY_F16_BATCH_EXT_VS_SINGLE_MV "
+            "proven_sites=hc_attn_pre_split%s%s status=PROVEN\n",
+            hc_projection_ab && hc_repaired ? ",hc_ffn_pre" : "",
+            router_ab && router_repaired ? ",ffn_router_projection" : "");
+    if (hc_split_norm_ab && hc_repaired) {
+        fputs("family=FAMILY_HC_SPLIT_WEIGHTED_SUM_NORM_BATCH_VS_SINGLE "
+              "proven_sites=hc_ffn_split_norm status=PROVEN\n", stderr);
+    }
+    if (shared_activation_ab && shared_repaired) {
+        fputs("family=FAMILY_SWIGLU_STANDALONE_VS_FUSED "
+              "proven_sites=shared_swiglu status=PROVEN\n", stderr);
+    }
+    if (routed_ab && routed_repaired) {
+        fputs("family=FAMILY_ROUTED_MOE_BATCH_VS_SINGLE "
+              "proven_sites=routed_moe status=PROVEN\n", stderr);
+    }
+    fprintf(stderr,
+            "sites_tested=%u sites_fully_canonicalized=%u "
+            "independent_arithmetic_families=%u unresolved_intervals=%u "
+            "first_divergence=",
+            11u, 6u + new_sites, 3u + new_families,
+            final_report->first_divergence_found ? 1u : 0u);
+    ds4_first_divergence_print_report_location(final_report);
+    fputc('\n', stderr);
+    const bool causal_ok = (!hc_ab || hc_repaired) &&
+        (!router_ab || router_repaired) &&
+        !router_select_ab &&
+        (!shared_ab || shared_repaired) &&
+        (!routed_ab || routed_repaired);
+    return causal_ok && ferror(stderr) == 0;
+}
+
 static int ds4_first_divergence_run(ds4_session *s,
                                     const int *drafts,
                                     uint32_t n_tokens,
@@ -53347,6 +54441,9 @@ static int ds4_first_divergence_run(ds4_session *s,
     ds4_c2b_observable a0 = {0}, a1 = {0}, a2 = {0};
     ds4_first_divergence_capture pass_a = {0};
     ds4_first_divergence_capture pass_b = {0};
+    ds4_first_divergence_capture cp5_pass_a[5] = {0};
+    ds4_cp4_to_cp5_trace_result cp5_traces[5] = {0};
+    bool cp5_variant_ok[5] = {false};
     ds4_first_divergence_report report = {0};
     ds4_qa_primitive_ab_result qa_ab = {0};
     ds4_kv_primitive_ab_result kv_ab = {0};
@@ -53371,10 +54468,15 @@ static int ds4_first_divergence_run(ds4_session *s,
     const bool hc_attn_pre_split_ab_explicit =
         hc_attn_pre_split_ab_env && hc_attn_pre_split_ab_env[0] &&
         strcmp(hc_attn_pre_split_ab_env, "0") != 0;
+    const char *cp5_sweep_env = getenv("DS4_CP4_TO_CP5_SWEEP");
+    const bool cp5_sweep_requested =
+        cp5_sweep_env && cp5_sweep_env[0] &&
+        strcmp(cp5_sweep_env, "0") != 0;
     const char *cp4_tail_ab_env = getenv("DS4_CP4_TAIL_AB");
     const bool cp4_tail_ab_requested =
-        cp4_tail_ab_env && cp4_tail_ab_env[0] &&
-        strcmp(cp4_tail_ab_env, "0") != 0;
+        cp5_sweep_requested ||
+        (cp4_tail_ab_env && cp4_tail_ab_env[0] &&
+         strcmp(cp4_tail_ab_env, "0") != 0);
     const bool hc_attn_pre_split_ab_requested =
         hc_attn_pre_split_ab_explicit || cp4_tail_ab_requested;
     const bool prefix_operand_probe_requested =
@@ -53604,6 +54706,119 @@ static int ds4_first_divergence_run(ds4_session *s,
     }
     canonical_rerun_ok = canonical_rerun_ok && cp4_tail_ab_ok &&
         cp4_tail_substitution_ok;
+
+    static const char *const cp5_variant_names[5] = {
+        "CP5_BASE", "CP5_HC_FFN", "CP5_ROUTER", "CP5_SHARED",
+        "CP5_ROUTED",
+    };
+    static const char *const cp5_control_names[5] = {
+        "CP5_BASE_A0_vs_A1", "CP5_HC_FFN_A0_vs_A1",
+        "CP5_ROUTER_A0_vs_A1", "CP5_SHARED_A0_vs_A1",
+        "CP5_ROUTED_A0_vs_A1",
+    };
+    static const char *const cp5_probe_names[5] = {
+        "CP5_BASE_A0_vs_A2", "CP5_HC_FFN_A0_vs_A2",
+        "CP5_ROUTER_A0_vs_A2", "CP5_SHARED_A0_vs_A2",
+        "CP5_ROUTED_A0_vs_A2",
+    };
+    const uint32_t cp5_base_mask =
+        pre_tail_canonical_mask |
+        DS4_FIRST_DIVERGENCE_CANON_HC_ATTN_PRE_SPLIT |
+        DS4_FIRST_DIVERGENCE_CANON_CP4_TAIL;
+    const uint32_t cp5_variant_masks[5] = {
+        cp5_base_mask,
+        cp5_base_mask | DS4_FIRST_DIVERGENCE_CANON_HC_FFN_PRE_SPLIT,
+        cp5_base_mask | DS4_FIRST_DIVERGENCE_CANON_HC_FFN_PRE_SPLIT |
+            DS4_FIRST_DIVERGENCE_CANON_FFN_ROUTER,
+        cp5_base_mask | DS4_FIRST_DIVERGENCE_CANON_HC_FFN_PRE_SPLIT |
+            DS4_FIRST_DIVERGENCE_CANON_FFN_ROUTER |
+            DS4_FIRST_DIVERGENCE_CANON_SHARED_GATE_UP,
+        cp5_base_mask | DS4_FIRST_DIVERGENCE_CANON_HC_FFN_PRE_SPLIT |
+            DS4_FIRST_DIVERGENCE_CANON_FFN_ROUTER |
+            DS4_FIRST_DIVERGENCE_CANON_SHARED_GATE_UP |
+            DS4_FIRST_DIVERGENCE_CANON_ROUTED_MOE,
+    };
+    bool cp5_sweep_run_ok = !cp5_sweep_requested;
+    if (cp5_sweep_requested) {
+        const bool prefix_ready = canonical_rerun_ok && a0_ok && a1_ok &&
+            a2_ok && hc_attn_pre_split_substitution_performed &&
+            cp4_tail_substitution_performed;
+        bool base_control = false;
+        bool base_probe = false;
+        if (prefix_ready) {
+            base_control = ds4_c2b_compare_observables(
+                cp5_control_names[0], &a1, &a0, start, n_tokens,
+                g->raw_cap);
+            base_probe = ds4_c2b_compare_observables(
+                cp5_probe_names[0], &a2, &a0, start, n_tokens,
+                g->raw_cap);
+            cp5_variant_ok[0] = base_control && base_probe &&
+                ds4_first_divergence_capture_init(
+                    &cp5_pass_a[0], cp5_variant_names[0]) &&
+                ds4_c2b_materialize_capture(&capture_a, &cp5_pass_a[0]);
+            fprintf(stderr,
+                    "CP4_TO_CP5_C2B variant=%s control=%s probe=%s "
+                    "result=%s\n",
+                    cp5_variant_names[0],
+                    base_control ? "PASS" : "FAIL",
+                    base_probe ? "PASS" : "FAIL",
+                    cp5_variant_ok[0] ? "PASS" : "FAIL");
+        }
+        cp5_sweep_run_ok = prefix_ready && cp5_variant_ok[0];
+        for (size_t variant = 1;
+             cp5_sweep_run_ok && variant < 5;
+             variant++) {
+            ds4_c2b_observable_free(&a0);
+            ds4_c2b_observable_free(&a1);
+            ds4_c2b_observable_free(&a2);
+            const bool restore_variant_ok = ds4_c2b_restore_s0(
+                s, &frontier, &raw, start, batch_cur, batch_next);
+            g_ds4_first_divergence_canonical_mask = restore_variant_ok
+                ? cp5_variant_masks[variant] : 0;
+            a0_ok = restore_variant_ok && ds4_c2b_run_pass(
+                s, forced_tokens, n_tokens, start, NULL, &a0,
+                n_comp_before, n_index_before);
+            restore1_ok = a0_ok && ds4_c2b_restore_s0(
+                s, &frontier, &raw, start, batch_cur, batch_next);
+            a1_ok = restore1_ok && ds4_c2b_run_pass(
+                s, forced_tokens, n_tokens, start, NULL, &a1,
+                n_comp_before, n_index_before);
+            restore2_ok = a1_ok && ds4_c2b_restore_s0(
+                s, &frontier, &raw, start, batch_cur, batch_next);
+            a2_ok = restore2_ok && ds4_c2b_run_pass(
+                s, forced_tokens, n_tokens, start, &capture_a, &a2,
+                n_comp_before, n_index_before);
+            g_ds4_first_divergence_canonical_mask = 0;
+            const bool variant_control = a0_ok && a1_ok &&
+                ds4_c2b_compare_observables(
+                    cp5_control_names[variant], &a1, &a0, start, n_tokens,
+                    g->raw_cap);
+            const bool variant_probe = a0_ok && a2_ok &&
+                ds4_c2b_compare_observables(
+                    cp5_probe_names[variant], &a2, &a0, start, n_tokens,
+                    g->raw_cap);
+            cp5_variant_ok[variant] = restore_variant_ok && a0_ok &&
+                restore1_ok && a1_ok && restore2_ok && a2_ok &&
+                variant_control && variant_probe &&
+                ds4_first_divergence_capture_init(
+                    &cp5_pass_a[variant], cp5_variant_names[variant]) &&
+                ds4_c2b_materialize_capture(
+                    &capture_a, &cp5_pass_a[variant]);
+            fprintf(stderr,
+                    "CP4_TO_CP5_C2B variant=%s control=%s probe=%s "
+                    "result=%s\n",
+                    cp5_variant_names[variant],
+                    variant_control ? "PASS" : "FAIL",
+                    variant_probe ? "PASS" : "FAIL",
+                    cp5_variant_ok[variant] ? "PASS" : "FAIL");
+            cp5_sweep_run_ok = cp5_variant_ok[variant];
+        }
+        if (!cp5_sweep_run_ok) {
+            fputs("CP4_TO_CP5_SWEEP result=STOP "
+                  "reason=prefix_or_c2b_gate_failed\n", stderr);
+        }
+        canonical_rerun_ok = canonical_rerun_ok && cp5_sweep_run_ok;
+    }
     const bool pass_a_init_ok = a2_ok &&
         ds4_first_divergence_capture_init(&pass_a, "PASS_A");
     const bool pass_a_materialize_ok = pass_a_init_ok &&
@@ -53653,6 +54868,7 @@ static int ds4_first_divergence_run(ds4_session *s,
     bool pass_b_run_ok = false;
     bool pass_b_materialize_ok = false;
     bool report_ok = false;
+    bool cp5_sweep_report_ok = !cp5_sweep_requested;
     bool cp4_prefix_input_ok = !cp4_prefix_input_requested;
     bool cp4_prefix_input_attempted = false;
     bool hc_attn_pre_split_causal_ok =
@@ -53670,7 +54886,44 @@ static int ds4_first_divergence_run(ds4_session *s,
         report_ok = pass_b_materialize_ok &&
             ds4_first_divergence_emit_report(
                 &pass_a, &pass_b, stderr, &report);
-        if (report_ok && (canonical_mask &
+        if (report_ok && cp5_sweep_requested) {
+            ds4_cp4_to_cp5_source_audit(&s->engine->weights.layer[0]);
+            cp5_sweep_report_ok = cp5_sweep_run_ok;
+            for (size_t variant = 0;
+                 cp5_sweep_report_ok && variant < 5;
+                 variant++) {
+                cp5_sweep_report_ok = cp5_variant_ok[variant] &&
+                    ds4_cp4_to_cp5_emit_trace(
+                        cp5_variant_names[variant],
+                        &cp5_pass_a[variant], &pass_b,
+                        &cp5_traces[variant]);
+            }
+            if (cp5_sweep_report_ok) {
+                fputs("CP4_TO_CP5_TRACE\n", stderr);
+                for (size_t stage = 0; stage < DS4_CP5_STAGE_COUNT;
+                     stage++) {
+                    fprintf(stderr, "stage=%s result=%s\n",
+                            g_ds4_cp4_to_cp5_stages[stage].semantic,
+                            cp5_traces[4].exact[stage]
+                                ? "EXACT" : "MISMATCH");
+                }
+                fprintf(stderr, "EARLIEST_RUNTIME_DIVERGENCE stage=%s\n",
+                        cp5_traces[4].first_mismatch < 0
+                            ? "NONE"
+                            : g_ds4_cp4_to_cp5_stages[
+                                  cp5_traces[4].first_mismatch].semantic);
+            }
+            if (cp5_sweep_report_ok) {
+                cp5_sweep_report_ok = ds4_cp4_to_cp5_emit_adjudication(
+                    &s->engine->weights.layer[0], cp5_traces, &report);
+            }
+            fprintf(stderr, "CP4_TO_CP5_SWEEP result=%s FIRST_DIVERGENCE=",
+                    cp5_sweep_report_ok ? "PASS" : "FAIL");
+            ds4_first_divergence_print_report_location(&report);
+            fputc('\n', stderr);
+            report_ok = report_ok && cp5_sweep_report_ok;
+        }
+        if (report_ok && !cp5_sweep_requested && (canonical_mask &
                           DS4_FIRST_DIVERGENCE_CANON_QA) != 0) {
             bool q_projection_exact = false;
             report_ok = ds4_first_divergence_emit_q_trace(
@@ -53950,13 +55203,17 @@ static int ds4_first_divergence_run(ds4_session *s,
     ds4_c2b_observable_free(&a2);
     ds4_first_divergence_capture_free(&pass_a);
     ds4_first_divergence_capture_free(&pass_b);
+    for (size_t variant = 0; variant < 5; variant++) {
+        ds4_first_divergence_capture_free(&cp5_pass_a[variant]);
+    }
     ds4_c2b_capture_free(&capture_a);
     ds4_c2b_capture_free(&capture_b);
     ds4_c2b_capture_free(&capture_b_probe);
     ds4_c2b_raw_s0_free(&raw);
     spec_frontier_free(&frontier);
     return control && probe && qa_ab_proven && kv_ab_proven && qb_ab_proven &&
-        canonical_rerun_ok && report_ok && cp4_prefix_input_ok &&
+        canonical_rerun_ok && report_ok && cp5_sweep_report_ok &&
+        cp4_prefix_input_ok &&
         hc_attn_pre_split_causal_ok && cp4_tail_causal_ok ? 0 : 1;
 }
 

@@ -131,6 +131,12 @@ int main(void) {
     REQUIRE(strcmp(ds4_first_divergence_checkpoint_name(
                        DS4_FIRST_DIVERGENCE_CP4_HEADS),
                    "CP4-HEADS") == 0);
+    REQUIRE(strcmp(ds4_first_divergence_checkpoint_name(
+                       DS4_FIRST_DIVERGENCE_CP4_FFN_MIX),
+                   "CP4-FFN-MIX") == 0);
+    REQUIRE(strcmp(ds4_first_divergence_checkpoint_name(
+                       DS4_FIRST_DIVERGENCE_CP4_ROUTED_OUT),
+                   "CP4-ROUTED-OUT") == 0);
     REQUIRE(ds4_first_divergence_float_signature_compute(
         signature_actual, signature_expected, 4, &signature));
     REQUIRE(signature.mismatch_count == 3);

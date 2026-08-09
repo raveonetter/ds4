@@ -157,7 +157,12 @@ const char *ds4_first_divergence_checkpoint_name(
     static const char *const names[] = {
         "CP1", "CP2-Q", "CP2-KV-P", "CP2-Q-NORM", "CP2-Q-CUR",
         "CP2-KV-R", "CP3-P", "CP3-F", "CP4-HEADS-RAW",
-        "CP4-HEADS", "CP4", "CP5"
+        "CP4-HEADS", "CP4", "CP4-FFN-MIX", "CP4-FFN-CUR",
+        "CP4-FFN-NORM", "CP4-ROUTER-LOGITS", "CP4-ROUTER-PROBS",
+        "CP4-ROUTER-SELECTED", "CP4-ROUTER-WEIGHTS",
+        "CP4-SHARED-GATE", "CP4-SHARED-UP", "CP4-SHARED-MID",
+        "CP4-ROUTED-GATE", "CP4-ROUTED-UP", "CP4-ROUTED-DOWN",
+        "CP4-ROUTED-OUT", "CP5"
     };
 
     if (checkpoint >= DS4_FIRST_DIVERGENCE_CHECKPOINT_COUNT) {

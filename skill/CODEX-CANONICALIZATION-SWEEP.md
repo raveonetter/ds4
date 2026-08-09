@@ -18,12 +18,23 @@
   `CP2-Q-CUR/q_cur` exact: **PROVEN BY TEST** on M4 Max.
 - Pre-inverse-RoPE heads subdivision and raw-attention canonicalization:
   **PROVEN BY TEST** on M4 Max.
-- Current first divergence after `{QA,KV,QB,ATTN-RAW}`:
-  `CP4/after_attn_hc` at row 0, layer 0: **PROVEN BY TEST** on M4 Max.
-- Isolated same-input CP4 tail A/B and conditional `CP4-TAIL`
-  causal substitution: **IMPLEMENTED; M4 RUNTIME REQUIRED**.
+- HC attention pre-split and CP4 tail causal substitutions:
+  **PROVEN BY TEST** on M4 Max.
+- Current first divergence after the complete proven CP4 prefix:
+  `CP5/layer_output` at row 0, layer 0; `CP4/after_attn_hc` exact:
+  **PROVEN BY TEST** on M4 Max.
+- CP4-to-CP5 natural-stage sweep and cumulative causal substitutions:
+  **IMPLEMENTED; M4 RUNTIME REQUIRED**.
 - Default production behavior remains unchanged when
   `DS4_FIRST_DIVERGENCE_CANONICAL` is unset.
+
+Current proven family concentration:
+
+```text
+family=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV proven_sites=QA,KV,QB,CP4_output_B status=PROVEN
+family=FAMILY_FLASH_ATTN_BATCH_DIRECT_VS_SINGLE_VEC_REDUCE proven_sites=CP4-HEADS-RAW status=PROVEN
+family=FAMILY_F16_BATCH_EXT_VS_SINGLE_MV proven_sites=hc_attn_pre_split status=PROVEN
+```
 
 ## Starting proven facts
 
@@ -74,6 +85,83 @@ schedule, Q-B, attention, compressor, FFN/MoE, cache/state handling, and
 ordinary `metal_graph_eval_token_raw_swa()` reference path are unchanged.
 
 Evidence label: **PROVEN BY SOURCE**.
+
+## CP4-to-CP5 natural-stage sweep
+
+`DS4_CP4_TO_CP5_SWEEP=1` starts from the proven
+`QA,KV,QB,ATTN-RAW` mask, reruns the already proven HC-attention and CP4-tail
+gates, then captures the real FFN/MoE tensors already materialized by both
+execution paths. No stage is recomputed for capture, no fusion is split, and
+all GPU snapshots are same-stream copies read by the CPU only after a pass
+completes.
+
+The ordered natural trace is:
+
+```text
+after_attn_hc
+hc_ffn_mix
+ffn_cur
+ffn_norm
+router_logits
+router_probs
+router_selected
+router_weights
+shared_gate
+shared_up
+shared_mid
+routed_gate
+routed_up
+routed_down
+routed_out
+layer_output
+```
+
+Two conceptual values are deliberately not checkpoints. `routed_mid` may be
+F16 in the generic batch path but F32 in sequential decode. `shared_out` may
+be an F16 temporary in the generic path while sequential decode folds the Q8
+shared-down projection directly into the HC epilogue. Comparing either would
+require changing storage or splitting fusion.
+
+The diagnostic tests these cumulative row-wise substitutions:
+
+1. ordinary single-row HC-FFN pre-sublayer arithmetic;
+2. ordinary single-row router projection arithmetic;
+3. the existing fused single-row Q8 shared gate/up/SwiGLU primitive;
+4. the existing single-row routed-MoE primitive.
+
+Each variant has its own A0/A1 and A0/A2 C2b gate. A mismatch is assigned to
+an arithmetic family only when its incoming semantic object is exact, source
+inspection proves identical weights and metadata, and the narrow cumulative
+substitution repairs the mismatching natural stage. Existing F16 projection
+sites concentrate in `FAMILY_F16_BATCH_EXT_VS_SINGLE_MV`; exact sites do not
+create a family.
+
+Run on the real M4 Max:
+
+```sh
+DS4_FIRST_DIVERGENCE=1 \
+DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB,ATTN-RAW \
+DS4_CP4_TO_CP5_SWEEP=1 \
+DS4_DSPARK_SCHEDULER=0 \
+./ds4 --dspark --dspark-confidence 0 \
+  -m ./ds4flash.gguf \
+  --mtp ./gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --tokens 16 --temp 0 --nothink \
+  -p 'Explain Redis in one sentence.' \
+  >canonical-sweep-cp4-to-cp5.log 2>&1
+```
+
+Inspect the proof-bearing lines:
+
+```sh
+grep -E '^(C2B_|CP4_TO_CP5_|stage=|EARLIEST_RUNTIME_DIVERGENCE|NEW_SOURCE_AB|DRIFT_SOURCE|CAUSAL_SUBSTITUTION|ARITHMETIC_FAMILY_TABLE|family=|sites_tested=|FIRST_DIVERGENCE)' \
+  canonical-sweep-cp4-to-cp5.log
+```
+
+The hard natural-comparison boundary inside this interval is the compound
+shared-down/HC epilogue. If `routed_out` is exact and `layer_output` still
+mismatches, further localization stops rather than manufacturing a shared
+contribution or splitting the fused sequential producer.
 
 ## CP2-KV-P producer pair
 
