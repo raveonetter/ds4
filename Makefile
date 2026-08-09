@@ -25,7 +25,7 @@ DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o first_divergence_capture.o ds4_float_compare.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o
+CORE_OBJS = ds4.o family_repair.o first_divergence_capture.o ds4_float_compare.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
@@ -51,7 +51,7 @@ NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NA
 # Vendored llama.cpp mmq prefill tier (cuda/mmq/, see cuda/mmq/VENDOR.md).
 MMQ_INCLUDES := -Icuda/mmq
 MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
-CORE_OBJS = ds4.o first_divergence_capture.o ds4_float_compare.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
+CORE_OBJS = ds4.o family_repair.o first_divergence_capture.o ds4_float_compare.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
@@ -63,7 +63,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-float-compare test-first-divergence test-metal-f32-inline-copy test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-float-compare test-first-divergence test-family-repair-contracts test-metal-f32-inline-copy test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -214,6 +214,9 @@ endif
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_float_compare.h first_divergence_capture.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
+family_repair.o: family_repair.c family_repair.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 first_divergence_capture.o: first_divergence_capture.c first_divergence_capture.h ds4_float_compare.h
 	$(CC) $(FLOAT_COMPARE_CFLAGS) -c -o $@ $<
 
@@ -225,6 +228,15 @@ tests/test_first_divergence: tests/test_first_divergence.o first_divergence_capt
 
 test-first-divergence: tests/test_first_divergence
 	./tests/test_first_divergence
+
+tests/test_family_repair_contracts.o: tests/test_family_repair_contracts.c family_repair.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_family_repair_contracts: tests/test_family_repair_contracts.o family_repair.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test-family-repair-contracts: tests/test_family_repair_contracts
+	./tests/test_family_repair_contracts
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
@@ -441,9 +453,10 @@ else
 endif
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
-	tests/test_first_divergence tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
+	tests/test_first_divergence tests/test_family_repair_contracts tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	$(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./tests/test_first_divergence
+	./tests/test_family_repair_contracts
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
@@ -505,4 +518,4 @@ test-float-compare: tests/test_float_compare
 	./tests/test_float_compare
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_float_compare tests/test_first_divergence tests/test_metal_f32_inline_copy tests/test_mxfp4_metal tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_float_compare tests/test_first_divergence tests/test_family_repair_contracts tests/test_metal_f32_inline_copy tests/test_mxfp4_metal tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
