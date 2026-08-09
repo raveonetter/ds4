@@ -50793,7 +50793,8 @@ static bool ds4_c2b_compare_f32(const char *comparison,
                                 const float *expected,
                                 size_t values) {
     ds4_float_compare_result r;
-    const bool exact = ds4_float_compare_exact(actual, expected, values, &r);
+    const bool exact =
+        ds4_float_compare_exact(actual, expected, values, &r) && r.bit_exact;
     if (!exact) ds4_c2b_report_f32(comparison, object, layer, row, &r);
     return exact;
 }
@@ -51160,7 +51161,8 @@ static bool ds4_fd_compare_f32_tensor(
         return false;
     }
     ds4_float_compare_result result;
-    const bool exact = ds4_float_compare_exact(a, e, values, &result);
+    const bool exact =
+        ds4_float_compare_exact(a, e, values, &result) && result.bit_exact;
     if (exact) {
         fprintf(stderr,
                 "CHECKPOINT row=%u layer=%u checkpoint=%s object=%s "
@@ -51495,7 +51497,8 @@ static ds4_e2_ab_result ds4_e2_compare_f32(
     if (out.read_ok) {
         memcpy(&out.first_actual, a, sizeof(out.first_actual));
         memcpy(&out.first_expected, e, sizeof(out.first_expected));
-        out.exact = ds4_float_compare_exact(a, e, values, &out.detail);
+        out.exact = ds4_float_compare_exact(a, e, values, &out.detail) &&
+                    out.detail.bit_exact;
     }
     free(a);
     free(e);
