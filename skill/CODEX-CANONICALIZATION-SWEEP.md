@@ -476,6 +476,61 @@ output of `hc_attn_pre_split`, and the producer interval is
 `CP4-HEADS → hc_attn_pre_split`. If all four inputs are exact while
 `after_attn_hc` differs, the adjudication is `REOPEN_CP4_TAIL`.
 
+## HC attention pre-split isolated A/B and causal substitution
+
+`hc_attn_pre_split` executes before Q/KV and attention. `CP4-HEADS` is a
+downstream canonical-prefix control, not an operand of this producer. The
+actual layer-0 fixture is the bitwise-exact `cur_hc` row plus the shared
+`hc_attn_fn`, `hc_attn_scale`, `hc_attn_base`, and `attn_norm` tensors.
+
+| Path | Projection | Split producer |
+| --- | --- | --- |
+| generic | multi-row plain RMSNorm + multi-row F16 matmul | `kernel_dsv4_hc_split_weighted_sum_norm4` |
+| sequential | single-row plain RMSNorm + F16 single MV | `kernel_dsv4_hc_split_weighted_sum_norm4` |
+
+The projection weight is F16, so the site is not pre-classified as the Q8_0
+family. The experiment also snapshots `hc_mix`: if it already differs, the
+split outputs inherit projection drift; if it is exact while `post/comb`
+differ, the shared split kernel's row-count behavior is the next candidate.
+
+The isolated A/B first replays the generic producer from the captured runtime
+input and requires its `hc_mix` and full `hc_split` to match real Pass A
+bitwise. It then runs the sequential producer on a row-0 view of the same GPU
+allocation. Only when both `post` and `comb` reproduce the mismatch does the
+diagnostic restore S0 and rerun Pass A with this producer alone replaced by
+rowwise ordinary-decode arithmetic.
+
+```sh
+DS4_FIRST_DIVERGENCE=1 \
+DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB,ATTN-RAW \
+DS4_HC_ATTN_PRE_SPLIT_AB=1 \
+DS4_DSPARK_SCHEDULER=0 \
+./ds4 --dspark --dspark-confidence 0 \
+  -m ./ds4flash.gguf \
+  --mtp ./gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --tokens 16 --temp 0 --nothink \
+  -p 'Explain Redis in one sentence.' \
+  >canonical-sweep-hc-attn-pre-split-ab.log 2>&1
+```
+
+Required isolated output:
+
+```text
+HC_ATTN_PRE_SPLIT_SOURCE_AUDIT ... candidate_family=UNCLASSIFIED evidence=PROVEN_BY_SOURCE
+HC_ATTN_PRE_SPLIT_AB input_bits_equal=PASS weights_same=PASS metadata_same=PASS post=MISMATCH comb=MISMATCH
+```
+
+The causal substitution passes only if every closure object is exact:
+
+```text
+HC_ATTN_PRE_SPLIT_CAUSAL_SUBSTITUTION cp4_heads=EXACT cur_hc=EXACT hc_mix=EXACT post=EXACT comb=EXACT after_attn_hc=EXACT result=PASS
+HC_ATTN_PRE_SPLIT_ADJUDICATION result=CAUSAL_CLOSURE first_divergence_beyond_cp4=YES family=UNCLASSIFIED
+```
+
+The authoritative Pass B remains unchanged. Its operand snapshots come from a
+restored shadow Pass B that must first pass
+`PASSB_PREFIX_INPUT_PROBE_CONTROL result=EXACT` against authoritative CP4.
+
 ## Isolated CP4 tail A/B
 
 No additional first-divergence checkpoint is introduced between `CP4-HEADS`

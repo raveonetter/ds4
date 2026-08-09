@@ -796,6 +796,36 @@ bool ds4_first_divergence_emit_cp4_prefix_input_summary(
     return ferror(stream) == 0;
 }
 
+bool ds4_first_divergence_emit_hc_attn_pre_split_causal_summary(
+        FILE *stream,
+        bool cp4_heads_exact,
+        bool cur_hc_exact,
+        bool hc_mix_exact,
+        bool post_exact,
+        bool comb_exact,
+        bool after_attn_hc_exact) {
+    if (!stream) return false;
+    const bool exact = cp4_heads_exact && cur_hc_exact && hc_mix_exact &&
+        post_exact && comb_exact && after_attn_hc_exact;
+    fprintf(stream,
+            "HC_ATTN_PRE_SPLIT_CAUSAL_SUBSTITUTION "
+            "cp4_heads=%s cur_hc=%s hc_mix=%s post=%s comb=%s "
+            "after_attn_hc=%s result=%s\n",
+            cp4_heads_exact ? "EXACT" : "MISMATCH",
+            cur_hc_exact ? "EXACT" : "MISMATCH",
+            hc_mix_exact ? "EXACT" : "MISMATCH",
+            post_exact ? "EXACT" : "MISMATCH",
+            comb_exact ? "EXACT" : "MISMATCH",
+            after_attn_hc_exact ? "EXACT" : "MISMATCH",
+            exact ? "PASS" : "FAIL");
+    fprintf(stream,
+            "HC_ATTN_PRE_SPLIT_ADJUDICATION result=%s "
+            "first_divergence_beyond_cp4=%s family=UNCLASSIFIED\n",
+            exact ? "CAUSAL_CLOSURE" : "RESIDUAL_REMAINS",
+            exact ? "YES" : "NO");
+    return ferror(stream) == 0;
+}
+
 bool ds4_first_divergence_emit_report(
         const ds4_first_divergence_capture *pass_a,
         const ds4_first_divergence_capture *pass_b,

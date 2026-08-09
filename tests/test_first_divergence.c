@@ -378,6 +378,34 @@ int main(void) {
                    "CP4_PREFIX_ADJUDICATION result=EXACT_THROUGH_CP4 reopen_cp4_tail=NO") != NULL);
     REQUIRE(fclose(q_log) == 0);
 
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_hc_attn_pre_split_causal_summary(
+        q_log, true, true, true, true, true, true));
+    REQUIRE(fflush(q_log) == 0);
+    REQUIRE(fseek(q_log, 0, SEEK_SET) == 0);
+    q_log_bytes = fread(q_log_text, 1, sizeof(q_log_text) - 1, q_log);
+    q_log_text[q_log_bytes] = '\0';
+    REQUIRE(strstr(q_log_text,
+                   "HC_ATTN_PRE_SPLIT_CAUSAL_SUBSTITUTION cp4_heads=EXACT cur_hc=EXACT hc_mix=EXACT post=EXACT comb=EXACT after_attn_hc=EXACT result=PASS") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "HC_ATTN_PRE_SPLIT_ADJUDICATION result=CAUSAL_CLOSURE first_divergence_beyond_cp4=YES family=UNCLASSIFIED") != NULL);
+    REQUIRE(fclose(q_log) == 0);
+
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_hc_attn_pre_split_causal_summary(
+        q_log, true, true, true, true, false, false));
+    REQUIRE(fflush(q_log) == 0);
+    REQUIRE(fseek(q_log, 0, SEEK_SET) == 0);
+    q_log_bytes = fread(q_log_text, 1, sizeof(q_log_text) - 1, q_log);
+    q_log_text[q_log_bytes] = '\0';
+    REQUIRE(strstr(q_log_text,
+                   "comb=MISMATCH after_attn_hc=MISMATCH result=FAIL") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "HC_ATTN_PRE_SPLIT_ADJUDICATION result=RESIDUAL_REMAINS first_divergence_beyond_cp4=NO family=UNCLASSIFIED") != NULL);
+    REQUIRE(fclose(q_log) == 0);
+
     puts("first-divergence forced pair: OK");
     return 0;
 }

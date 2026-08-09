@@ -174,6 +174,15 @@ bool ds4_first_divergence_emit_cp4_prefix_input_summary(
         bool comb_exact,
         bool after_attn_hc_exact);
 
+bool ds4_first_divergence_emit_hc_attn_pre_split_causal_summary(
+        FILE *stream,
+        bool cp4_heads_exact,
+        bool cur_hc_exact,
+        bool hc_mix_exact,
+        bool post_exact,
+        bool comb_exact,
+        bool after_attn_hc_exact);
+
 bool ds4_first_divergence_float_signature_compute(
         const float *actual,
         const float *expected,

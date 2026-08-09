@@ -15298,6 +15298,9 @@ typedef struct {
     /* Inputs for the isolated CP4 tail A/B.  These are copied alongside the
      * existing CP4 capture and are not registered as online checkpoints. */
     ds4_gpu_tensor *cp4_tail_cur_hc[DS4_MAX_LAYER];
+    /* Actual hc_attn_pre_split projection output.  The 24-value rows are
+     * diagnostic fixtures for the narrow producer A/B, not checkpoints. */
+    ds4_gpu_tensor *hc_attn_pre_mix[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp4_tail_hc_split[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp5[DS4_MAX_LAYER];
     uint32_t cp3_n_comp[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
@@ -15326,6 +15329,7 @@ enum {
     DS4_FIRST_DIVERGENCE_CANON_QB = 1u << 2,
     DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW = 1u << 3,
     DS4_FIRST_DIVERGENCE_CANON_CP4_TAIL = 1u << 4,
+    DS4_FIRST_DIVERGENCE_CANON_HC_ATTN_PRE_SPLIT = 1u << 5,
 };
 static uint32_t g_ds4_first_divergence_canonical_mask;
 
@@ -25620,6 +25624,94 @@ static bool metal_graph_attention_output_hc_canonical_rows(
     return ok;
 }
 
+/* Diagnostic-only rowwise reconstruction of the ordinary HC attention
+ * pre-sublayer.  Each verifier row uses the exact decode ordering:
+ *
+ *   RMSNorm(cur_hc) -> F16 hc_attn_fn MV -> fused split/sum/RMSNorm.
+ *
+ * The production batch path remains untouched while the canonical mask bit is
+ * clear.  No tensor is read back or recomputed outside this producer. */
+static bool metal_graph_hc_attn_pre_canonical_rows(
+        ds4_gpu_tensor       *attn_cur,
+        ds4_gpu_tensor       *attn_norm,
+        ds4_gpu_tensor       *hc_mix,
+        ds4_gpu_tensor       *hc_split,
+        ds4_gpu_tensor       *flat_hc,
+        const ds4_gpu_tensor *cur_hc,
+        const ds4_model      *model,
+        const ds4_layer_weights *layer,
+        uint32_t              rows) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc =
+        2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    if (!attn_cur || !attn_norm || !hc_mix || !hc_split || !flat_hc ||
+        !cur_hc || !model || !layer || !layer->hc_attn_fn ||
+        !layer->hc_attn_scale || !layer->hc_attn_base ||
+        !layer->attn_norm || rows == 0 || hc_dim > UINT32_MAX ||
+        ds4_gpu_tensor_bytes(attn_cur) <
+            (uint64_t)rows * DS4_N_EMBD * sizeof(float) ||
+        ds4_gpu_tensor_bytes(attn_norm) <
+            (uint64_t)rows * DS4_N_EMBD * sizeof(float) ||
+        ds4_gpu_tensor_bytes(hc_mix) <
+            (uint64_t)rows * mix_hc * sizeof(float) ||
+        ds4_gpu_tensor_bytes(hc_split) <
+            (uint64_t)rows * mix_hc * sizeof(float) ||
+        ds4_gpu_tensor_bytes(flat_hc) <
+            (uint64_t)rows * hc_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(cur_hc) <
+            (uint64_t)rows * hc_dim * sizeof(float)) {
+        return false;
+    }
+
+    bool ok = true;
+    for (uint32_t row = 0; ok && row < rows; row++) {
+        ds4_gpu_tensor *cur_row = ds4_gpu_tensor_view(
+            cur_hc, (uint64_t)row * hc_dim * sizeof(float),
+            hc_dim * sizeof(float));
+        ds4_gpu_tensor *flat_row = ds4_gpu_tensor_view(
+            flat_hc, (uint64_t)row * hc_dim * sizeof(float),
+            hc_dim * sizeof(float));
+        ds4_gpu_tensor *mix_row = ds4_gpu_tensor_view(
+            hc_mix, (uint64_t)row * mix_hc * sizeof(float),
+            mix_hc * sizeof(float));
+        ds4_gpu_tensor *split_row = ds4_gpu_tensor_view(
+            hc_split, (uint64_t)row * mix_hc * sizeof(float),
+            mix_hc * sizeof(float));
+        ds4_gpu_tensor *attn_row = ds4_gpu_tensor_view(
+            attn_cur, (uint64_t)row * DS4_N_EMBD * sizeof(float),
+            (uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor *norm_row = ds4_gpu_tensor_view(
+            attn_norm, (uint64_t)row * DS4_N_EMBD * sizeof(float),
+            (uint64_t)DS4_N_EMBD * sizeof(float));
+        ok = cur_row && flat_row && mix_row && split_row && attn_row &&
+             norm_row &&
+             ds4_gpu_rms_norm_plain_tensor(
+                 flat_row, cur_row, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+        if (ok) {
+            ok = metal_graph_matmul_plain_tensor(
+                mix_row, model, layer->hc_attn_fn,
+                hc_dim, mix_hc, flat_row, 1);
+        }
+        if (ok) {
+            ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(
+                attn_row, norm_row, split_row, mix_row, cur_row,
+                model->map, model->size,
+                layer->hc_attn_scale->abs_offset,
+                layer->hc_attn_base->abs_offset,
+                layer->attn_norm->abs_offset,
+                DS4_N_EMBD, DS4_N_HC, DS4_N_HC_SINKHORN_ITER,
+                DS4_HC_EPS, DS4_RMS_EPS) != 0;
+        }
+        ds4_gpu_tensor_free(norm_row);
+        ds4_gpu_tensor_free(attn_row);
+        ds4_gpu_tensor_free(split_row);
+        ds4_gpu_tensor_free(mix_row);
+        ds4_gpu_tensor_free(flat_row);
+        ds4_gpu_tensor_free(cur_row);
+    }
+    return ok;
+}
+
 static bool metal_graph_matmul_named_or_canonical_rows(
         uint32_t                canonical_bit,
         const char             *name,
@@ -27518,14 +27610,24 @@ static bool metal_graph_encode_layer_attention_batch(
                               DS4_N_HC == 4 &&
                               !metal_graph_use_reference_hc_decode() &&
                               metal_graph_enable_batch_hc_norm_fusion();
-    if (ok) ok = metal_graph_hc_rms_scale_project(hc_mix_view,
-                                                    metal_graph_batch_flat_hc(g),
-                                                    model,
-                                                    layer->hc_attn_fn,
-                                                    metal_graph_batch_cur_hc(g),
-                                                    hc_dim,
-                                                    n_tokens);
-    if (metal_graph_use_reference_hc_decode()) {
+    const bool canonical_hc_attn_pre =
+        ds4_first_divergence_canonical_enabled(
+            DS4_FIRST_DIVERGENCE_CANON_HC_ATTN_PRE_SPLIT);
+    if (ok && canonical_hc_attn_pre) {
+        ok = metal_graph_hc_attn_pre_canonical_rows(
+            attn_cur_view, metal_graph_batch_attn_norm(g),
+            hc_mix_view, hc_split_view, metal_graph_batch_flat_hc(g),
+            metal_graph_batch_cur_hc(g), model, layer, n_tokens);
+    } else if (ok) {
+        ok = metal_graph_hc_rms_scale_project(hc_mix_view,
+                                               metal_graph_batch_flat_hc(g),
+                                               model,
+                                               layer->hc_attn_fn,
+                                               metal_graph_batch_cur_hc(g),
+                                               hc_dim,
+                                               n_tokens);
+    }
+    if (!canonical_hc_attn_pre && metal_graph_use_reference_hc_decode()) {
         if (ok) ok = ds4_gpu_hc_split_sinkhorn_tensor(hc_split_view,
                                                         hc_mix_view,
                                                         model->map,
@@ -27540,7 +27642,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             hc_split_view,
                                                             DS4_N_EMBD,
                                                             DS4_N_HC) != 0;
-    } else if (fuse_hc_norm) {
+    } else if (!canonical_hc_attn_pre && fuse_hc_norm) {
         if (ok) ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(attn_cur_view,
                                                                  metal_graph_batch_attn_norm(g),
                                                                  hc_split_view,
@@ -27556,7 +27658,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                  DS4_N_HC_SINKHORN_ITER,
                                                                  DS4_HC_EPS,
                                                                  DS4_RMS_EPS) != 0;
-    } else {
+    } else if (!canonical_hc_attn_pre) {
         if (ok) ok = ds4_gpu_hc_split_weighted_sum_tensor(attn_cur_view,
                                                             hc_split_view,
                                                             hc_mix_view,
@@ -27575,7 +27677,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("hc_pre");
-    if (ok && !fuse_hc_norm) {
+    if (ok && !canonical_hc_attn_pre && !fuse_hc_norm) {
         ok = ds4_gpu_rms_norm_weight_rows_tensor(metal_graph_batch_attn_norm(g),
                                                   metal_graph_batch_attn_cur(g),
                                                   model->map,
@@ -29880,7 +29982,7 @@ static bool ds4_c45_capture_cp4_tail_inputs(ds4_gpu_graph *g,
     if (!c || !g_ds4_c45_capture_tail_inputs) return true;
     if (c->graph != g || il >= DS4_N_LAYER || pos < c->start ||
         pos - c->start >= c->n_tokens || !c->cp4_tail_cur_hc[il] ||
-        !c->cp4_tail_hc_split[il]) {
+        !c->hc_attn_pre_mix[il] || !c->cp4_tail_hc_split[il]) {
         return false;
     }
     const uint32_t row = pos - c->start;
@@ -29893,6 +29995,9 @@ static bool ds4_c45_capture_cp4_tail_inputs(ds4_gpu_graph *g,
         ds4_c2b_inline_copy(c->cp4_tail_cur_hc[il],
                             (uint64_t)row * hc_row_bytes,
                             metal_graph_cur_hc(g), 0, hc_row_bytes) &&
+        ds4_c2b_inline_copy(c->hc_attn_pre_mix[il],
+                            (uint64_t)row * split_row_bytes,
+                            metal_graph_hc_mix(g), 0, split_row_bytes) &&
         ds4_c2b_inline_copy(c->cp4_tail_hc_split[il],
                             (uint64_t)row * split_row_bytes,
                             metal_graph_hc_split(g), 0, split_row_bytes);
@@ -29958,6 +30063,8 @@ static bool ds4_c2b_capture_attention(ds4_gpu_graph *g,
                             metal_graph_batch_heads(g), 0, q_out_bytes) &&
         ds4_c2b_inline_copy(c->cp4_tail_cur_hc[il], 0,
                             metal_graph_batch_cur_hc(g), 0, hc_bytes) &&
+        ds4_c2b_inline_copy(c->hc_attn_pre_mix[il], 0,
+                            metal_graph_batch_hc_mix(g), 0, split_bytes) &&
         ds4_c2b_inline_copy(c->cp4_tail_hc_split[il], 0,
                             metal_graph_batch_hc_split(g), 0, split_bytes) &&
         ds4_c2b_inline_copy(c->cp4[il], 0,
@@ -50691,6 +50798,7 @@ static void ds4_c2b_capture_free(ds4_c2b_capture *c) {
         DS4_C2B_FREE(cp4_heads_raw);
         DS4_C2B_FREE(cp4_heads);
         DS4_C2B_FREE(cp4_tail_cur_hc);
+        DS4_C2B_FREE(hc_attn_pre_mix);
         DS4_C2B_FREE(cp4_tail_hc_split);
         DS4_C2B_FREE(cp5);
 #undef DS4_C2B_FREE
@@ -50727,11 +50835,12 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
             !metal_graph_batch_attn_norm(g) || !metal_graph_batch_qr(g) ||
             !metal_graph_batch_kv_raw(g) || !metal_graph_batch_qr_norm(g) ||
             !metal_graph_batch_q(g) || !metal_graph_batch_heads(g) ||
+            !metal_graph_batch_hc_mix(g) ||
             !metal_graph_batch_after_attn_hc(g) ||
             !metal_graph_batch_next_hc(g) || !metal_graph_attn_norm(g) ||
             !metal_graph_qr(g) || !metal_graph_kv_raw(g) ||
             !metal_graph_qr_norm(g) || !metal_graph_q(g) ||
-            !metal_graph_heads(g) ||
+            !metal_graph_heads(g) || !metal_graph_hc_mix(g) ||
             !metal_graph_after_attn_hc(g) ||
             !metal_graph_after_ffn_hc(g)) {
             ds4_c2b_capture_free(c);
@@ -50755,6 +50864,7 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
             ds4_gpu_tensor_bytes(metal_graph_batch_q(g)) < q_out_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_heads(g)) < q_out_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_cur_hc(g)) < hc_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_hc_mix(g)) < split_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_hc_split(g)) < split_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_after_attn_hc(g)) < hc_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_next_hc(g)) < hc_bytes ||
@@ -50768,6 +50878,7 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
                 c->q_out_values[il] * sizeof(float) ||
             ds4_gpu_tensor_bytes(metal_graph_heads(g)) <
                 c->q_out_values[il] * sizeof(float) ||
+            ds4_gpu_tensor_bytes(metal_graph_hc_mix(g)) < split_bytes / n_tokens ||
             ds4_gpu_tensor_bytes(metal_graph_kv_raw(g)) < kv_bytes / n_tokens ||
             ds4_gpu_tensor_bytes(metal_graph_after_attn_hc(g)) <
                 (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float) ||
@@ -50786,12 +50897,14 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
         c->cp4_heads_raw[il] = ds4_gpu_tensor_alloc(q_out_bytes);
         c->cp4_heads[il] = ds4_gpu_tensor_alloc(q_out_bytes);
         c->cp4_tail_cur_hc[il] = ds4_gpu_tensor_alloc(hc_bytes);
+        c->hc_attn_pre_mix[il] = ds4_gpu_tensor_alloc(split_bytes);
         c->cp4_tail_hc_split[il] = ds4_gpu_tensor_alloc(split_bytes);
         c->cp5[il] = ds4_gpu_tensor_alloc(hc_bytes);
         if (!c->cp1[il] || !c->cp2_q[il] || !c->cp2_kv_p[il] ||
             !c->cp2_q_norm[il] || !c->cp2_q_cur[il] ||
             !c->cp2_kv_r[il] || !c->cp4_heads_raw[il] ||
             !c->cp4_heads[il] || !c->cp4_tail_cur_hc[il] ||
+            !c->hc_attn_pre_mix[il] ||
             !c->cp4_tail_hc_split[il] ||
             !c->cp4[il] || !c->cp5[il]) {
             ds4_c2b_capture_free(c);
@@ -52006,6 +52119,318 @@ typedef struct {
     bool executed;
     bool input_bits_equal;
     bool weights_same;
+    bool metadata_same;
+    bool generic_replay_exact;
+    bool reproduced_post_comb_mismatch;
+    ds4_float_compare_result mix_comparison;
+    ds4_float_compare_result pre_comparison;
+    ds4_float_compare_result post_comparison;
+    ds4_float_compare_result comb_comparison;
+} ds4_hc_attn_pre_split_ab_result;
+
+static const char *ds4_exact_word(bool exact) {
+    return exact ? "EXACT" : "MISMATCH";
+}
+
+static void ds4_hc_attn_pre_split_report_output(
+        const char *output,
+        const ds4_float_compare_result *comparison) {
+    fprintf(stderr,
+            "HC_ATTN_PRE_SPLIT_OBJECT output=%s result=%s elements=%zu "
+            "mismatch_count=%zu",
+            output, ds4_exact_word(comparison->bit_exact),
+            comparison->length, comparison->mismatch_count);
+    if (comparison->bit_exact) {
+        fputs(" first_index=none generic_bits=none sequential_bits=none\n",
+              stderr);
+    } else {
+        fprintf(stderr,
+                " first_index=%zu generic_bits=0x%08" PRIx32
+                " sequential_bits=0x%08" PRIx32 "\n",
+                comparison->first_mismatch_index,
+                comparison->first_actual_bits,
+                comparison->first_expected_bits);
+    }
+}
+
+/* Isolate the real layer-0 hc_attn_pre_split producer on the canonical-prefix
+ * Pass-A cur_hc bits.  CP4-HEADS is a downstream prefix control and is not an
+ * operand of this producer.  Generic keeps the verifier row count; sequential
+ * uses the exact one-row RMSNorm -> F16 MV -> fused split/sum/norm topology.
+ * The shared model mapping and parameter offsets are used by both calls. */
+static bool ds4_hc_attn_pre_split_ab_run(
+        ds4_session *s,
+        const ds4_c2b_capture *capture,
+        ds4_hc_attn_pre_split_ab_result *result) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc =
+        2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t hc_row_bytes = hc_dim * sizeof(float);
+    const uint64_t mix_row_bytes = mix_hc * sizeof(float);
+    const uint64_t attn_row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    ds4_gpu_tensor *generic_flat = NULL;
+    ds4_gpu_tensor *generic_mix = NULL;
+    ds4_gpu_tensor *generic_split = NULL;
+    ds4_gpu_tensor *generic_attn = NULL;
+    ds4_gpu_tensor *generic_norm = NULL;
+    ds4_gpu_tensor *sequential_input = NULL;
+    ds4_gpu_tensor *sequential_flat = NULL;
+    ds4_gpu_tensor *sequential_mix = NULL;
+    ds4_gpu_tensor *sequential_split = NULL;
+    ds4_gpu_tensor *sequential_attn = NULL;
+    ds4_gpu_tensor *sequential_norm = NULL;
+    float *generic_input_cpu = NULL;
+    float *sequential_input_cpu = NULL;
+    float generic_mix_cpu[2u * DS4_N_HC + DS4_N_HC * DS4_N_HC];
+    float sequential_mix_cpu[2u * DS4_N_HC + DS4_N_HC * DS4_N_HC];
+    float generic_split_cpu[2u * DS4_N_HC + DS4_N_HC * DS4_N_HC];
+    float sequential_split_cpu[2u * DS4_N_HC + DS4_N_HC * DS4_N_HC];
+    float runtime_mix_cpu[2u * DS4_N_HC + DS4_N_HC * DS4_N_HC];
+    float runtime_split_cpu[2u * DS4_N_HC + DS4_N_HC * DS4_N_HC];
+    ds4_float_compare_result input_comparison;
+    ds4_float_compare_result mix_replay;
+    ds4_float_compare_result split_replay;
+    bool ok = false;
+
+    if (!result) return false;
+    memset(result, 0, sizeof(*result));
+    if (!s || !capture || capture->graph != &s->graph ||
+        capture->n_tokens < 2u || !capture->cp4_tail_cur_hc[0] ||
+        !capture->hc_attn_pre_mix[0] || !capture->cp4_tail_hc_split[0] ||
+        hc_dim > UINT32_MAX) {
+        fputs("HC_ATTN_PRE_SPLIT_AB input_bits_equal=FAIL weights_same=FAIL "
+              "post=ERROR comb=ERROR reason=invalid_real_shape_fixture\n",
+              stderr);
+        return false;
+    }
+
+    const ds4_layer_weights *layer = &s->engine->weights.layer[0];
+    const ds4_tensor *fn = layer->hc_attn_fn;
+    const ds4_tensor *scale = layer->hc_attn_scale;
+    const ds4_tensor *base = layer->hc_attn_base;
+    const ds4_tensor *norm = layer->attn_norm;
+    result->weights_same = fn && scale && base && norm &&
+        fn->type == DS4_TENSOR_F16 && fn->ndim == 2 &&
+        fn->dim[0] == hc_dim && fn->dim[1] == mix_hc &&
+        scale->type == DS4_TENSOR_F32 && scale->ndim == 1 &&
+        scale->dim[0] == 3u &&
+        base->type == DS4_TENSOR_F32 && base->ndim == 1 &&
+        base->dim[0] == mix_hc &&
+        norm->type == DS4_TENSOR_F32 && norm->ndim == 1 &&
+        norm->dim[0] == DS4_N_EMBD;
+    result->metadata_same = result->weights_same &&
+        s->engine->model.map &&
+        fn->abs_offset <= s->engine->model.size &&
+        hc_dim * mix_hc * sizeof(uint16_t) <=
+            s->engine->model.size - fn->abs_offset &&
+        scale->abs_offset <= s->engine->model.size &&
+        3u * sizeof(float) <=
+            s->engine->model.size - scale->abs_offset &&
+        base->abs_offset <= s->engine->model.size &&
+        mix_hc * sizeof(float) <=
+            s->engine->model.size - base->abs_offset &&
+        norm->abs_offset <= s->engine->model.size &&
+        (uint64_t)DS4_N_EMBD * sizeof(float) <=
+            s->engine->model.size - norm->abs_offset;
+    fprintf(stderr,
+            "HC_ATTN_PRE_SPLIT_SOURCE_AUDIT "
+            "actual_input=cur_hc cp4_heads_role=downstream_prefix_control "
+            "generic_projection=rms_norm_plain_rows+matmul_f16_rows "
+            "sequential_projection=rms_norm_plain_single+matmul_f16_single_mv "
+            "split_kernel=kernel_dsv4_hc_split_weighted_sum_norm4_shared "
+            "projection_weight_type=F16 candidate_family=UNCLASSIFIED "
+            "evidence=PROVEN_BY_SOURCE\n");
+    if (!result->weights_same || !result->metadata_same ||
+        ds4_gpu_tensor_bytes(capture->cp4_tail_cur_hc[0]) <
+            (uint64_t)capture->n_tokens * hc_row_bytes ||
+        ds4_gpu_tensor_bytes(capture->hc_attn_pre_mix[0]) <
+            (uint64_t)capture->n_tokens * mix_row_bytes ||
+        ds4_gpu_tensor_bytes(capture->cp4_tail_hc_split[0]) <
+            (uint64_t)capture->n_tokens * mix_row_bytes) {
+        fputs("HC_ATTN_PRE_SPLIT_AB input_bits_equal=FAIL weights_same=FAIL "
+              "post=ERROR comb=ERROR reason=weight_or_layout\n", stderr);
+        return false;
+    }
+
+    const uint64_t rows = capture->n_tokens;
+    sequential_input = ds4_gpu_tensor_view(
+        capture->cp4_tail_cur_hc[0], 0, hc_row_bytes);
+    generic_flat = ds4_gpu_tensor_alloc(rows * hc_row_bytes);
+    generic_mix = ds4_gpu_tensor_alloc(rows * mix_row_bytes);
+    generic_split = ds4_gpu_tensor_alloc(rows * mix_row_bytes);
+    generic_attn = ds4_gpu_tensor_alloc(rows * attn_row_bytes);
+    generic_norm = ds4_gpu_tensor_alloc(rows * attn_row_bytes);
+    sequential_flat = ds4_gpu_tensor_alloc(hc_row_bytes);
+    sequential_mix = ds4_gpu_tensor_alloc(mix_row_bytes);
+    sequential_split = ds4_gpu_tensor_alloc(mix_row_bytes);
+    sequential_attn = ds4_gpu_tensor_alloc(attn_row_bytes);
+    sequential_norm = ds4_gpu_tensor_alloc(attn_row_bytes);
+    if (!sequential_input || !generic_flat || !generic_mix ||
+        !generic_split || !generic_attn || !generic_norm ||
+        !sequential_flat || !sequential_mix || !sequential_split ||
+        !sequential_attn || !sequential_norm) {
+        goto done;
+    }
+
+    generic_input_cpu = xmalloc((size_t)hc_row_bytes);
+    sequential_input_cpu = xmalloc((size_t)hc_row_bytes);
+    if (!ds4_gpu_tensor_read(capture->cp4_tail_cur_hc[0], 0,
+                             generic_input_cpu, hc_row_bytes) ||
+        !ds4_gpu_tensor_read(sequential_input, 0,
+                             sequential_input_cpu, hc_row_bytes) ||
+        !ds4_float_compare_exact(generic_input_cpu, sequential_input_cpu,
+                                 (size_t)hc_dim, &input_comparison)) {
+        goto done;
+    }
+    result->input_bits_equal = input_comparison.bit_exact;
+    if (!result->input_bits_equal) goto done;
+
+    ok = ds4_gpu_begin_commands() != 0;
+    if (ok) {
+        ok = metal_graph_hc_rms_scale_project(
+            generic_mix, generic_flat, &s->engine->model, fn,
+            capture->cp4_tail_cur_hc[0], hc_dim, capture->n_tokens);
+    }
+    if (ok) {
+        ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(
+            generic_attn, generic_norm, generic_split, generic_mix,
+            capture->cp4_tail_cur_hc[0],
+            s->engine->model.map, s->engine->model.size,
+            scale->abs_offset, base->abs_offset, norm->abs_offset,
+            DS4_N_EMBD, DS4_N_HC, DS4_N_HC_SINKHORN_ITER,
+            DS4_HC_EPS, DS4_RMS_EPS) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_rms_norm_plain_tensor(
+            sequential_flat, sequential_input,
+            (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+    }
+    if (ok) {
+        ok = metal_graph_matmul_plain_tensor(
+            sequential_mix, &s->engine->model, fn,
+            hc_dim, mix_hc, sequential_flat, 1);
+    }
+    if (ok) {
+        ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(
+            sequential_attn, sequential_norm, sequential_split,
+            sequential_mix, sequential_input,
+            s->engine->model.map, s->engine->model.size,
+            scale->abs_offset, base->abs_offset, norm->abs_offset,
+            DS4_N_EMBD, DS4_N_HC, DS4_N_HC_SINKHORN_ITER,
+            DS4_HC_EPS, DS4_RMS_EPS) != 0;
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok ||
+        !ds4_gpu_tensor_read(generic_mix, 0, generic_mix_cpu,
+                             mix_row_bytes) ||
+        !ds4_gpu_tensor_read(sequential_mix, 0, sequential_mix_cpu,
+                             mix_row_bytes) ||
+        !ds4_gpu_tensor_read(generic_split, 0, generic_split_cpu,
+                             mix_row_bytes) ||
+        !ds4_gpu_tensor_read(sequential_split, 0, sequential_split_cpu,
+                             mix_row_bytes) ||
+        !ds4_gpu_tensor_read(capture->hc_attn_pre_mix[0], 0,
+                             runtime_mix_cpu, mix_row_bytes) ||
+        !ds4_gpu_tensor_read(capture->cp4_tail_hc_split[0], 0,
+                             runtime_split_cpu, mix_row_bytes) ||
+        !ds4_float_compare_exact(
+            generic_mix_cpu, sequential_mix_cpu, (size_t)mix_hc,
+            &result->mix_comparison) ||
+        !ds4_float_compare_exact(
+            generic_split_cpu, sequential_split_cpu, DS4_N_HC,
+            &result->pre_comparison) ||
+        !ds4_float_compare_exact(
+            generic_split_cpu + DS4_N_HC,
+            sequential_split_cpu + DS4_N_HC, DS4_N_HC,
+            &result->post_comparison) ||
+        !ds4_float_compare_exact(
+            generic_split_cpu + 2u * DS4_N_HC,
+            sequential_split_cpu + 2u * DS4_N_HC,
+            (size_t)DS4_N_HC * DS4_N_HC,
+            &result->comb_comparison) ||
+        !ds4_float_compare_exact(
+            generic_mix_cpu, runtime_mix_cpu, (size_t)mix_hc,
+            &mix_replay) ||
+        !ds4_float_compare_exact(
+            generic_split_cpu, runtime_split_cpu, (size_t)mix_hc,
+            &split_replay)) {
+        ok = false;
+        goto done;
+    }
+    result->generic_replay_exact =
+        mix_replay.bit_exact && split_replay.bit_exact;
+    result->reproduced_post_comb_mismatch =
+        !result->post_comparison.bit_exact &&
+        !result->comb_comparison.bit_exact;
+    result->executed = true;
+
+done:
+    if (result->executed) {
+        ds4_hc_attn_pre_split_report_output(
+            "post", &result->post_comparison);
+        ds4_hc_attn_pre_split_report_output(
+            "comb", &result->comb_comparison);
+    }
+    fprintf(stderr,
+            "HC_ATTN_PRE_SPLIT_STAGE_AB hc_mix=%s pre=%s post=%s comb=%s "
+            "generic_runtime_replay=%s\n",
+            result->executed
+                ? ds4_exact_word(result->mix_comparison.bit_exact) : "ERROR",
+            result->executed
+                ? ds4_exact_word(result->pre_comparison.bit_exact) : "ERROR",
+            result->executed
+                ? ds4_exact_word(result->post_comparison.bit_exact) : "ERROR",
+            result->executed
+                ? ds4_exact_word(result->comb_comparison.bit_exact) : "ERROR",
+            result->executed
+                ? ds4_exact_word(result->generic_replay_exact) : "ERROR");
+    fprintf(stderr,
+            "HC_ATTN_PRE_SPLIT_AB input_bits_equal=%s weights_same=%s "
+            "metadata_same=%s post=%s comb=%s\n",
+            result->input_bits_equal ? "PASS" : "FAIL",
+            result->weights_same ? "PASS" : "FAIL",
+            result->metadata_same ? "PASS" : "FAIL",
+            result->executed
+                ? ds4_exact_word(result->post_comparison.bit_exact) : "ERROR",
+            result->executed
+                ? ds4_exact_word(result->comb_comparison.bit_exact) : "ERROR");
+    if (result->executed && result->generic_replay_exact &&
+        result->input_bits_equal && result->weights_same &&
+        result->metadata_same) {
+        if (result->reproduced_post_comb_mismatch) {
+            fputs("HC_ATTN_PRE_SPLIT_NUMERICAL_NON_EQUIVALENCE "
+                  "PROVEN_BY_TEST family=UNCLASSIFIED\n", stderr);
+        } else {
+            fputs("HC_ATTN_PRE_SPLIT_RUNTIME_MISMATCH_REPRODUCTION "
+                  "result=NO causal_substitution=SKIPPED\n", stderr);
+        }
+        ok = true;
+    } else {
+        fputs("HC_ATTN_PRE_SPLIT_ISOLATION_INCONCLUSIVE\n", stderr);
+        ok = false;
+    }
+
+    free(sequential_input_cpu);
+    free(generic_input_cpu);
+    ds4_gpu_tensor_free(sequential_norm);
+    ds4_gpu_tensor_free(sequential_attn);
+    ds4_gpu_tensor_free(sequential_split);
+    ds4_gpu_tensor_free(sequential_mix);
+    ds4_gpu_tensor_free(sequential_flat);
+    ds4_gpu_tensor_free(sequential_input);
+    ds4_gpu_tensor_free(generic_norm);
+    ds4_gpu_tensor_free(generic_attn);
+    ds4_gpu_tensor_free(generic_split);
+    ds4_gpu_tensor_free(generic_mix);
+    ds4_gpu_tensor_free(generic_flat);
+    return ok;
+}
+
+typedef struct {
+    bool executed;
+    bool input_bits_equal;
+    bool weights_same;
     bool semantics_preserved;
     bool numerical_non_equivalence;
     ds4_float_compare_result output_comparison;
@@ -52710,6 +53135,67 @@ static bool ds4_cp4_prefix_input_close(
     return ok && heads.bit_exact;
 }
 
+static bool ds4_hc_attn_pre_split_causal_close(
+        const ds4_c2b_capture *pass_a,
+        const ds4_c2b_capture *pass_b,
+        const ds4_c2b_capture *pass_b_probe) {
+    const uint32_t layer = 0;
+    const uint32_t row = 0;
+    const uint64_t heads_values =
+        (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t hc_values = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t split_values =
+        2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t heads_offset =
+        (uint64_t)row * heads_values * sizeof(float);
+    const uint64_t hc_offset = (uint64_t)row * hc_values * sizeof(float);
+    const uint64_t split_offset =
+        (uint64_t)row * split_values * sizeof(float);
+    ds4_float_compare_result heads;
+    ds4_float_compare_result cur_hc;
+    ds4_float_compare_result mix;
+    ds4_float_compare_result post;
+    ds4_float_compare_result comb;
+    ds4_float_compare_result after;
+    const bool ok = pass_a && pass_b && pass_b_probe &&
+        ds4_cp4_prefix_compare_gpu_f32(
+            pass_a->cp4_heads[layer], heads_offset,
+            pass_b_probe->cp4_heads[layer], heads_offset,
+            (size_t)heads_values, &heads) &&
+        ds4_cp4_prefix_compare_gpu_f32(
+            pass_a->cp4_tail_cur_hc[layer], hc_offset,
+            pass_b_probe->cp4_tail_cur_hc[layer], hc_offset,
+            (size_t)hc_values, &cur_hc) &&
+        ds4_cp4_prefix_compare_gpu_f32(
+            pass_a->hc_attn_pre_mix[layer], split_offset,
+            pass_b_probe->hc_attn_pre_mix[layer], split_offset,
+            (size_t)split_values, &mix) &&
+        ds4_cp4_prefix_compare_gpu_f32(
+            pass_a->cp4_tail_hc_split[layer],
+            split_offset + (uint64_t)DS4_N_HC * sizeof(float),
+            pass_b_probe->cp4_tail_hc_split[layer],
+            split_offset + (uint64_t)DS4_N_HC * sizeof(float),
+            DS4_N_HC, &post) &&
+        ds4_cp4_prefix_compare_gpu_f32(
+            pass_a->cp4_tail_hc_split[layer],
+            split_offset + 2ull * DS4_N_HC * sizeof(float),
+            pass_b_probe->cp4_tail_hc_split[layer],
+            split_offset + 2ull * DS4_N_HC * sizeof(float),
+            (size_t)DS4_N_HC * DS4_N_HC, &comb) &&
+        ds4_cp4_prefix_compare_gpu_f32(
+            pass_a->cp4[layer], hc_offset,
+            pass_b->cp4[layer], hc_offset,
+            (size_t)hc_values, &after);
+    if (!ok) {
+        fputs("HC_ATTN_PRE_SPLIT_CAUSAL_SUBSTITUTION result=ERROR "
+              "reason=compare\n", stderr);
+        return false;
+    }
+    return ds4_first_divergence_emit_hc_attn_pre_split_causal_summary(
+               stderr, heads.bit_exact, cur_hc.bit_exact, mix.bit_exact,
+               post.bit_exact, comb.bit_exact, after.bit_exact);
+}
+
 static int ds4_first_divergence_run(ds4_session *s,
                                     const int *drafts,
                                     uint32_t n_tokens,
@@ -52726,6 +53212,7 @@ static int ds4_first_divergence_run(ds4_session *s,
     ds4_qa_primitive_ab_result qa_ab = {0};
     ds4_kv_primitive_ab_result kv_ab = {0};
     ds4_qb_primitive_ab_result qb_ab = {0};
+    ds4_hc_attn_pre_split_ab_result hc_attn_pre_split_ab = {0};
     ds4_cp4_tail_primitive_ab_result cp4_tail_ab = {0};
     int forced_tokens[DS4_DSPARK_MAX_BLOCK_SIZE] = {0};
     uint32_t n_comp_before[DS4_MAX_LAYER] = {0};
@@ -52740,6 +53227,13 @@ static int ds4_first_divergence_run(ds4_session *s,
     const bool cp4_prefix_input_requested =
         cp4_prefix_input_env && cp4_prefix_input_env[0] &&
         strcmp(cp4_prefix_input_env, "0") != 0;
+    const char *hc_attn_pre_split_ab_env =
+        getenv("DS4_HC_ATTN_PRE_SPLIT_AB");
+    const bool hc_attn_pre_split_ab_requested =
+        hc_attn_pre_split_ab_env && hc_attn_pre_split_ab_env[0] &&
+        strcmp(hc_attn_pre_split_ab_env, "0") != 0;
+    const bool prefix_operand_probe_requested =
+        cp4_prefix_input_requested || hc_attn_pre_split_ab_requested;
     bool canonical_config_ok = ds4_first_divergence_parse_canonical_mask(
         canonical_env, &canonical_mask);
     if (legacy_canonical_qa_env && legacy_canonical_qa_env[0] &&
@@ -52781,7 +53275,7 @@ static int ds4_first_divergence_run(ds4_session *s,
         DS4_FIRST_DIVERGENCE_CANON_QB |
         DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW;
     canonical_config_ok = canonical_config_ok &&
-        (!cp4_prefix_input_requested ||
+        (!prefix_operand_probe_requested ||
          canonical_mask == cp4_prefix_required_mask);
     ds4_gpu_graph *g = &s->graph;
     ds4_gpu_tensor *batch_cur = g->batch_cur_hc_by_tier[0];
@@ -52809,7 +53303,7 @@ static int ds4_first_divergence_run(ds4_session *s,
         ds4_c2b_capture_alloc(&capture_b, g, &s->engine->weights,
                               start, n_tokens);
     const bool alloc_b_probe_ok = alloc_b_ok &&
-        (!cp4_prefix_input_requested ||
+        (!prefix_operand_probe_requested ||
          ds4_c2b_capture_alloc(&capture_b_probe, g, &s->engine->weights,
                                start, n_tokens));
     const bool raw_ok = alloc_b_probe_ok &&
@@ -52873,7 +53367,49 @@ static int ds4_first_divergence_run(ds4_session *s,
         canonical_rerun_ok = restore_canonical_ok && a0_ok &&
             restore1_ok && a1_ok && restore2_ok && a2_ok;
     }
-    const bool cp4_tail_ab_requested = !cp4_prefix_input_requested &&
+    const bool hc_attn_pre_split_ab_ok =
+        !hc_attn_pre_split_ab_requested ||
+        (canonical_rerun_ok && a2_ok &&
+         ds4_hc_attn_pre_split_ab_run(
+             s, &capture_a, &hc_attn_pre_split_ab));
+    bool hc_attn_pre_split_substitution_performed = false;
+    bool hc_attn_pre_split_substitution_ok =
+        !hc_attn_pre_split_ab_requested ||
+        (hc_attn_pre_split_ab_ok &&
+         !hc_attn_pre_split_ab.reproduced_post_comb_mismatch);
+    if (hc_attn_pre_split_ab_requested && hc_attn_pre_split_ab_ok &&
+        hc_attn_pre_split_ab.reproduced_post_comb_mismatch) {
+        hc_attn_pre_split_substitution_performed = true;
+        ds4_c2b_observable_free(&a0);
+        ds4_c2b_observable_free(&a1);
+        ds4_c2b_observable_free(&a2);
+        const bool restore_hc_pre_ok = ds4_c2b_restore_s0(
+            s, &frontier, &raw, start, batch_cur, batch_next);
+        g_ds4_first_divergence_canonical_mask = restore_hc_pre_ok
+            ? pre_tail_canonical_mask |
+                  DS4_FIRST_DIVERGENCE_CANON_HC_ATTN_PRE_SPLIT
+            : 0;
+        a0_ok = restore_hc_pre_ok &&
+            ds4_c2b_run_pass(s, forced_tokens, n_tokens, start, NULL,
+                              &a0, n_comp_before, n_index_before);
+        restore1_ok = a0_ok && ds4_c2b_restore_s0(
+            s, &frontier, &raw, start, batch_cur, batch_next);
+        a1_ok = restore1_ok &&
+            ds4_c2b_run_pass(s, forced_tokens, n_tokens, start, NULL,
+                              &a1, n_comp_before, n_index_before);
+        restore2_ok = a1_ok && ds4_c2b_restore_s0(
+            s, &frontier, &raw, start, batch_cur, batch_next);
+        a2_ok = restore2_ok &&
+            ds4_c2b_run_pass(s, forced_tokens, n_tokens, start, &capture_a,
+                              &a2, n_comp_before, n_index_before);
+        g_ds4_first_divergence_canonical_mask = 0;
+        hc_attn_pre_split_substitution_ok = restore_hc_pre_ok && a0_ok &&
+            restore1_ok && a1_ok && restore2_ok && a2_ok;
+    }
+    canonical_rerun_ok = canonical_rerun_ok &&
+        hc_attn_pre_split_ab_ok && hc_attn_pre_split_substitution_ok;
+
+    const bool cp4_tail_ab_requested = !prefix_operand_probe_requested &&
         (pre_tail_canonical_mask &
          DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW) != 0;
     const bool cp4_tail_ab_ok = !cp4_tail_ab_requested ||
@@ -52959,6 +53495,10 @@ static int ds4_first_divergence_run(ds4_session *s,
     bool report_ok = false;
     bool cp4_prefix_input_ok = !cp4_prefix_input_requested;
     bool cp4_prefix_input_attempted = false;
+    bool hc_attn_pre_split_causal_ok =
+        !hc_attn_pre_split_ab_requested ||
+        !hc_attn_pre_split_substitution_performed;
+    bool hc_attn_pre_split_causal_attempted = false;
     if (control && probe && qa_ab_proven && kv_ab_proven && qb_ab_proven) {
         pass_b_init_ok = ds4_first_divergence_capture_init(&pass_b, "PASS_B");
         pass_b_run_ok = pass_b_init_ok && ds4_c45_run_pass_b(
@@ -53141,8 +53681,12 @@ static int ds4_first_divergence_run(ds4_session *s,
                 }
             }
         }
-        if (report_ok && cp4_prefix_input_requested) {
-            cp4_prefix_input_attempted = true;
+        if (report_ok &&
+            (cp4_prefix_input_requested ||
+             hc_attn_pre_split_substitution_performed)) {
+            cp4_prefix_input_attempted = cp4_prefix_input_requested;
+            hc_attn_pre_split_causal_attempted =
+                hc_attn_pre_split_substitution_performed;
             const bool shadow_restore_ok = ds4_c2b_restore_s0(
                 s, &frontier, &raw, start, batch_cur, batch_next);
             if (shadow_restore_ok) {
@@ -53158,18 +53702,28 @@ static int ds4_first_divergence_run(ds4_session *s,
             const bool shadow_control_ok = shadow_sync_ok &&
                 ds4_cp4_prefix_pass_b_probe_control(
                     &capture_b, &capture_b_probe);
-            cp4_prefix_input_ok = shadow_control_ok &&
-                ds4_cp4_prefix_input_close(
-                    &capture_a, &capture_b, &capture_b_probe);
-            if (!cp4_prefix_input_ok) {
+            if (cp4_prefix_input_requested) {
+                cp4_prefix_input_ok = shadow_control_ok &&
+                    ds4_cp4_prefix_input_close(
+                        &capture_a, &capture_b, &capture_b_probe);
+            }
+            if (hc_attn_pre_split_substitution_performed) {
+                hc_attn_pre_split_causal_ok = shadow_control_ok &&
+                    ds4_hc_attn_pre_split_causal_close(
+                        &capture_a, &capture_b, &capture_b_probe);
+            }
+            if ((cp4_prefix_input_requested && !cp4_prefix_input_ok) ||
+                (hc_attn_pre_split_substitution_performed &&
+                 !hc_attn_pre_split_causal_ok)) {
                 fprintf(stderr,
-                        "CP4_PREFIX_INPUT_ERROR restore=%d run=%d sync=%d "
-                        "probe_control=%d compare=%d\n",
+                        "PREFIX_OPERAND_PROBE_ERROR restore=%d run=%d sync=%d "
+                        "probe_control=%d cp4_compare=%d hc_pre_causal=%d\n",
                         shadow_restore_ok ? 1 : 0,
                         shadow_run_ok ? 1 : 0,
                         shadow_sync_ok ? 1 : 0,
                         shadow_control_ok ? 1 : 0,
-                        cp4_prefix_input_ok ? 1 : 0);
+                        cp4_prefix_input_ok ? 1 : 0,
+                        hc_attn_pre_split_causal_ok ? 1 : 0);
             }
         }
     }
@@ -53178,6 +53732,17 @@ static int ds4_first_divergence_run(ds4_session *s,
                 "CP4_PREFIX_INPUT_AB result=SKIPPED reason=%s\n",
                 control && probe
                     ? "canonical_prefix_not_proven"
+                    : "c2b_non_perturbation_gate");
+    }
+    if (hc_attn_pre_split_ab_requested &&
+        !hc_attn_pre_split_causal_attempted) {
+        fprintf(stderr,
+                "HC_ATTN_PRE_SPLIT_CAUSAL_SUBSTITUTION result=SKIPPED "
+                "reason=%s\n",
+                control && probe && hc_attn_pre_split_ab_ok
+                    ? "isolated_ab_did_not_reproduce_post_comb_mismatch"
+                    : control && probe
+                        ? "isolated_ab_or_canonical_prefix_not_proven"
                     : "c2b_non_perturbation_gate");
     }
     if (control && probe && qa_ab_proven && kv_ab_proven &&
@@ -53204,7 +53769,8 @@ static int ds4_first_divergence_run(ds4_session *s,
     ds4_c2b_raw_s0_free(&raw);
     spec_frontier_free(&frontier);
     return control && probe && qa_ab_proven && kv_ab_proven && qb_ab_proven &&
-        canonical_rerun_ok && report_ok && cp4_prefix_input_ok ? 0 : 1;
+        canonical_rerun_ok && report_ok && cp4_prefix_input_ok &&
+        hc_attn_pre_split_causal_ok ? 0 : 1;
 }
 
 /* Commit an intermediate state captured by a tiny speculative verifier.
