@@ -65,7 +65,7 @@ static const ds4_family_repair_manifest_entry g_family_manifest[] = {
         "routed_moe_single_iq2_xxs_q2_k",
         DS4_FAMILY_REPAIR_ENTRY_ROUTED_MOE_IQ2_XXS_Q2_K,
         "ds4_repair_routed_moe_iq2_xxs_q2_k",
-        DS4_FAMILY_REPAIR_NOT_IMPLEMENTED,
+        DS4_FAMILY_REPAIR_EXACT,
     },
     {
         DS4_REPAIR_FAMILY_Q8_SHARED_DOWN_BATCH_F32_HC_ADD_VS_SINGLE_FUSED_HC,

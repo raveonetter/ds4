@@ -22,6 +22,11 @@ enum {
     TEST_CP5_SPLIT = 2 * TEST_CP5_HC + TEST_CP5_HC * TEST_CP5_HC,
     TEST_ROUTER_EXPERTS = 256,
     TEST_ROUTER_TOPK = 6,
+    TEST_MOE_DIM = 256,
+    TEST_MOE_TOTAL_EXPERTS = 8,
+    TEST_MOE_USED_EXPERTS = 6,
+    TEST_IQ2_XXS_TYPE = 16,
+    TEST_Q2_K_TYPE = 10,
 };
 
 typedef struct __attribute__((packed)) {
@@ -29,7 +34,22 @@ typedef struct __attribute__((packed)) {
     int8_t qs[32];
 } test_block_q8_0;
 
+typedef struct __attribute__((packed)) {
+    uint16_t d;
+    uint16_t qs[32];
+} test_block_iq2_xxs;
+
+typedef struct __attribute__((packed)) {
+    uint8_t scales[16];
+    uint8_t qs[64];
+    uint16_t d;
+    uint16_t dmin;
+} test_block_q2_k;
+
 _Static_assert(sizeof(test_block_q8_0) == 34, "Q8_0 block layout changed");
+_Static_assert(sizeof(test_block_iq2_xxs) == 66,
+               "IQ2_XXS block layout changed");
+_Static_assert(sizeof(test_block_q2_k) == 84, "Q2_K block layout changed");
 
 bool ds4_log_is_tty(FILE *fp) {
     (void)fp;
@@ -71,6 +91,44 @@ static void fill_f16_matrix(uint16_t *matrix, uint32_t out_dim,
                 (int32_t)((row * 11u + col * 13u + salt * 17u) % 63u) - 31;
             matrix[(uint64_t)row * TEST_IN + col] =
                 half_bits((float)raw / 512.0f);
+        }
+    }
+}
+
+static void fill_iq2_xxs_experts(test_block_iq2_xxs *matrix,
+                                 uint32_t salt) {
+    for (uint32_t expert = 0; expert < TEST_MOE_TOTAL_EXPERTS; expert++) {
+        for (uint32_t row = 0; row < TEST_MOE_DIM; row++) {
+            test_block_iq2_xxs *block = matrix +
+                (uint64_t)expert * TEST_MOE_DIM + row;
+            block->d = half_bits(
+                (float)(1u + ((expert + row + salt) % 5u)) / 2048.0f);
+            for (uint32_t i = 0; i < 32u; i++) {
+                block->qs[i] = (uint16_t)(
+                    (expert * 97u + row * 53u + i * 29u + salt * 11u) &
+                    0xffffu);
+            }
+        }
+    }
+}
+
+static void fill_q2_k_experts(test_block_q2_k *matrix, uint32_t salt) {
+    for (uint32_t expert = 0; expert < TEST_MOE_TOTAL_EXPERTS; expert++) {
+        for (uint32_t row = 0; row < TEST_MOE_DIM; row++) {
+            test_block_q2_k *block = matrix +
+                (uint64_t)expert * TEST_MOE_DIM + row;
+            block->d = half_bits(
+                (float)(1u + ((expert * 3u + row + salt) % 7u)) / 512.0f);
+            block->dmin = half_bits(
+                (float)(1u + ((expert + row * 5u + salt) % 3u)) / 2048.0f);
+            for (uint32_t i = 0; i < 16u; i++) {
+                block->scales[i] = (uint8_t)(
+                    expert * 13u + row * 7u + i * 17u + salt);
+            }
+            for (uint32_t i = 0; i < 64u; i++) {
+                block->qs[i] = (uint8_t)(
+                    expert * 19u + row * 11u + i * 23u + salt * 3u);
+            }
         }
     }
 }
@@ -481,6 +539,181 @@ static int run_cp5_tail_contract(const void *model, uint64_t model_size,
     return ok;
 }
 
+static int run_routed_moe_contract(const void *model, uint64_t model_size,
+                                   uint64_t gate_offset,
+                                   uint64_t up_offset,
+                                   uint64_t down_offset) {
+    const uint64_t gate_row_bytes = sizeof(test_block_iq2_xxs);
+    const uint64_t down_row_bytes = sizeof(test_block_q2_k);
+    const uint64_t gate_expert_bytes =
+        (uint64_t)TEST_MOE_DIM * gate_row_bytes;
+    const uint64_t down_expert_bytes =
+        (uint64_t)TEST_MOE_DIM * down_row_bytes;
+    const uint64_t input_count = (uint64_t)TEST_ROWS * TEST_MOE_DIM;
+    const uint64_t route_count =
+        (uint64_t)TEST_ROWS * TEST_MOE_USED_EXPERTS;
+    const uint64_t act_count = route_count * TEST_MOE_DIM;
+    const uint64_t out_count = input_count;
+    float *input_host = calloc((size_t)input_count, sizeof(float));
+    int32_t *selected_host = calloc((size_t)route_count, sizeof(int32_t));
+    float *weights_host = calloc((size_t)route_count, sizeof(float));
+    float *actual = calloc((size_t)out_count, sizeof(float));
+    float *expected = calloc((size_t)out_count, sizeof(float));
+    float *mid_actual = calloc((size_t)act_count, sizeof(float));
+    float *mid_expected = calloc((size_t)act_count, sizeof(float));
+    ds4_gpu_tensor *input = ds4_gpu_tensor_alloc(
+        input_count * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(
+        route_count * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(
+        route_count * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_count * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(act_count * sizeof(float));
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(act_count * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(act_count * sizeof(float));
+    ds4_gpu_tensor *experts = ds4_gpu_tensor_alloc(act_count * sizeof(float));
+    ds4_gpu_tensor *out_ref = ds4_gpu_tensor_alloc(
+        out_count * sizeof(float));
+    ds4_gpu_tensor *gate_ref = ds4_gpu_tensor_alloc(
+        act_count * sizeof(float));
+    ds4_gpu_tensor *up_ref = ds4_gpu_tensor_alloc(
+        act_count * sizeof(float));
+    ds4_gpu_tensor *mid_ref = ds4_gpu_tensor_alloc(
+        act_count * sizeof(float));
+    ds4_gpu_tensor *experts_ref = ds4_gpu_tensor_alloc(
+        act_count * sizeof(float));
+    int ok = input_host && selected_host && weights_host && actual &&
+             expected && mid_actual && mid_expected && input && selected &&
+             weights && out && gate && up && mid && experts && out_ref &&
+             gate_ref && up_ref && mid_ref && experts_ref;
+
+    for (uint32_t row = 0; ok && row < TEST_ROWS; row++) {
+        for (uint32_t col = 0; col < TEST_MOE_DIM; col++) {
+            input_host[(uint64_t)row * TEST_MOE_DIM + col] =
+                (float)((int32_t)((row * 37u + col * 41u + 9u) % 127u) -
+                        63) / 512.0f;
+        }
+        for (uint32_t slot = 0; slot < TEST_MOE_USED_EXPERTS; slot++) {
+            selected_host[(uint64_t)row * TEST_MOE_USED_EXPERTS + slot] =
+                (int32_t)((row * 3u + slot * 5u + 1u) %
+                          TEST_MOE_TOTAL_EXPERTS);
+            weights_host[(uint64_t)row * TEST_MOE_USED_EXPERTS + slot] =
+                (float)(TEST_MOE_USED_EXPERTS - slot) / 21.0f;
+        }
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_write(input, 0, input_host,
+                                  input_count * sizeof(float)) &&
+             ds4_gpu_tensor_write(selected, 0, selected_host,
+                                  route_count * sizeof(int32_t)) &&
+             ds4_gpu_tensor_write(weights, 0, weights_host,
+                                  route_count * sizeof(float)) &&
+             ds4_gpu_routed_moe_rows_exact_tensor(
+                 out, gate, up, mid, experts, model, model_size,
+                 gate_offset, up_offset, down_offset,
+                 TEST_IQ2_XXS_TYPE, TEST_Q2_K_TYPE,
+                 gate_expert_bytes, gate_row_bytes,
+                 down_expert_bytes, down_row_bytes,
+                 TEST_MOE_DIM, TEST_MOE_DIM, TEST_MOE_DIM,
+                 selected, weights, TEST_MOE_TOTAL_EXPERTS,
+                 TEST_MOE_USED_EXPERTS, 7.0f, input, 0u, TEST_ROWS,
+                 false) != 0;
+    }
+    for (uint32_t row = 0; ok && row < TEST_ROWS; row++) {
+        const uint64_t input_offset =
+            (uint64_t)row * TEST_MOE_DIM * sizeof(float);
+        const uint64_t route_offset =
+            (uint64_t)row * TEST_MOE_USED_EXPERTS;
+        const uint64_t act_offset =
+            route_offset * TEST_MOE_DIM * sizeof(float);
+        const uint64_t out_offset = input_offset;
+        ds4_gpu_tensor *input_row = ds4_gpu_tensor_view(
+            input, input_offset, (uint64_t)TEST_MOE_DIM * sizeof(float));
+        ds4_gpu_tensor *selected_row = ds4_gpu_tensor_view(
+            selected, route_offset * sizeof(int32_t),
+            (uint64_t)TEST_MOE_USED_EXPERTS * sizeof(int32_t));
+        ds4_gpu_tensor *weights_row = ds4_gpu_tensor_view(
+            weights, route_offset * sizeof(float),
+            (uint64_t)TEST_MOE_USED_EXPERTS * sizeof(float));
+        ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
+            out_ref, out_offset, (uint64_t)TEST_MOE_DIM * sizeof(float));
+        ds4_gpu_tensor *gate_row = ds4_gpu_tensor_view(
+            gate_ref, act_offset,
+            (uint64_t)TEST_MOE_USED_EXPERTS * TEST_MOE_DIM * sizeof(float));
+        ds4_gpu_tensor *up_row = ds4_gpu_tensor_view(
+            up_ref, act_offset,
+            (uint64_t)TEST_MOE_USED_EXPERTS * TEST_MOE_DIM * sizeof(float));
+        ds4_gpu_tensor *mid_row = ds4_gpu_tensor_view(
+            mid_ref, act_offset,
+            (uint64_t)TEST_MOE_USED_EXPERTS * TEST_MOE_DIM * sizeof(float));
+        ds4_gpu_tensor *experts_row = ds4_gpu_tensor_view(
+            experts_ref, act_offset,
+            (uint64_t)TEST_MOE_USED_EXPERTS * TEST_MOE_DIM * sizeof(float));
+        ok = input_row && selected_row && weights_row && out_row &&
+             gate_row && up_row && mid_row && experts_row &&
+             ds4_gpu_routed_moe_one_tensor(
+                 out_row, gate_row, up_row, mid_row, experts_row,
+                 model, model_size, gate_offset, up_offset, down_offset,
+                 TEST_IQ2_XXS_TYPE, TEST_Q2_K_TYPE,
+                 gate_expert_bytes, gate_row_bytes,
+                 down_expert_bytes, down_row_bytes,
+                 TEST_MOE_DIM, TEST_MOE_DIM, TEST_MOE_DIM,
+                 selected_row, weights_row, TEST_MOE_TOTAL_EXPERTS,
+                 TEST_MOE_USED_EXPERTS, 7.0f, input_row, NULL, 0u,
+                 false) != 0;
+        ds4_gpu_tensor_free(experts_row);
+        ds4_gpu_tensor_free(mid_row);
+        ds4_gpu_tensor_free(up_row);
+        ds4_gpu_tensor_free(gate_row);
+        ds4_gpu_tensor_free(out_row);
+        ds4_gpu_tensor_free(weights_row);
+        ds4_gpu_tensor_free(selected_row);
+        ds4_gpu_tensor_free(input_row);
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_read(out, 0, actual,
+                                 out_count * sizeof(float)) &&
+             ds4_gpu_tensor_read(out_ref, 0, expected,
+                                 out_count * sizeof(float)) &&
+             ds4_gpu_tensor_read(mid, 0, mid_actual,
+                                 act_count * sizeof(float)) &&
+             ds4_gpu_tensor_read(mid_ref, 0, mid_expected,
+                                 act_count * sizeof(float)) &&
+             compare_exact("routed_moe_output", actual, expected,
+                           (size_t)out_count) &&
+             compare_exact("routed_moe_mid", mid_actual, mid_expected,
+                           (size_t)act_count);
+    }
+
+    printf("PRODUCTION_FAMILY_AB "
+           "family=FAMILY_ROUTED_MOE_IQ2_XXS_Q2_K_BATCH_VS_SINGLE "
+           "rows=%u sites=routed_moe input_bits_equal=PASS "
+           "weights_same=PASS metadata_same=PASS result=%s\n",
+           TEST_ROWS, ok ? "EXACT" : "MISMATCH");
+
+    ds4_gpu_tensor_free(experts_ref);
+    ds4_gpu_tensor_free(mid_ref);
+    ds4_gpu_tensor_free(up_ref);
+    ds4_gpu_tensor_free(gate_ref);
+    ds4_gpu_tensor_free(out_ref);
+    ds4_gpu_tensor_free(experts);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(input);
+    free(mid_expected);
+    free(mid_actual);
+    free(expected);
+    free(actual);
+    free(weights_host);
+    free(selected_host);
+    free(input_host);
+    return ok;
+}
+
 static int run_router_contract(void) {
     const uint64_t probs_count =
         (uint64_t)TEST_ROWS * TEST_ROUTER_EXPERTS;
@@ -573,14 +806,26 @@ int main(void) {
     const uint64_t cp5_q8_bytes =
         (uint64_t)TEST_CP5_EMBD * (TEST_CP5_IN / 32u) *
         sizeof(test_block_q8_0);
+    const uint64_t moe_iq2_bytes =
+        (uint64_t)TEST_MOE_TOTAL_EXPERTS * TEST_MOE_DIM *
+        sizeof(test_block_iq2_xxs);
+    const uint64_t moe_q2_bytes =
+        (uint64_t)TEST_MOE_TOTAL_EXPERTS * TEST_MOE_DIM *
+        sizeof(test_block_q2_k);
     const uint64_t q8_gate_offset = 0;
     const uint64_t q8_up_offset = align_up(q8_bytes, page);
     const uint64_t f16_a_offset = align_up(q8_up_offset + q8_bytes, page);
     const uint64_t f16_b_offset = align_up(f16_a_offset + f16_bytes, page);
     const uint64_t cp5_q8_offset =
         align_up(f16_b_offset + f16_bytes, page);
-    const uint64_t model_size =
+    const uint64_t moe_gate_offset =
         align_up(cp5_q8_offset + cp5_q8_bytes, page);
+    const uint64_t moe_up_offset =
+        align_up(moe_gate_offset + moe_iq2_bytes, page);
+    const uint64_t moe_down_offset =
+        align_up(moe_up_offset + moe_iq2_bytes, page);
+    const uint64_t model_size =
+        align_up(moe_down_offset + moe_q2_bytes, page);
     void *model = NULL;
     float *input_host = calloc(
         (size_t)TEST_ROWS * TEST_IN, sizeof(float));
@@ -588,6 +833,7 @@ int main(void) {
     int initialized = 0;
     int q8_ok = 0;
     int cp5_ok = 0;
+    int routed_moe_ok = 0;
     int router_ok = 0;
     unsigned f16_results = 0;
     int ok = input_host != NULL &&
@@ -610,6 +856,12 @@ int main(void) {
         fill_q8_matrix((test_block_q8_0 *)
                        ((uint8_t *)model + cp5_q8_offset),
                        TEST_CP5_IN, TEST_CP5_EMBD, 19u);
+        fill_iq2_xxs_experts((test_block_iq2_xxs *)
+                             ((uint8_t *)model + moe_gate_offset), 7u);
+        fill_iq2_xxs_experts((test_block_iq2_xxs *)
+                             ((uint8_t *)model + moe_up_offset), 23u);
+        fill_q2_k_experts((test_block_q2_k *)
+                          ((uint8_t *)model + moe_down_offset), 31u);
         for (uint32_t row = 0; row < TEST_ROWS; row++) {
             for (uint32_t col = 0; col < TEST_IN; col++) {
                 const int32_t raw =
@@ -628,6 +880,8 @@ int main(void) {
         initialized = ok;
     }
     if (ok) {
+        ds4_gpu_set_quality(false);
+        ds4_gpu_set_ssd_streaming(false);
         ok = ds4_gpu_set_model_map(model, model_size) != 0;
     }
     if (ok) {
@@ -641,18 +895,23 @@ int main(void) {
         q8_ok = run_q8_contract(model, model_size,
                                 q8_gate_offset, q8_up_offset, input);
         cp5_ok = run_cp5_tail_contract(model, model_size, cp5_q8_offset);
+        routed_moe_ok = run_routed_moe_contract(
+            model, model_size, moe_gate_offset, moe_up_offset,
+            moe_down_offset);
         f16_results = run_f16_contracts(model, model_size,
                                          f16_a_offset, f16_b_offset, input);
         router_ok = run_router_contract();
-        ok = q8_ok && cp5_ok && f16_results == 3u && router_ok;
+        ok = q8_ok && cp5_ok && routed_moe_ok &&
+             f16_results == 3u && router_ok;
     }
 
     const unsigned families_exact = (q8_ok ? 1u : 0u) +
         (cp5_ok ? 1u : 0u) +
+        (routed_moe_ok ? 1u : 0u) +
         ((f16_results & 1u) ? 1u : 0u) +
         ((f16_results & 2u) ? 1u : 0u) + (router_ok ? 1u : 0u);
-    printf("PROJECTION_REPAIR_STATUS families_total=5 families_exact=%u "
-           "families_failed=%u\n", families_exact, 5u - families_exact);
+    printf("PROJECTION_REPAIR_STATUS families_total=6 families_exact=%u "
+           "families_failed=%u\n", families_exact, 6u - families_exact);
     ds4_gpu_tensor_free(input);
     if (initialized) ds4_gpu_cleanup();
     free(input_host);

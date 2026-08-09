@@ -38246,6 +38246,132 @@ int ds4_gpu_routed_moe_one_tensor(
     return 1;
 }
 
+int ds4_gpu_routed_moe_rows_exact_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t                layer_index,
+        uint32_t                n_rows,
+        bool                    force_resident) {
+    const uint64_t input_values = expert_in_dim;
+    const uint64_t act_values = (uint64_t)n_expert * expert_mid_dim;
+    const uint64_t expert_values = (uint64_t)n_expert * out_dim;
+    const uint64_t out_values = out_dim;
+    const uint64_t route_values = n_expert;
+    if (!out || !gate || !up || !mid || !experts || !model_map ||
+        !selected || !weights || !x || n_rows == 0 ||
+        expert_in_dim == 0 || expert_mid_dim == 0 || out_dim == 0 ||
+        n_total_expert == 0 || n_expert == 0 ||
+        n_expert > DS4_METAL_MAX_ROUTED_EXPERT_USED ||
+        input_values > UINT64_MAX / sizeof(float) ||
+        act_values > UINT64_MAX / sizeof(float) ||
+        expert_values > UINT64_MAX / sizeof(float) ||
+        out_values > UINT64_MAX / sizeof(float) ||
+        route_values > UINT64_MAX / sizeof(float)) {
+        return 0;
+    }
+
+    const uint64_t input_row_bytes = input_values * sizeof(float);
+    const uint64_t act_row_bytes = act_values * sizeof(float);
+    const uint64_t expert_row_bytes = expert_values * sizeof(float);
+    const uint64_t out_row_bytes = out_values * sizeof(float);
+    const uint64_t selected_row_bytes = route_values * sizeof(int32_t);
+    const uint64_t weights_row_bytes = route_values * sizeof(float);
+    if (n_rows > UINT64_MAX / input_row_bytes ||
+        n_rows > UINT64_MAX / act_row_bytes ||
+        n_rows > UINT64_MAX / expert_row_bytes ||
+        n_rows > UINT64_MAX / out_row_bytes ||
+        n_rows > UINT64_MAX / selected_row_bytes ||
+        n_rows > UINT64_MAX / weights_row_bytes ||
+        ds4_gpu_tensor_bytes(x) < (uint64_t)n_rows * input_row_bytes ||
+        ds4_gpu_tensor_bytes(gate) < (uint64_t)n_rows * act_row_bytes ||
+        ds4_gpu_tensor_bytes(up) < (uint64_t)n_rows * act_row_bytes ||
+        ds4_gpu_tensor_bytes(mid) < (uint64_t)n_rows * act_row_bytes ||
+        ds4_gpu_tensor_bytes(experts) <
+            (uint64_t)n_rows * expert_row_bytes ||
+        ds4_gpu_tensor_bytes(out) < (uint64_t)n_rows * out_row_bytes ||
+        ds4_gpu_tensor_bytes(selected) <
+            (uint64_t)n_rows * selected_row_bytes ||
+        ds4_gpu_tensor_bytes(weights) <
+            (uint64_t)n_rows * weights_row_bytes) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        if (getenv("DS4_METAL_PROJECTION_REPAIR_DIAGNOSTICS") != NULL) {
+            fprintf(stderr,
+                    "PROJECTION_REPAIR_IMPL family=ROUTED_MOE_IQ2_XXS_Q2_K "
+                    "op=routed_moe mode=CANONICAL_ROW_API rows=%u\n",
+                    n_rows);
+        }
+        for (uint32_t row = 0; row < n_rows; row++) {
+            ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
+                out, (uint64_t)row * out_row_bytes, out_row_bytes);
+            ds4_gpu_tensor *gate_row = ds4_gpu_tensor_view(
+                gate, (uint64_t)row * act_row_bytes, act_row_bytes);
+            ds4_gpu_tensor *up_row = ds4_gpu_tensor_view(
+                up, (uint64_t)row * act_row_bytes, act_row_bytes);
+            ds4_gpu_tensor *mid_row = ds4_gpu_tensor_view(
+                mid, (uint64_t)row * act_row_bytes, act_row_bytes);
+            ds4_gpu_tensor *experts_row = ds4_gpu_tensor_view(
+                experts, (uint64_t)row * expert_row_bytes,
+                expert_row_bytes);
+            ds4_gpu_tensor *selected_row = ds4_gpu_tensor_view(
+                selected, (uint64_t)row * selected_row_bytes,
+                selected_row_bytes);
+            ds4_gpu_tensor *weights_row = ds4_gpu_tensor_view(
+                weights, (uint64_t)row * weights_row_bytes,
+                weights_row_bytes);
+            ds4_gpu_tensor *input_row = ds4_gpu_tensor_view(
+                x, (uint64_t)row * input_row_bytes, input_row_bytes);
+            const int ok = out_row && gate_row && up_row && mid_row &&
+                experts_row && selected_row && weights_row && input_row &&
+                ds4_gpu_routed_moe_one_tensor(
+                    out_row, gate_row, up_row, mid_row, experts_row,
+                    model_map, model_size, gate_offset, up_offset,
+                    down_offset, gate_type, down_type,
+                    gate_expert_bytes, gate_row_bytes,
+                    down_expert_bytes, down_row_bytes,
+                    expert_in_dim, expert_mid_dim, out_dim,
+                    selected_row, weights_row, n_total_expert, n_expert,
+                    clamp, input_row, NULL, layer_index, force_resident);
+            ds4_gpu_tensor_free(input_row);
+            ds4_gpu_tensor_free(weights_row);
+            ds4_gpu_tensor_free(selected_row);
+            ds4_gpu_tensor_free(experts_row);
+            ds4_gpu_tensor_free(mid_row);
+            ds4_gpu_tensor_free(up_row);
+            ds4_gpu_tensor_free(gate_row);
+            ds4_gpu_tensor_free(out_row);
+            if (!ok) return 0;
+        }
+    }
+
+    return 1;
+}
+
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,

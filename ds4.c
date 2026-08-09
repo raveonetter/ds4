@@ -252,21 +252,6 @@ int ds4_gpu_matmul_f16_router_rows_exact_tensor(
             out, model_map, model_size, weight_offset,
             4096u, 256u, x, n_rows);
 }
-int ds4_gpu_shared_down_hc_expand_q8_0_rows_exact_tensor(
-        ds4_gpu_tensor *out_hc, ds4_gpu_tensor *shared_out,
-        const void *model_map, uint64_t model_size, uint64_t weight_offset,
-        uint64_t in_dim, uint64_t out_dim,
-        const ds4_gpu_tensor *shared_mid,
-        const ds4_gpu_tensor *routed_out,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
-        uint32_t n_embd, uint32_t n_hc, uint32_t n_rows) {
-    (void)out_hc; (void)shared_out; (void)model_map; (void)model_size;
-    (void)weight_offset; (void)in_dim; (void)out_dim; (void)shared_mid;
-    (void)routed_out; (void)residual_hc; (void)split; (void)n_embd;
-    (void)n_hc; (void)n_rows;
-    return 0;
-}
 int ds4_gpu_q8_cache_suppressed(void) { return 0; }
 void ds4_gpu_set_q8_cache_suppressed(int suppressed) { (void)suppressed; }
 int ds4_gpu_set_decode_fast_attention(int enabled) { (void)enabled; return 0; }
@@ -25661,6 +25646,21 @@ static bool metal_graph_q8_projection_repair_enabled(void) {
 #endif
 }
 
+static bool metal_graph_routed_moe_repair_enabled(
+        const ds4_layer_weights *layer) {
+#if defined(__APPLE__)
+    return layer &&
+        layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
+        ds4_family_repair_runtime_enabled(
+            DS4_REPAIR_FAMILY_ROUTED_MOE_IQ2_XXS_Q2_K_BATCH_VS_SINGLE);
+#else
+    (void)layer;
+    return false;
+#endif
+}
+
 static bool metal_graph_matmul_canonical_rows(
         ds4_gpu_tensor       *out,
         const ds4_model        *model,
@@ -26119,6 +26119,30 @@ static bool metal_graph_routed_moe_canonical_rows(
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+#if defined(__APPLE__)
+    const bool ok = ds4_gpu_routed_moe_rows_exact_tensor(
+        metal_graph_batch_routed_out(g),
+        metal_graph_batch_routed_gate(g),
+        metal_graph_batch_routed_up(g),
+        metal_graph_batch_routed_mid(g),
+        metal_graph_batch_routed_down(g),
+        model->map, model->size,
+        layer->ffn_gate_exps->abs_offset,
+        layer->ffn_up_exps->abs_offset,
+        layer->ffn_down_exps->abs_offset,
+        layer->ffn_gate_exps->type,
+        layer->ffn_down_exps->type,
+        gate_expert_bytes, gate_row_bytes,
+        down_expert_bytes, down_row_bytes,
+        (uint32_t)layer->ffn_gate_exps->dim[0],
+        (uint32_t)down_in_dim,
+        (uint32_t)routed_out_dim,
+        metal_graph_batch_router_selected(g),
+        metal_graph_batch_router_weights(g),
+        DS4_N_EXPERT, DS4_N_EXPERT_USED,
+        DS4_SWIGLU_CLAMP_EXP,
+        metal_graph_batch_ffn_norm(g), il, rows, false) != 0;
+#else
     const uint64_t act_values = (uint64_t)DS4_N_EXPERT_USED * down_in_dim;
     const uint64_t down_values = (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD;
     bool ok = true;
@@ -26183,6 +26207,7 @@ static bool metal_graph_routed_moe_canonical_rows(
         ds4_gpu_tensor_free(gate_row);
         ds4_gpu_tensor_free(out_row);
     }
+#endif
     if (ok) g->batch_routed_mid_is_f16 = false;
     return ok;
 }
@@ -30596,8 +30621,10 @@ static bool metal_graph_encode_layer_ffn_batch(
                                     g->tp_batch_in[il],
                                     (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
         }
-    } else if (ok && ds4_first_divergence_canonical_enabled(
-                           DS4_FIRST_DIVERGENCE_CANON_ROUTED_MOE)) {
+    } else if (ok &&
+               (ds4_first_divergence_canonical_enabled(
+                    DS4_FIRST_DIVERGENCE_CANON_ROUTED_MOE) ||
+                metal_graph_routed_moe_repair_enabled(layer))) {
         ok = metal_graph_routed_moe_canonical_rows(
             g, model, layer, il, n_tokens);
     } else if (ok) {
