@@ -109,18 +109,19 @@ router_weights
 shared_gate
 shared_up
 shared_mid
-routed_gate
-routed_up
-routed_down
 routed_out
 layer_output
 ```
 
-Two conceptual values are deliberately not checkpoints. `routed_mid` may be
+Five internal values are deliberately not semantic checkpoints.
+`routed_gate`, `routed_up`, and `routed_down` are quantization-dependent
+scratch: the IQ2_XXS/Q2_K implementations may reorder, bypass, or leave parts
+of them undefined while producing the same `routed_out`. `routed_mid` may be
 F16 in the generic batch path but F32 in sequential decode. `shared_out` may
 be an F16 temporary in the generic path while sequential decode folds the Q8
-shared-down projection directly into the HC epilogue. Comparing either would
-require changing storage or splitting fusion.
+shared-down projection directly into the HC epilogue. The GPU scratch copies
+remain available for low-level debugging, but these objects are not
+registered with the ordered first-divergence reporter.
 
 The diagnostic tests these cumulative row-wise substitutions:
 
@@ -128,7 +129,10 @@ The diagnostic tests these cumulative row-wise substitutions:
 2. ordinary single-row router projection arithmetic;
 3. ordinary single-row router selection and weight normalization;
 4. the existing fused single-row Q8 shared gate/up/SwiGLU primitive;
-5. the existing single-row routed-MoE primitive.
+5. the existing single-row routed-MoE primitive, adjudicated by its stable
+   semantic output `routed_out`;
+6. the ordinary fused single-row Q8 shared-down/HC epilogue for every verifier
+   row.
 
 The router-selection variant is separate from router projection. On the M4
 path, exact logits/probabilities/top-k with mismatching router weights isolate
@@ -166,10 +170,13 @@ grep -E '^(C2B_|CP4_TO_CP5_|stage=|EARLIEST_RUNTIME_DIVERGENCE|NEW_SOURCE_AB|DRI
   canonical-sweep-cp4-to-cp5.log
 ```
 
-The hard natural-comparison boundary inside this interval is the compound
-shared-down/HC epilogue. If `routed_out` is exact and `layer_output` still
-mismatches, further localization stops rather than manufacturing a shared
-contribution or splitting the fused sequential producer.
+The compound shared-down/HC epilogue remains atomic: the harness does not
+manufacture a shared contribution or split the sequential fusion. Once
+`after_attn_hc`, `shared_mid`, and `routed_out` are exact, `CP5_TAIL_AB`
+compares the existing `layer_output`. The cumulative `CP5_TAIL` variant then
+replaces the complete generic tail producer with the real fused sequential
+producer row by row. Its own A0/A1/A2 gate must pass before a causal family is
+reported or the frontier is advanced beyond CP5.
 
 ## CP2-KV-P producer pair
 
