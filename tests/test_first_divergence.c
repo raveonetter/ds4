@@ -79,6 +79,8 @@ int main(void) {
     ds4_first_divergence_capture q_pass_b;
     ds4_first_divergence_capture interval_pass_a;
     ds4_first_divergence_capture interval_pass_b;
+    ds4_first_divergence_capture cp3_pass_a;
+    ds4_first_divergence_capture cp3_pass_b;
     FILE *q_log;
     bool q_projection_exact;
     bool kv_projection_exact;
@@ -91,6 +93,8 @@ int main(void) {
     const float kv_raw[] = {0.25f, -1.5f, 4.0f};
     const float interval_exact[] = {0.25f, -0.75f};
     const float interval_mismatch[] = {0.25f, -0.5f};
+    const float cp3_exact[] = {0.5f, -0.25f};
+    const float cp3_mismatch[] = {0.5f, -0.125f};
     const float signature_actual[] = {1.0f, 3.0f, 5.0f, 7.0f};
     const float signature_expected[] = {1.0f, 2.0f, 4.0f, 8.0f};
     const uint32_t n_comp = 17;
@@ -180,6 +184,59 @@ int main(void) {
     REQUIRE(strcmp(report.subobject, "attn_norm") == 0);
     ds4_first_divergence_capture_free(&pass_a);
     ds4_first_divergence_capture_free(&pass_b);
+
+    REQUIRE(ds4_first_divergence_capture_init(&cp3_pass_a, "PASS_A"));
+    REQUIRE(ds4_first_divergence_capture_init(&cp3_pass_b, "PASS_B"));
+#define CAPTURE_CP3_PAIR(checkpoint_, subobject_, a_, b_) do { \
+        REQUIRE(ds4_first_divergence_capture_f32( \
+            &cp3_pass_a, 0, 2, (checkpoint_), (subobject_), (a_), 2)); \
+        REQUIRE(ds4_first_divergence_capture_f32( \
+            &cp3_pass_b, 0, 2, (checkpoint_), (subobject_), (b_), 2)); \
+    } while (0)
+    /* Insert in reverse causal order. CP3-P must rank pre-update state before
+     * projected inputs, and the whole boundary must precede CP3-F. */
+    CAPTURE_CP3_PAIR(DS4_FIRST_DIVERGENCE_CP3_F,
+                     "attn_state_kv", cp3_exact, cp3_mismatch);
+    CAPTURE_CP3_PAIR(DS4_FIRST_DIVERGENCE_CP3_P,
+                     "attn_comp_kv_raw", cp3_exact, cp3_mismatch);
+    CAPTURE_CP3_PAIR(DS4_FIRST_DIVERGENCE_CP3_P,
+                     "attn_state_kv_before", cp3_exact, cp3_mismatch);
+#undef CAPTURE_CP3_PAIR
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_report(
+        &cp3_pass_a, &cp3_pass_b, q_log, &report));
+    REQUIRE(report.checkpoint == DS4_FIRST_DIVERGENCE_CP3_P);
+    REQUIRE(strcmp(report.subobject, "attn_state_kv_before") == 0);
+    REQUIRE(fclose(q_log) == 0);
+    for (size_t i = 0; i < cp3_pass_b.count; i++) {
+        ds4_first_divergence_snapshot *b = &cp3_pass_b.snapshots[i];
+        if (strcmp(b->subobject, "attn_state_kv_before") == 0) {
+            memcpy(b->data, cp3_exact, sizeof(cp3_exact));
+        }
+    }
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_report(
+        &cp3_pass_a, &cp3_pass_b, q_log, &report));
+    REQUIRE(report.checkpoint == DS4_FIRST_DIVERGENCE_CP3_P);
+    REQUIRE(strcmp(report.subobject, "attn_comp_kv_raw") == 0);
+    REQUIRE(fclose(q_log) == 0);
+    for (size_t i = 0; i < cp3_pass_b.count; i++) {
+        ds4_first_divergence_snapshot *b = &cp3_pass_b.snapshots[i];
+        if (strcmp(b->subobject, "attn_comp_kv_raw") == 0) {
+            memcpy(b->data, cp3_exact, sizeof(cp3_exact));
+        }
+    }
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_report(
+        &cp3_pass_a, &cp3_pass_b, q_log, &report));
+    REQUIRE(report.checkpoint == DS4_FIRST_DIVERGENCE_CP3_F);
+    REQUIRE(strcmp(report.subobject, "attn_state_kv") == 0);
+    REQUIRE(fclose(q_log) == 0);
+    ds4_first_divergence_capture_free(&cp3_pass_a);
+    ds4_first_divergence_capture_free(&cp3_pass_b);
 
     REQUIRE(ds4_first_divergence_capture_init(&q_pass_a, "PASS_A"));
     REQUIRE(ds4_first_divergence_capture_init(&q_pass_b, "PASS_B"));

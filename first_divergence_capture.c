@@ -211,6 +211,21 @@ bool ds4_first_divergence_run_forced_pair(
     return true;
 }
 
+static int cp3_p_subobject_rank(const char *name) {
+    static const char *const ordered[] = {
+        "attn_state_kv_before",
+        "attn_state_score_before",
+        "attn_comp_kv_raw",
+        "attn_comp_score_raw"
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(ordered) / sizeof(ordered[0]); ++i) {
+        if (strcmp(name, ordered[i]) == 0) return (int)i;
+    }
+    return (int)(sizeof(ordered) / sizeof(ordered[0]));
+}
+
 static int cp3_subobject_rank(const char *name) {
     static const char *const ordered[] = {
         "attn_state_kv",
@@ -239,6 +254,11 @@ static int snapshot_order(const ds4_first_divergence_snapshot *a,
     if (a->layer != b->layer) return a->layer < b->layer ? -1 : 1;
     if (a->checkpoint != b->checkpoint) {
         return a->checkpoint < b->checkpoint ? -1 : 1;
+    }
+    if (a->checkpoint == DS4_FIRST_DIVERGENCE_CP3_P) {
+        a_rank = cp3_p_subobject_rank(a->subobject);
+        b_rank = cp3_p_subobject_rank(b->subobject);
+        if (a_rank != b_rank) return a_rank < b_rank ? -1 : 1;
     }
     if (a->checkpoint == DS4_FIRST_DIVERGENCE_CP3_F) {
         a_rank = cp3_subobject_rank(a->subobject);

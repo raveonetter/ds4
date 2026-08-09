@@ -699,3 +699,56 @@ DS4_DSPARK_SCHEDULER=0 \
 The substitution is diagnostic-only. It creates no new online checkpoint,
 does not alter sequential Pass B, and leaves production execution and replay
 unchanged when the mask is unset.
+
+
+## Layer-2 CP3-F input/state audit
+
+The closed CP4→CP5 sweep leaves the global first divergence at
+`row=0 layer=2 CP3-F/attn_state_kv`.  `DS4_CP3F_INPUT_AUDIT=1`
+adds one ordered pre-update boundary without reopening any closed interval.
+
+For each real attention-compressor update, both paths capture:
+
+1. `attn_state_kv_before` and `attn_state_score_before`, before the
+   sequential fused pair projection is allowed to prewrite state;
+2. `attn_comp_kv_raw` and `attn_comp_score_raw`, immediately after the
+   real projection producer and before `ds4_gpu_compressor_update_tensor`;
+3. the existing `CP3-F` post-update state and counters.
+
+The ordered adjudication is mechanical:
+
+```text
+CP3-P pre-state mismatch  -> C_RESTORE_OR_CAPTURE_BOUNDARY
+CP3-P projection mismatch -> A_DIFFERENT_COMPRESSOR_INPUT
+CP3-P exact, CP3-F mismatch -> B_SAME_INPUT_STATE_DIFFERENT_UPDATE
+```
+
+The hook uses same-stream inline copies.  Its pre-state and projection hook
+counts must equal every compressed layer times every verifier row before the
+capture is materialized.  The existing A0/A1/A2 C2b gate remains mandatory.
+
+Run the full proven prefix plus the new audit:
+
+```sh
+DS4_FIRST_DIVERGENCE=1 \
+DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB,ATTN-RAW \
+DS4_CP4_TO_CP5_SWEEP=1 \
+DS4_CP3F_INPUT_AUDIT=1 \
+DS4_DSPARK_SCHEDULER=0 \
+./ds4 --dspark --dspark-confidence 0 \
+  -m ./ds4flash.gguf \
+  --mtp ./gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --tokens 16 --temp 0 --nothink \
+  -p 'Explain Redis in one sentence.' \
+  >canonical-sweep-cp3f-input-audit.log 2>&1
+```
+
+Inspect:
+
+```sh
+grep -E '^(C2B_|FIRST_DIVERGENCE |CP3F_|CP4_TO_CP5_SWEEP)' \
+  canonical-sweep-cp3f-input-audit.log
+```
+
+A result is admissible only when `C2B_CONTROL`, `C2B_PROBE`, and
+`C2B_RESULT` all pass and `CP4_TO_CP5_SWEEP result=PASS`.
