@@ -1,0 +1,40 @@
+ds4: DSpark support model detected: /Users/sijiaguo/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf (stages=3 block=5 markov_rank=256 tensors=81 missing=0 invalid=0 metadata_errors=0); use --dspark to enable experimental runtime decode
+ds4: Metal device Apple M4 Max, 128.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 2.912 ms, residency requested in 596.221 ms, warmup 4.443 ms (mapped 93065.67 MiB from offset 5.09 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: Metal model views created in 0.183 ms, residency requested in 758.385 ms, warmup 0.798 ms (mapped 5711.67 MiB from offset 0.01 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 0.61 GiB (raw 0.36 + compressed 0.25) + buffers 0.25 GiB + resident model 90.88 GiB = 91.74 GiB planned
+ds4: memory detail: ctx=32768 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=8194 backend=metal
+ds4: memory: KV 0.61 GiB (raw 0.36 + compressed 0.25) + buffers 0.25 GiB = 0.86 GiB context
+ds4: memory detail: ctx=32768 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=8194 backend=metal
+ds4: DSpark target-hidden capture enabled: layers=40,41,42
+QA_PRIMITIVE_AB input_bits_equal=PASS weights_same=PASS elements=1024 result=MISMATCH mismatch_count=823 first_index=0 generic_bits=0x3b21c760 sequential_bits=0x3b21c7a0 max_abs=5.2154064178466797e-08 max_rel=0.0013335873499714232 max_ulp=14336 mismatch_fraction=0.8037109375 mean_abs=8.3691702457144856e-09 rms_abs=1.1096596329135279e-08 p50_abs=7.4505805969238281e-09 p95_abs=2.2351741790771484e-08 p99_abs=2.9802322387695312e-08 relative_l2=1.6302470259513109e-07 cosine_similarity=0.99999999999998823 positive_delta_count=415 negative_delta_count=408
+QA_PRIMITIVE_NUMERICAL_NON_EQUIVALENCE PROVEN_BY_TEST
+KV_PRIMITIVE_AB input_bits_equal=PASS weights_same=PASS elements=512 result=MISMATCH mismatch_count=431 first_index=0 generic_bits=0x3bc606c4 sequential_bits=0x3bc606bc max_abs=4.4703483581542969e-08 max_rel=0.00066137566137566134 max_ulp=8192 mismatch_fraction=0.841796875 mean_abs=9.7720658231992275e-09 rms_abs=1.2926741589862414e-08 p50_abs=7.4505805969238281e-09 p95_abs=2.9802322387695312e-08 p99_abs=3.3527612686157227e-08 relative_l2=1.5454367931804077e-07 cosine_similarity=0.99999999999998945 positive_delta_count=220 negative_delta_count=211
+KV_PRIMITIVE_NUMERICAL_NON_EQUIVALENCE PROVEN_BY_TEST
+QB_PRIMITIVE_AB input_bits_equal=PASS weights_same=PASS elements=32768 result=MISMATCH mismatch_count=26366 first_index=0 generic_bits=0x37da1c00 sequential_bits=0x37da2400 max_abs=5.9604644775390625e-08 max_rel=0.0038167938931297708 max_ulp=49152 mismatch_fraction=0.80462646484375 mean_abs=3.3378881880707922e-09 rms_abs=4.5860175954163998e-09 p50_abs=2.7939677238464355e-09 p95_abs=9.3132257461547852e-09 p99_abs=1.4901161193847656e-08 relative_l2=1.3003010150662359e-07 cosine_similarity=0.99999999999996736 positive_delta_count=13198 negative_delta_count=13168
+QB_PRIMITIVE_NUMERICAL_NON_EQUIVALENCE PROVEN_BY_TEST
+QB_PRODUCER_LOCALIZATION semantic=q_b_projection_before_shared_head_rms_rope generic=metal_graph_matmul_q8_0_named_tensor_attn_q_b sequential=metal_graph_matmul_dense_quant_abs shared_post_projection=ds4_gpu_head_rms_norm_rope_tail_tensor metal_f16_fused_helper=UNAVAILABLE evidence=PROVEN_BY_SOURCE_AND_TEST
+HC_ATTN_PRE_SPLIT_SOURCE_AUDIT actual_input=cur_hc cp4_heads_role=downstream_prefix_control generic_projection=rms_norm_plain_rows+matmul_f16_rows sequential_projection=rms_norm_plain_single+matmul_f16_single_mv split_kernel=kernel_dsv4_hc_split_weighted_sum_norm4_shared projection_weight_type=F16 candidate_family=UNCLASSIFIED evidence=PROVEN_BY_SOURCE
+HC_ATTN_PRE_SPLIT_OBJECT output=post result=MISMATCH elements=4 mismatch_count=2 first_index=1 generic_bits=0x2fe412f8 sequential_bits=0x2fe412d0
+HC_ATTN_PRE_SPLIT_OBJECT output=comb result=MISMATCH elements=16 mismatch_count=11 first_index=1 generic_bits=0x3abd8f42 sequential_bits=0x3abd8f4b
+HC_ATTN_PRE_SPLIT_STAGE_AB hc_mix=MISMATCH pre=EXACT post=MISMATCH comb=MISMATCH generic_runtime_replay=EXACT
+HC_ATTN_PRE_SPLIT_AB input_bits_equal=PASS weights_same=PASS metadata_same=PASS post=MISMATCH comb=MISMATCH
+HC_ATTN_PRE_SPLIT_NUMERICAL_NON_EQUIVALENCE PROVEN_BY_TEST family=UNCLASSIFIED
+CP4_TAIL_SOURCE_AUDIT generic_path=metal_graph_attention_output_dense_quant_batch+ds4_gpu_hc_expand_split_tensor sequential_path=ds4_gpu_attention_output_low_q8_tensor+ds4_gpu_matmul_q8_0_hc_expand_tensor controlled_output_b_pair=ds4_gpu_matmul_q8_0_tensor_rows+ds4_gpu_hc_expand_split_tensor_vs_ds4_gpu_matmul_q8_0_hc_expand_tensor_rows generic_primitives=Q8_output_A_small_batch+Q8_output_B_small_batch+standalone_F32_HC_epilogue sequential_primitives=Q8_output_A_single_F32+Q8_output_B_single+fused_HC_expand_residual_add candidate_family=UNCLASSIFIED component_attribution=UNKNOWN evidence=PROVEN_BY_SOURCE
+CP4_TAIL_ISOLATED_AB input_bits_equal=PASS weights_same=PASS metadata_same=PASS elements=81920 result=MISMATCH mismatch_count=16858 first_index=0 generic_bits=0xbb9ce2b5 sequential_bits=0xbb9ce2ad max_abs=1.4901161193847656e-07 max_rel=0.0019752289732982852 max_ulp=22528 mismatch_fraction=0.20578613281249999 mean_abs=2.5867945091517796e-09 rms_abs=8.4377749200287527e-09 p50_abs=0 p95_abs=1.4901161193847656e-08 p99_abs=4.4703483581542969e-08 relative_l2=1.3584999213432888e-07 cosine_similarity=0.99999999999998401 positive_delta_count=8504 negative_delta_count=8354 evidence=PROVEN_BY_TEST
+CP4_TAIL_STAGE_AB attn_low=EXACT output_b=MISMATCH output_b_plus_hc=MISMATCH full_tail=MISMATCH
+CP4_TO_CP5_C2B variant=CP5_BASE control=PASS probe=PASS result=PASS
+CP4_TO_CP5_C2B variant=CP5_HC_FFN control=PASS probe=PASS result=PASS
+CP4_TO_CP5_C2B variant=CP5_ROUTER control=PASS probe=PASS result=PASS
+CP4_TO_CP5_C2B variant=CP5_ROUTER_SELECT control=PASS probe=PASS result=FAIL
+CP4_TO_CP5_SWEEP result=STOP reason=prefix_or_c2b_gate_failed
+C2B_ERROR config=1 alloc_a=1 alloc_b=1 alloc_b_probe=1 raw_snapshot=1 frontier=1 A0=1 restore1=1 A1=1 restore2=1 A2=1 materialize_a=1 pass_b_restore=1 canonical_rerun=0
+C2B_CONTROL A0_vs_A1 FAIL
+C2B_PROBE   A0_vs_A2 FAIL
+C2B_RESULT  FAIL
+CP4_TAIL_CAUSAL_SUBSTITUTION result=SKIPPED reason=c2b_non_perturbation_gate
