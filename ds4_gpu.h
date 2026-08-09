@@ -1751,6 +1751,23 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
+int ds4_gpu_attention_decode_heads_rows_exact_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const uint32_t          *n_raw_by_row,
+        uint32_t                raw_cap,
+        const uint32_t          *raw_start_by_row,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
+        const uint32_t          *n_comp_by_row,
+        uint32_t                n_rows,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
 int ds4_gpu_attention_decode_heads_rope_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

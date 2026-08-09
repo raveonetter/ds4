@@ -27062,6 +27062,68 @@ int ds4_gpu_attention_decode_heads_tensor(
     return 1;
 }
 
+int ds4_gpu_attention_decode_heads_rows_exact_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const uint32_t          *n_raw_by_row,
+        uint32_t                raw_cap,
+        const uint32_t          *raw_start_by_row,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
+        const uint32_t          *n_comp_by_row,
+        uint32_t                n_rows,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (!heads || !model_map || !q || !raw_kv || !n_raw_by_row ||
+        !raw_start_by_row || n_rows == 0 || raw_cap == 0 ||
+        n_head == 0 || head_dim == 0) {
+        return 0;
+    }
+    const uint64_t row_values = (uint64_t)n_head * head_dim;
+    if (row_values > UINT64_MAX / sizeof(float) ||
+        n_rows > UINT64_MAX / row_values / sizeof(float)) {
+        return 0;
+    }
+    const uint64_t row_bytes = row_values * sizeof(float);
+    const uint64_t rows_bytes = (uint64_t)n_rows * row_bytes;
+    if (ds4_gpu_tensor_bytes(q) < rows_bytes ||
+        ds4_gpu_tensor_bytes(heads) < rows_bytes) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        if (getenv("DS4_METAL_PROJECTION_REPAIR_DIAGNOSTICS") != NULL) {
+            fprintf(stderr,
+                    "PROJECTION_REPAIR_IMPL family=FLASH_ATTN "
+                    "op=attention_heads mode=CANONICAL_ROW_API rows=%u\n",
+                    n_rows);
+        }
+        for (uint32_t row = 0; row < n_rows; row++) {
+            const uint32_t n_comp = n_comp_by_row
+                ? n_comp_by_row[row] : 0u;
+            ds4_gpu_tensor *q_row = ds4_gpu_tensor_view(
+                q, (uint64_t)row * row_bytes, row_bytes);
+            ds4_gpu_tensor *heads_row = ds4_gpu_tensor_view(
+                heads, (uint64_t)row * row_bytes, row_bytes);
+            const int ok = q_row && heads_row &&
+                ds4_gpu_attention_decode_heads_tensor(
+                    heads_row, model_map, model_size, sinks_offset,
+                    q_row, raw_kv, n_raw_by_row[row], raw_cap,
+                    raw_start_by_row[row], n_comp ? comp_kv : NULL,
+                    comp_kv_f16, n_comp, NULL, 0u, n_head, head_dim);
+            ds4_gpu_tensor_free(heads_row);
+            ds4_gpu_tensor_free(q_row);
+            if (!ok) return 0;
+        }
+    }
+
+    return 1;
+}
+
 int ds4_gpu_swiglu_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *gate,

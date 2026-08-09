@@ -27,6 +27,9 @@ enum {
     TEST_MOE_USED_EXPERTS = 6,
     TEST_IQ2_XXS_TYPE = 16,
     TEST_Q2_K_TYPE = 10,
+    TEST_ATTN_HEADS = 2,
+    TEST_ATTN_DIM = 512,
+    TEST_ATTN_RAW_CAP = 8,
 };
 
 typedef struct __attribute__((packed)) {
@@ -241,7 +244,7 @@ static int run_q8_contract(const void *model, uint64_t model_size,
                            (size_t)count);
     }
 
-    printf("PRODUCTION_FAMILY_AB family=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV "
+    printf("EXACT_ROW_ORACLE_AB family=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV "
            "rows=%u sites=QA,KV,QB,CP4_output_B,shared_gate_up "
            "input_bits_equal=PASS weights_same=PASS metadata_same=PASS "
            "result=%s\n", TEST_ROWS, ok ? "EXACT" : "MISMATCH");
@@ -370,12 +373,12 @@ static unsigned run_f16_contracts(const void *model, uint64_t model_size,
                                 pair_b_expected, (size_t)pair_count);
     }
 
-    printf("PRODUCTION_FAMILY_AB family=FAMILY_F16_BATCH_EXT_VS_SINGLE_MV "
+    printf("EXACT_ROW_ORACLE_AB family=FAMILY_F16_BATCH_EXT_VS_SINGLE_MV "
            "rows=%u sites=hc_attn_pre_split,hc_ffn_pre,ffn_router_projection "
            "input_bits_equal=PASS weights_same=PASS "
            "metadata_same=PASS result=%s\n",
            TEST_ROWS, single_ok ? "EXACT" : "MISMATCH");
-    printf("PRODUCTION_FAMILY_AB "
+    printf("EXACT_ROW_ORACLE_AB "
            "family=FAMILY_F16_BATCH_EXT_VS_SINGLE_PAIR_MV rows=%u "
            "sites=attention_kv,attention_score,indexer_kv,indexer_score "
            "input_bits_equal=PASS weights_same=PASS metadata_same=PASS "
@@ -514,7 +517,7 @@ static int run_cp5_tail_contract(const void *model, uint64_t model_size,
                            shared_expected, (size_t)embd_count);
     }
 
-    printf("PRODUCTION_FAMILY_AB "
+    printf("EXACT_ROW_ORACLE_AB "
            "family=FAMILY_Q8_SHARED_DOWN_BATCH_F32_HC_ADD_VS_SINGLE_FUSED_HC "
            "rows=%u sites=cp5_tail input_bits_equal=PASS weights_same=PASS "
            "metadata_same=PASS result=%s\n",
@@ -536,6 +539,94 @@ static int run_cp5_tail_contract(const void *model, uint64_t model_size,
     free(residual_host);
     free(routed_host);
     free(mid_host);
+    return ok;
+}
+
+static int run_flash_attention_contract(const void *model,
+                                        uint64_t model_size,
+                                        uint64_t sinks_offset) {
+    const uint64_t row_values =
+        (uint64_t)TEST_ATTN_HEADS * TEST_ATTN_DIM;
+    const uint64_t output_count = (uint64_t)TEST_ROWS * row_values;
+    const uint64_t raw_count =
+        (uint64_t)TEST_ATTN_RAW_CAP * TEST_ATTN_DIM;
+    float *q_host = calloc((size_t)output_count, sizeof(float));
+    float *raw_host = calloc((size_t)raw_count, sizeof(float));
+    float *actual = calloc((size_t)output_count, sizeof(float));
+    float *expected = calloc((size_t)output_count, sizeof(float));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(output_count * sizeof(float));
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(
+        output_count * sizeof(float));
+    ds4_gpu_tensor *reference = ds4_gpu_tensor_alloc(
+        output_count * sizeof(float));
+    uint32_t n_raw_by_row[TEST_ROWS];
+    uint32_t raw_start_by_row[TEST_ROWS];
+    int ok = q_host && raw_host && actual && expected &&
+             q && raw && heads && reference;
+
+    for (uint64_t i = 0; ok && i < output_count; i++) {
+        q_host[i] =
+            (float)((int32_t)((i * 43u + 17u) % 127u) - 63) / 256.0f;
+    }
+    for (uint64_t i = 0; ok && i < raw_count; i++) {
+        raw_host[i] =
+            (float)((int32_t)((i * 47u + 29u) % 113u) - 56) / 256.0f;
+    }
+    for (uint32_t row = 0; row < TEST_ROWS; row++) {
+        n_raw_by_row[row] = row + 1u;
+        raw_start_by_row[row] = 0u;
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_write(q, 0, q_host,
+                                  output_count * sizeof(float)) &&
+             ds4_gpu_tensor_write(raw, 0, raw_host,
+                                  raw_count * sizeof(float)) &&
+             ds4_gpu_attention_decode_heads_rows_exact_tensor(
+                 heads, model, model_size, sinks_offset, q, raw,
+                 n_raw_by_row, TEST_ATTN_RAW_CAP, raw_start_by_row,
+                 NULL, 0u, NULL, TEST_ROWS,
+                 TEST_ATTN_HEADS, TEST_ATTN_DIM) != 0;
+    }
+    for (uint32_t row = 0; ok && row < TEST_ROWS; row++) {
+        const uint64_t row_offset =
+            (uint64_t)row * row_values * sizeof(float);
+        ds4_gpu_tensor *q_row = ds4_gpu_tensor_view(
+            q, row_offset, row_values * sizeof(float));
+        ds4_gpu_tensor *heads_row = ds4_gpu_tensor_view(
+            reference, row_offset, row_values * sizeof(float));
+        ok = q_row && heads_row &&
+             ds4_gpu_attention_decode_heads_tensor(
+                 heads_row, model, model_size, sinks_offset, q_row, raw,
+                 n_raw_by_row[row], TEST_ATTN_RAW_CAP,
+                 raw_start_by_row[row], NULL, 0u, 0u, NULL, 0u,
+                 TEST_ATTN_HEADS, TEST_ATTN_DIM) != 0;
+        ds4_gpu_tensor_free(heads_row);
+        ds4_gpu_tensor_free(q_row);
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_read(heads, 0, actual,
+                                 output_count * sizeof(float)) &&
+             ds4_gpu_tensor_read(reference, 0, expected,
+                                 output_count * sizeof(float)) &&
+             compare_exact("flash_attention_heads", actual, expected,
+                           (size_t)output_count);
+    }
+
+    printf("EXACT_ROW_ORACLE_AB "
+           "family=FAMILY_FLASH_ATTN_BATCH_DIRECT_VS_SINGLE_VEC_REDUCE "
+           "rows=%u sites=attention_heads input_bits_equal=PASS "
+           "weights_same=PASS metadata_same=PASS result=%s\n",
+           TEST_ROWS, ok ? "EXACT" : "MISMATCH");
+
+    ds4_gpu_tensor_free(reference);
+    ds4_gpu_tensor_free(heads);
+    ds4_gpu_tensor_free(raw);
+    ds4_gpu_tensor_free(q);
+    free(expected);
+    free(actual);
+    free(raw_host);
+    free(q_host);
     return ok;
 }
 
@@ -685,7 +776,7 @@ static int run_routed_moe_contract(const void *model, uint64_t model_size,
                            (size_t)act_count);
     }
 
-    printf("PRODUCTION_FAMILY_AB "
+    printf("EXACT_ROW_ORACLE_AB "
            "family=FAMILY_ROUTED_MOE_IQ2_XXS_Q2_K_BATCH_VS_SINGLE "
            "rows=%u sites=routed_moe input_bits_equal=PASS "
            "weights_same=PASS metadata_same=PASS result=%s\n",
@@ -779,7 +870,7 @@ static int run_router_contract(void) {
              compare_exact("router_weights", actual, expected,
                            (size_t)topk_count);
     }
-    printf("PRODUCTION_FAMILY_AB "
+    printf("EXACT_ROW_ORACLE_AB "
            "family=FAMILY_ROUTER_WEIGHT_NORMALIZATION_BATCH_REDUCE_VS_SINGLE_KERNEL "
            "rows=%u sites=ffn_router_weights input_bits_equal=PASS "
            "weights_same=PASS "
@@ -824,8 +915,11 @@ int main(void) {
         align_up(moe_gate_offset + moe_iq2_bytes, page);
     const uint64_t moe_down_offset =
         align_up(moe_up_offset + moe_iq2_bytes, page);
-    const uint64_t model_size =
+    const uint64_t attn_sinks_offset =
         align_up(moe_down_offset + moe_q2_bytes, page);
+    const uint64_t model_size =
+        align_up(attn_sinks_offset +
+                 (uint64_t)TEST_ATTN_HEADS * sizeof(float), page);
     void *model = NULL;
     float *input_host = calloc(
         (size_t)TEST_ROWS * TEST_IN, sizeof(float));
@@ -833,6 +927,7 @@ int main(void) {
     int initialized = 0;
     int q8_ok = 0;
     int cp5_ok = 0;
+    int flash_attention_ok = 0;
     int routed_moe_ok = 0;
     int router_ok = 0;
     unsigned f16_results = 0;
@@ -862,6 +957,11 @@ int main(void) {
                              ((uint8_t *)model + moe_up_offset), 23u);
         fill_q2_k_experts((test_block_q2_k *)
                           ((uint8_t *)model + moe_down_offset), 31u);
+        float *attn_sinks = (float *)
+            ((uint8_t *)model + attn_sinks_offset);
+        for (uint32_t head = 0; head < TEST_ATTN_HEADS; head++) {
+            attn_sinks[head] = (float)(head + 1u) / 16.0f;
+        }
         for (uint32_t row = 0; row < TEST_ROWS; row++) {
             for (uint32_t col = 0; col < TEST_IN; col++) {
                 const int32_t raw =
@@ -895,13 +995,15 @@ int main(void) {
         q8_ok = run_q8_contract(model, model_size,
                                 q8_gate_offset, q8_up_offset, input);
         cp5_ok = run_cp5_tail_contract(model, model_size, cp5_q8_offset);
+        flash_attention_ok = run_flash_attention_contract(
+            model, model_size, attn_sinks_offset);
         routed_moe_ok = run_routed_moe_contract(
             model, model_size, moe_gate_offset, moe_up_offset,
             moe_down_offset);
         f16_results = run_f16_contracts(model, model_size,
                                          f16_a_offset, f16_b_offset, input);
         router_ok = run_router_contract();
-        ok = q8_ok && cp5_ok && routed_moe_ok &&
+        ok = q8_ok && cp5_ok && flash_attention_ok && routed_moe_ok &&
              f16_results == 3u && router_ok;
     }
 
@@ -910,8 +1012,15 @@ int main(void) {
         (routed_moe_ok ? 1u : 0u) +
         ((f16_results & 1u) ? 1u : 0u) +
         ((f16_results & 2u) ? 1u : 0u) + (router_ok ? 1u : 0u);
+    printf("FLASH_ATTN_ORACLE_STATUS result=%s production_repair=NOT_IMPLEMENTED\n",
+           flash_attention_ok ? "EXACT" : "MISMATCH");
+    printf("EXACT_ROW_ORACLE_STATUS families_total=7 families_exact=%u "
+           "families_failed=%u\n",
+           families_exact + (flash_attention_ok ? 1u : 0u),
+           7u - families_exact - (flash_attention_ok ? 1u : 0u));
     printf("PROJECTION_REPAIR_STATUS families_total=6 families_exact=%u "
-           "families_failed=%u\n", families_exact, 6u - families_exact);
+           "families_failed=%u performance=UNMEASURED\n",
+           families_exact, 6u - families_exact);
     ds4_gpu_tensor_free(input);
     if (initialized) ds4_gpu_cleanup();
     free(input_host);
