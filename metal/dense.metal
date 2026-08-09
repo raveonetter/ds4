@@ -197,6 +197,24 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// Batch-row schedule with the ordinary decode reduction topology.  The host
+// expands grid.y across activation rows; every (row, output-group)
+// threadgroup runs the exact same lane traversal and two-stage reduction as
+// kernel_mul_mv_q8_0_f32.
+[[host_name("kernel_mul_mv_q8_0_f32_canonical_batch")]]
+kernel void kernel_mul_mv_q8_0_f32_canonical_batch(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 [[host_name("kernel_mul_mv_q8_0_f32_r4")]]
 kernel void kernel_mul_mv_q8_0_f32_r4(
         constant ds4_metal_args_mul_mv & args,
@@ -208,6 +226,20 @@ kernel void kernel_mul_mv_q8_0_f32_r4(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q8_0_f32_impl<4, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q8_0_f32_canonical_batch_r4")]]
+kernel void kernel_mul_mv_q8_0_f32_canonical_batch_r4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<4, constant ds4_metal_args_mul_mv &>(
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 // Output projection alias used by the optimized host dispatch.

@@ -44,9 +44,19 @@ int main(void) {
     REQUIRE(unsetenv("DS4_FAMILY_REPAIRS") == 0);
     REQUIRE(!ds4_family_repair_runtime_enabled(manifest[0].family));
     REQUIRE(setenv("DS4_FAMILY_REPAIRS", "all", 1) == 0);
-    REQUIRE(ds4_family_repair_runtime_enabled(manifest[0].family));
+    REQUIRE(!ds4_family_repair_runtime_enabled(manifest[0].family));
     REQUIRE(!ds4_family_repair_runtime_enabled(manifest[1].family));
+    REQUIRE(ds4_family_repair_runtime_enabled(manifest[2].family));
     REQUIRE(unsetenv("DS4_FAMILY_REPAIRS") == 0);
+    REQUIRE(unsetenv("DS4_FAMILY1_REPAIR") == 0);
+    REQUIRE(!ds4_family1_qa_candidate_enabled());
+    REQUIRE(setenv("DS4_FAMILY1_REPAIR", "QA", 1) == 0);
+    REQUIRE(ds4_family1_qa_candidate_enabled());
+    REQUIRE(setenv("DS4_FAMILY1_REPAIR", "qa", 1) == 0);
+    REQUIRE(ds4_family1_qa_candidate_enabled());
+    REQUIRE(setenv("DS4_FAMILY1_REPAIR", "KV", 1) == 0);
+    REQUIRE(!ds4_family1_qa_candidate_enabled());
+    REQUIRE(unsetenv("DS4_FAMILY1_REPAIR") == 0);
 
     for (i = 0; i < site_class_count; i++) {
         ds4_family_repair_dispatch disabled;

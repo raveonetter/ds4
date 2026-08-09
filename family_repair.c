@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #define DS4_REPAIR_FAMILY_BIT(family) (1u << (unsigned)(family))
 #define DS4_REPAIR_FAMILY_ALL_MASK \
@@ -21,7 +22,9 @@ static const ds4_family_repair_manifest_entry g_family_manifest[] = {
         "kernel_mul_mv_q8_0_f32 ordinary single MV",
         DS4_FAMILY_REPAIR_ENTRY_Q8_0_BATCH_EXT,
         "ds4_repair_q8_0_batch_ext",
-        DS4_FAMILY_REPAIR_EXACT,
+        /* QA has a batch-preserving candidate.  The family remains pending
+         * until KV, QB, output-B, and shared gate/up use the same topology. */
+        DS4_FAMILY_REPAIR_NOT_IMPLEMENTED,
     },
     {
         DS4_REPAIR_FAMILY_FLASH_ATTN_BATCH_DIRECT_VS_SINGLE_VEC_REDUCE,
@@ -240,6 +243,11 @@ bool ds4_family_repair_runtime_enabled(ds4_repair_family family) {
     }
     return ds4_family_repair_enabled(mask, family) &&
         ds4_family_repair_family(family)->status == DS4_FAMILY_REPAIR_EXACT;
+}
+
+bool ds4_family1_qa_candidate_enabled(void) {
+    const char *site = getenv("DS4_FAMILY1_REPAIR");
+    return site && strcasecmp(site, "QA") == 0;
 }
 
 bool ds4_family_repair_select(ds4_repair_site site,

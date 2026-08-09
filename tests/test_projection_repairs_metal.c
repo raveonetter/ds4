@@ -1,13 +1,16 @@
+#define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE
 
 #include "ds4_float_compare.h"
 #include "ds4_gpu.h"
 
+#include <float.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 enum {
@@ -153,12 +156,19 @@ static int compare_exact(const char *label, const float *actual,
     return 1;
 }
 
+static double monotonic_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
+
 static int run_q8_contract(const void *model, uint64_t model_size,
                            uint64_t gate_offset, uint64_t up_offset,
                            ds4_gpu_tensor *input) {
     const uint64_t count = (uint64_t)TEST_ROWS * TEST_Q8_OUT;
     const uint64_t bytes = count * sizeof(float);
-    float *actual = calloc((size_t)count, sizeof(float));
+    float *generic_host = calloc((size_t)count, sizeof(float));
+    float *candidate_host = calloc((size_t)count, sizeof(float));
     float *expected = calloc((size_t)count, sizeof(float));
     float *gate_actual = calloc((size_t)count, sizeof(float));
     float *gate_expected = calloc((size_t)count, sizeof(float));
@@ -166,7 +176,8 @@ static int run_q8_contract(const void *model, uint64_t model_size,
     float *up_expected = calloc((size_t)count, sizeof(float));
     float *mid_actual = calloc((size_t)count, sizeof(float));
     float *mid_expected = calloc((size_t)count, sizeof(float));
-    ds4_gpu_tensor *batch = ds4_gpu_tensor_alloc(bytes);
+    ds4_gpu_tensor *generic = ds4_gpu_tensor_alloc(bytes);
+    ds4_gpu_tensor *candidate = ds4_gpu_tensor_alloc(bytes);
     ds4_gpu_tensor *reference = ds4_gpu_tensor_alloc(bytes);
     ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(bytes);
     ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(bytes);
@@ -174,14 +185,25 @@ static int run_q8_contract(const void *model, uint64_t model_size,
     ds4_gpu_tensor *gate_ref = ds4_gpu_tensor_alloc(bytes);
     ds4_gpu_tensor *up_ref = ds4_gpu_tensor_alloc(bytes);
     ds4_gpu_tensor *mid_ref = ds4_gpu_tensor_alloc(bytes);
-    int ok = actual && expected && gate_actual && gate_expected &&
+    int old_mismatch = 0;
+    int candidate_exact = 0;
+    int shared_gate_exact = 0;
+    int performance_ok = 0;
+    double generic_best_ms = DBL_MAX;
+    double candidate_best_ms = DBL_MAX;
+    double exact_best_ms = DBL_MAX;
+    int ok = generic_host && candidate_host && expected &&
+             gate_actual && gate_expected &&
              up_actual && up_expected && mid_actual && mid_expected &&
-             batch && reference && gate && up && mid &&
+             generic && candidate && reference && gate && up && mid &&
              gate_ref && up_ref && mid_ref;
 
     if (ok) {
-        ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
-                 batch, model, model_size, gate_offset,
+        ok = ds4_gpu_matmul_q8_0_tensor(
+                 generic, model, model_size, gate_offset,
+                 TEST_IN, TEST_Q8_OUT, input, TEST_ROWS) != 0 &&
+             ds4_gpu_matmul_q8_0_canonical_batch_tensor(
+                 candidate, model, model_size, gate_offset,
                  TEST_IN, TEST_Q8_OUT, input, TEST_ROWS) != 0;
     }
     for (uint32_t row = 0; ok && row < TEST_ROWS; row++) {
@@ -227,7 +249,9 @@ static int run_q8_contract(const void *model, uint64_t model_size,
         ds4_gpu_tensor_free(in_row);
     }
     if (ok) {
-        ok = ds4_gpu_tensor_read(batch, 0, actual, bytes) &&
+        ds4_float_compare_result old_result;
+        ok = ds4_gpu_tensor_read(generic, 0, generic_host, bytes) &&
+             ds4_gpu_tensor_read(candidate, 0, candidate_host, bytes) &&
              ds4_gpu_tensor_read(reference, 0, expected, bytes) &&
              ds4_gpu_tensor_read(gate, 0, gate_actual, bytes) &&
              ds4_gpu_tensor_read(gate_ref, 0, gate_expected, bytes) &&
@@ -235,19 +259,88 @@ static int run_q8_contract(const void *model, uint64_t model_size,
              ds4_gpu_tensor_read(up_ref, 0, up_expected, bytes) &&
              ds4_gpu_tensor_read(mid, 0, mid_actual, bytes) &&
              ds4_gpu_tensor_read(mid_ref, 0, mid_expected, bytes) &&
-             compare_exact("q8_projection", actual, expected, (size_t)count) &&
-             compare_exact("q8_fused_gate", gate_actual, gate_expected,
-                           (size_t)count) &&
-             compare_exact("q8_fused_up", up_actual, up_expected,
-                           (size_t)count) &&
-             compare_exact("q8_fused_mid", mid_actual, mid_expected,
-                           (size_t)count);
+             ds4_float_compare_exact(generic_host, expected,
+                                     (size_t)count, &old_result);
+        if (ok) {
+            old_mismatch = !old_result.bit_exact;
+            candidate_exact = compare_exact(
+                "family1_qa_candidate", candidate_host, expected,
+                (size_t)count);
+            ok = old_mismatch && candidate_exact;
+            if (!old_mismatch) {
+                fprintf(stderr,
+                        "family1_qa_generic unexpectedly matched the single-row oracle\n");
+            }
+        }
+        if (ok) {
+            shared_gate_exact =
+                compare_exact("q8_fused_gate", gate_actual, gate_expected,
+                              (size_t)count) &&
+                compare_exact("q8_fused_up", up_actual, up_expected,
+                              (size_t)count) &&
+                compare_exact("q8_fused_mid", mid_actual, mid_expected,
+                              (size_t)count);
+            ok = shared_gate_exact;
+        }
     }
 
-    printf("EXACT_ROW_ORACLE_AB family=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV "
-           "rows=%u sites=QA,KV,QB,CP4_output_B,shared_gate_up "
+    for (unsigned trial = 0; ok && trial < 5u; trial++) {
+        double start = monotonic_ms();
+        ok = ds4_gpu_matmul_q8_0_tensor(
+                 generic, model, model_size, gate_offset,
+                 TEST_IN, TEST_Q8_OUT, input, TEST_ROWS) != 0;
+        double elapsed = monotonic_ms() - start;
+        if (ok && elapsed < generic_best_ms) generic_best_ms = elapsed;
+
+        start = monotonic_ms();
+        if (ok) {
+            ok = ds4_gpu_matmul_q8_0_canonical_batch_tensor(
+                     candidate, model, model_size, gate_offset,
+                     TEST_IN, TEST_Q8_OUT, input, TEST_ROWS) != 0;
+        }
+        elapsed = monotonic_ms() - start;
+        if (ok && elapsed < candidate_best_ms) candidate_best_ms = elapsed;
+
+        start = monotonic_ms();
+        if (ok) {
+            ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                     reference, model, model_size, gate_offset,
+                     TEST_IN, TEST_Q8_OUT, input, TEST_ROWS) != 0;
+        }
+        elapsed = monotonic_ms() - start;
+        if (ok && elapsed < exact_best_ms) exact_best_ms = elapsed;
+    }
+    if (ok) {
+        performance_ok = candidate_best_ms < exact_best_ms;
+        ok = performance_ok;
+    }
+
+    printf("FAMILY1_REPAIR_TEST "
+           "family=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV site=QA "
+           "old_kernel=kernel_mul_mv_ext_q8_0_f32_r1 "
+           "new_kernel=kernel_mul_mv_q8_0_f32_canonical_batch "
            "input_bits_equal=PASS weights_same=PASS metadata_same=PASS "
-           "result=%s\n", TEST_ROWS, ok ? "EXACT" : "MISMATCH");
+           "old_vs_seq=%s new_vs_seq=%s batch_parallelism=PRESERVED "
+           "candidate_dispatches=1 exact_dispatches=%u "
+           "generic_ms=%.3f candidate_ms=%.3f exact_ms=%.3f "
+           "candidate_over_generic=%.3f "
+           "candidate_faster_than_exact=%s result=%s\n",
+           old_mismatch ? "MISMATCH" : "EXACT",
+           candidate_exact ? "EXACT" : "MISMATCH",
+           TEST_ROWS,
+           generic_best_ms == DBL_MAX ? 0.0 : generic_best_ms,
+           candidate_best_ms == DBL_MAX ? 0.0 : candidate_best_ms,
+           exact_best_ms == DBL_MAX ? 0.0 : exact_best_ms,
+           generic_best_ms > 0.0 && generic_best_ms != DBL_MAX &&
+                   candidate_best_ms != DBL_MAX
+               ? candidate_best_ms / generic_best_ms
+               : 0.0,
+           performance_ok ? "PASS" : "FAIL",
+           ok ? "PASS" : "FAIL");
+    printf("EXACT_ROW_ORACLE_AB "
+           "family=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV "
+           "site=shared_gate_up rows=%u result=%s performance=UNMEASURED\n",
+           TEST_ROWS, shared_gate_exact ? "EXACT" : "MISMATCH");
 
     ds4_gpu_tensor_free(mid_ref);
     ds4_gpu_tensor_free(up_ref);
@@ -256,7 +349,8 @@ static int run_q8_contract(const void *model, uint64_t model_size,
     ds4_gpu_tensor_free(up);
     ds4_gpu_tensor_free(gate);
     ds4_gpu_tensor_free(reference);
-    ds4_gpu_tensor_free(batch);
+    ds4_gpu_tensor_free(candidate);
+    ds4_gpu_tensor_free(generic);
     free(mid_expected);
     free(mid_actual);
     free(up_expected);
@@ -264,7 +358,8 @@ static int run_q8_contract(const void *model, uint64_t model_size,
     free(gate_expected);
     free(gate_actual);
     free(expected);
-    free(actual);
+    free(candidate_host);
+    free(generic_host);
     return ok;
 }
 
@@ -889,7 +984,8 @@ static int run_router_contract(void) {
 }
 
 int main(void) {
-    const uint64_t page = (uint64_t)getpagesize();
+    const long page_size = sysconf(_SC_PAGESIZE);
+    const uint64_t page = page_size > 0 ? (uint64_t)page_size : 4096u;
     const uint64_t q8_bytes =
         (uint64_t)TEST_Q8_OUT * (TEST_IN / 32u) * sizeof(test_block_q8_0);
     const uint64_t f16_bytes =
@@ -974,7 +1070,8 @@ int main(void) {
 
     unsetenv("DS4_METAL_ENABLE_Q8_DECODE_EXACT_VIEWS");
     unsetenv("DS4_METAL_ENABLE_F32_DECODE_EXACT_VIEWS");
-    setenv("DS4_METAL_PROJECTION_REPAIR_DIAGNOSTICS", "1", 1);
+    unsetenv("DS4_METAL_Q8_DECODE_MPP");
+    unsetenv("DS4_METAL_PROJECTION_REPAIR_DIAGNOSTICS");
     if (ok) {
         ok = ds4_gpu_init() != 0;
         initialized = ok;
@@ -1007,8 +1104,7 @@ int main(void) {
              f16_results == 3u && router_ok;
     }
 
-    const unsigned families_exact = (q8_ok ? 1u : 0u) +
-        (cp5_ok ? 1u : 0u) +
+    const unsigned families_exact = (cp5_ok ? 1u : 0u) +
         (routed_moe_ok ? 1u : 0u) +
         ((f16_results & 1u) ? 1u : 0u) +
         ((f16_results & 2u) ? 1u : 0u) + (router_ok ? 1u : 0u);
@@ -1016,11 +1112,20 @@ int main(void) {
            flash_attention_ok ? "EXACT" : "MISMATCH");
     printf("EXACT_ROW_ORACLE_STATUS families_total=7 families_exact=%u "
            "families_failed=%u\n",
-           families_exact + (flash_attention_ok ? 1u : 0u),
-           7u - families_exact - (flash_attention_ok ? 1u : 0u));
-    printf("PROJECTION_REPAIR_STATUS families_total=6 families_exact=%u "
-           "families_failed=%u performance=UNMEASURED\n",
-           families_exact, 6u - families_exact);
+           families_exact + (q8_ok ? 1u : 0u) +
+               (flash_attention_ok ? 1u : 0u),
+           7u - families_exact - (q8_ok ? 1u : 0u) -
+               (flash_attention_ok ? 1u : 0u));
+    printf("FAMILY_REPAIR_CANDIDATE_STATUS "
+           "family=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV "
+           "completed_sites=%u pending_sites=%u result=%s\n",
+           q8_ok ? 1u : 0u, q8_ok ? 4u : 5u,
+           q8_ok ? "PASS" : "FAIL");
+    printf("PROJECTION_REPAIR_STATUS families_total=7 families_exact=%u "
+           "families_partial=%u families_not_implemented=1 "
+           "families_failed=%u\n",
+           families_exact, q8_ok ? 1u : 0u,
+           5u - families_exact + (q8_ok ? 0u : 1u));
     ds4_gpu_tensor_free(input);
     if (initialized) ds4_gpu_cleanup();
     free(input_host);
