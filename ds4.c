@@ -55744,7 +55744,7 @@ static bool ds4_mixed_attention_primitive_ab_run(
         const ds4_c2b_capture *capture,
         uint32_t layer_index,
         ds4_mixed_attention_ab_result *result) {
-    ds4_gpu_tensor *q_clone = NULL;
+    ds4_gpu_tensor *sequential_q = NULL;
     ds4_gpu_tensor *generic_out = NULL;
     ds4_gpu_tensor *sequential_out = NULL;
     ds4_gpu_tensor *generic_stage = NULL;
@@ -55876,21 +55876,18 @@ static bool ds4_mixed_attention_primitive_ab_run(
     if (!result->metadata_same) goto done;
 
     failed_stage = "allocation";
-    q_clone = ds4_gpu_tensor_alloc(q_bytes);
+    /* Both attention primitives only read Q.  A view preserves the captured
+     * bits without requiring ds4_gpu_tensor_copy's active batch command
+     * buffer, which is no longer live when this isolated replay runs. */
+    sequential_q = ds4_gpu_tensor_view(
+        capture->cp2_q_cur[layer_index], 0, q_bytes);
     generic_out = ds4_gpu_tensor_alloc(q_bytes);
     sequential_out = ds4_gpu_tensor_alloc(q_bytes);
     generic_stage = ds4_gpu_tensor_alloc(max_stage_bytes);
     sequential_stage = ds4_gpu_tensor_alloc(
         (uint64_t)rows * max_stage_bytes);
-    if (!q_clone || !generic_out || !sequential_out || !generic_stage ||
+    if (!sequential_q || !generic_out || !sequential_out || !generic_stage ||
         !sequential_stage) {
-        goto done;
-    }
-
-    failed_stage = "q_clone";
-    if (!ds4_gpu_tensor_copy(q_clone, 0,
-                             capture->cp2_q_cur[layer_index], 0,
-                             q_bytes)) {
         goto done;
     }
 
@@ -55958,7 +55955,7 @@ static bool ds4_mixed_attention_primitive_ab_run(
         const uint32_t row_comp =
             capture->cp3_n_comp[layer_index][row];
         ds4_gpu_tensor *q_row = ds4_gpu_tensor_view(
-            q_clone, (uint64_t)row * q_row_values * sizeof(float),
+            sequential_q, (uint64_t)row * q_row_values * sizeof(float),
             q_row_values * sizeof(float));
         ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
             sequential_out,
@@ -56040,7 +56037,7 @@ static bool ds4_mixed_attention_primitive_ab_run(
     failed_stage = "readback";
     if (!ds4_gpu_tensor_read(capture->cp2_q_cur[layer_index], 0,
                              q_generic_cpu, q_bytes) ||
-        !ds4_gpu_tensor_read(q_clone, 0, q_sequential_cpu, q_bytes) ||
+        !ds4_gpu_tensor_read(sequential_q, 0, q_sequential_cpu, q_bytes) ||
         !ds4_gpu_tensor_read(capture->cp4_heads_raw[layer_index], 0,
                              runtime_cpu, q_bytes) ||
         !ds4_gpu_tensor_read(generic_out, 0, generic_cpu, q_bytes) ||
@@ -56192,7 +56189,7 @@ done:;
     ds4_gpu_tensor_free(generic_stage);
     ds4_gpu_tensor_free(sequential_out);
     ds4_gpu_tensor_free(generic_out);
-    ds4_gpu_tensor_free(q_clone);
+    ds4_gpu_tensor_free(sequential_q);
     return ok && result->executed && result->q_exact &&
         result->staged_kv_exact && result->metadata_same &&
         result->generic_runtime_replay_exact;
