@@ -741,8 +741,9 @@ int ds4_gpu_matmul_f16_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-/* Metal family repairs: one dispatch over independent rows while retaining
- * the ordinary decode matvec reduction order within every row. */
+/* Metal family repairs: one command encoder with an ordinary one-row decode
+ * dispatch per row.  Kernel entry, tensor shape, grid geometry, and reduction
+ * order therefore match canonical decode; only buffer offsets advance. */
 int ds4_gpu_matmul_f16_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -2123,7 +2124,8 @@ int ds4_gpu_router_select_tensor(
         bool                    hash_mode,
         const ds4_gpu_tensor *logits);
 
-/* Isolated router-weight family entry and its ordinary one-row oracle. */
+/* Isolated router-weight family entry.  The rows entry repeatedly dispatches
+ * the ordinary one-row kernel with row-relative buffer offsets. */
 int ds4_gpu_router_weights_rows_exact_tensor(
         ds4_gpu_tensor       *weights,
         const ds4_gpu_tensor *probs,
