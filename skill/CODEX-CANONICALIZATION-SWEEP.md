@@ -807,11 +807,11 @@ The family is proven only when the isolated same-input A/B executes, all four
 trial gates pass, the selected component substitutions repair the layer-2
 CP3-P objects, and T3 advances the global first divergence beyond CP3-P.
 
-## Compressed zero-prefix attention forward sweep
+## Compressed attention forward sweep
 
 `DS4_MIXED_ATTN_FAMILY_SWEEP=1` starts from the proven T3 compressor result
-and audits the layer-2 static-mixed attention boundary.  It is valid only with
-the CP3 family and CP4→CP5 sweep enabled.
+and audits the layer-2 mixed-attention boundary at the real diagnostic S0.  It
+is valid only with the CP3 family and CP4→CP5 sweep enabled.
 
 The diagnostic performs:
 
@@ -820,12 +820,14 @@ The diagnostic performs:
    sequence (physical masked slots are ignored);
 3. a same-input comparison against ordinary gathered decode, row by row;
 4. a layer-2-only causal substitution;
-5. up to two further natural compressed zero-prefix attention sites, each
+5. up to two further natural compressed attention sites, each
    with its own primitive replay, input gate, A0/A1/A2 gate, and substitution.
 
-For the diagnostic block size (`n_tokens <= 5`), the Metal static-mixed
-wrapper selects the vector FlashAttention kernel plus reduce.  The source
-audit prints the selected runtime topology; family adjudication must use that
+The documented command prefills a nonempty prompt, so its real generic path is
+the absolute-position prefixed mixed-batch wrapper over the persistent raw KV
+ring and compressed cache.  A true `pos0 == 0` run instead selects the static
+prefill wrapper.  The source audit prints `pos0`, raw-ring span, compressed
+counts, and the selected runtime topology; family adjudication must use that
 line rather than the wrapper name.
 
 Run:

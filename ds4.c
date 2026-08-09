@@ -27672,9 +27672,10 @@ static bool metal_graph_cp3_projection_substitute_rows(
 }
 
 /* Produce the exact row topology used by ordinary sequential decode from the
- * zero-prefix batch operands.  This is a diagnostic substitution only.  It
- * deliberately calls the public gathered decode primitive for every row,
- * including rows that have not emitted a compressed key yet. */
+ * batch operands and persistent KV caches.  This is a diagnostic substitution
+ * only.  It deliberately calls the public gathered decode primitive for every
+ * row, using the absolute position and the compressed visibility captured for
+ * that row. */
 static bool metal_graph_attention_substitute_canonical_rows(
         ds4_gpu_graph *g,
         const ds4_model *model,
@@ -27685,7 +27686,7 @@ static bool metal_graph_attention_substitute_canonical_rows(
         const uint32_t *comp_counts) {
     if (!ds4_attention_layer_substitution_enabled(il)) return true;
     const uint32_t ratio = ds4_layer_compress_ratio(il);
-    if (!g || !model || !layer || pos0 != 0 || n_tokens == 0 ||
+    if (!g || !model || !layer || n_tokens == 0 ||
         n_tokens > g->raw_cap || ratio == 0 || !comp_counts ||
         !metal_graph_batch_q(g) || !metal_graph_batch_kv(g) ||
         !metal_graph_batch_heads(g) || !g->layer_raw_cache[il] ||
@@ -27700,11 +27701,10 @@ static bool metal_graph_attention_substitute_canonical_rows(
 
     bool ok = true;
     for (uint32_t row = 0; ok && row < n_tokens; row++) {
-        const uint32_t logical_raw = row + 1u;
-        const uint32_t n_raw = g->raw_window != 0 &&
-                               logical_raw > g->raw_window
-            ? g->raw_window : logical_raw;
-        const uint32_t raw_start = logical_raw - n_raw;
+        const uint32_t pos = pos0 + row;
+        const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1u);
+        const uint32_t raw_start =
+            metal_graph_raw_start_for_span(g, pos, n_raw);
         const uint32_t n_comp = comp_counts[row];
         if (n_comp > final_comp) return false;
         ds4_gpu_tensor *q_row = metal_graph_tensor_row_view(
@@ -27718,9 +27718,9 @@ static bool metal_graph_attention_substitute_canonical_rows(
                 model->size,
                 layer->attn_sinks->abs_offset,
                 q_row,
-                metal_graph_batch_kv(g),
+                g->layer_raw_cache[il],
                 n_raw,
-                n_tokens,
+                g->raw_cap,
                 raw_start,
                 n_comp ? g->layer_attn_comp_cache[il] : NULL,
                 metal_graph_attn_comp_cache_is_f16(),
@@ -55671,9 +55671,14 @@ typedef struct {
     bool numerical_non_equivalence;
     bool static_mixed;
     bool generic_vec_reduce;
+    bool zero_prefix;
     uint32_t layer;
     uint32_t ratio;
+    uint32_t pos0;
     uint32_t n_tokens;
+    uint32_t n_raw;
+    uint32_t raw_start;
+    uint32_t n_comp_before;
     uint32_t n_comp;
     ds4_float_compare_result output_comparison;
     ds4_first_divergence_float_signature output_signature;
@@ -55693,11 +55698,47 @@ static const char *ds4_mixed_attention_family_name(
     return "FAMILY_FLASH_ATTN_STATIC_MASKED_VEC_REDUCE_VS_SINGLE_GATHERED_VEC_REDUCE";
 }
 
-/* Replay the real zero-prefix attention producer on the captured Pass-A
- * operands, then compare it with the ordinary decode primitive row by row.
- * The F16 semantic staging audit compares only visible keys: the generic
- * batch is allowed to contain future raw rows and not-yet-visible compressed
- * rows behind its mask, while the gathered side omits those physical slots. */
+static bool ds4_mixed_attention_stage_visible_kv(
+        ds4_gpu_tensor *dst,
+        const ds4_gpu_tensor *raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_raw,
+        const ds4_gpu_tensor *comp,
+        uint32_t n_comp) {
+    if (!dst || !raw || raw_cap == 0 || raw_start >= raw_cap ||
+        n_raw == 0 || n_raw > raw_cap) {
+        return false;
+    }
+    if (n_comp != 0) {
+        return comp && ds4_gpu_flash_kv_stage_f16_tensor(
+            dst, raw, raw_cap, raw_start, n_raw, comp, 1, n_comp,
+            DS4_N_HEAD_DIM) != 0;
+    }
+
+    const uint32_t first_rows = n_raw < raw_cap - raw_start
+        ? n_raw : raw_cap - raw_start;
+    const uint32_t wrapped_rows = n_raw - first_rows;
+    const uint64_t raw_row_bytes =
+        (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t f16_row_bytes =
+        (uint64_t)DS4_N_HEAD_DIM * sizeof(uint16_t);
+    bool ok = ds4_gpu_tensor_copy_f32_to_f16(
+        dst, 0, raw, (uint64_t)raw_start * raw_row_bytes,
+        (uint64_t)first_rows * DS4_N_HEAD_DIM) != 0;
+    if (ok && wrapped_rows != 0) {
+        ok = ds4_gpu_tensor_copy_f32_to_f16(
+            dst, (uint64_t)first_rows * f16_row_bytes, raw, 0,
+            (uint64_t)wrapped_rows * DS4_N_HEAD_DIM) != 0;
+    }
+    return ok;
+}
+
+/* Replay the real attention producer on the captured Pass-A operands, then
+ * compare it with the ordinary decode primitive row by row.  At pos0 == 0 the
+ * real producer is the static-prefill wrapper; after a prompt prefix it is the
+ * absolute-position mixed-batch wrapper over the persistent raw ring.  The
+ * F16 semantic staging audit compares only the keys visible to each row. */
 static bool ds4_mixed_attention_primitive_ab_run(
         ds4_session *s,
         const ds4_c2b_capture *capture,
@@ -55722,12 +55763,29 @@ static bool ds4_mixed_attention_primitive_ab_run(
 
     if (!result) return false;
     memset(result, 0, sizeof(*result));
-    if (!s || !capture || capture->graph != &s->graph ||
-        layer_index >= DS4_N_LAYER || capture->start != 0 ||
-        capture->n_tokens == 0 || capture->n_tokens >= 20u ||
-        !capture->cp2_q_cur[layer_index] ||
+    if (!s) goto done;
+    if (!capture) {
+        failed_stage = "preconditions_capture";
+        goto done;
+    }
+    if (capture->graph != &s->graph) {
+        failed_stage = "preconditions_graph";
+        goto done;
+    }
+    if (layer_index >= DS4_N_LAYER) {
+        failed_stage = "preconditions_layer";
+        goto done;
+    }
+    result->layer = layer_index;
+    result->pos0 = capture->start;
+    if (capture->n_tokens == 0 || capture->n_tokens >= 20u) {
+        failed_stage = "preconditions_rows";
+        goto done;
+    }
+    if (!capture->cp2_q_cur[layer_index] ||
         !capture->cp2_kv_r[layer_index] ||
         !capture->cp4_heads_raw[layer_index]) {
+        failed_stage = "preconditions_capture_tensors";
         goto done;
     }
 
@@ -55739,15 +55797,38 @@ static bool ds4_mixed_attention_primitive_ab_run(
     const uint32_t before = capture->n_comp_before[layer_index];
     const uint32_t final_count =
         capture->cp3_n_comp[layer_index][rows - 1u];
-    if (ratio == 0 || final_count < before || before != 0 ||
-        final_count - before > rows ||
-        !layer->attn_sinks || !g->layer_attn_comp_cache[layer_index] ||
-        !metal_graph_attn_comp_cache_is_f16()) {
+    result->ratio = ratio;
+    result->n_tokens = rows;
+    result->n_comp_before = before;
+    result->n_comp = final_count;
+    result->zero_prefix = capture->start == 0;
+    if (ratio == 0) {
+        failed_stage = "preconditions_ratio";
         goto done;
     }
-    const uint32_t n_comp = final_count - before;
-    const bool static_mixed = n_comp != 0;
-    if (static_mixed && ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K) {
+    if (final_count < before || final_count - before > rows) {
+        failed_stage = "preconditions_comp_counts";
+        goto done;
+    }
+    if (!layer->attn_sinks || !g->layer_attn_comp_cache[layer_index] ||
+        !metal_graph_attn_comp_cache_is_f16()) {
+        failed_stage = "preconditions_kv_storage";
+        goto done;
+    }
+    const bool static_mixed = final_count != 0;
+    if (static_mixed && ratio == 4 &&
+        final_count > DS4_N_INDEXER_TOP_K) {
+        failed_stage = "preconditions_indexed_attention";
+        goto done;
+    }
+
+    const uint32_t final_pos = capture->start + rows - 1u;
+    const uint32_t n_raw = result->zero_prefix
+        ? rows : metal_graph_raw_span_for_batch(g, capture->start, rows);
+    const uint32_t raw_start = result->zero_prefix
+        ? 0u : metal_graph_raw_start_for_span(g, final_pos, n_raw);
+    if (n_raw == 0 || n_raw > g->raw_cap || raw_start >= g->raw_cap) {
+        failed_stage = "preconditions_raw_span";
         goto done;
     }
 
@@ -55755,33 +55836,33 @@ static bool ds4_mixed_attention_primitive_ab_run(
         (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t q_values = (uint64_t)rows * q_row_values;
     const uint64_t q_bytes = q_values * sizeof(float);
-    const uint64_t raw_row_bytes =
-        (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
     const uint64_t f16_row_bytes =
         (uint64_t)DS4_N_HEAD_DIM * sizeof(uint16_t);
-    const uint64_t max_stage_rows = (uint64_t)rows + n_comp;
+    const uint64_t max_stage_rows = (uint64_t)n_raw + final_count;
     const uint64_t max_stage_bytes = max_stage_rows * f16_row_bytes;
     if (q_values > SIZE_MAX || max_stage_rows > SIZE_MAX / rows ||
         ds4_gpu_tensor_bytes(capture->cp2_q_cur[layer_index]) < q_bytes ||
         ds4_gpu_tensor_bytes(capture->cp2_kv_r[layer_index]) <
-            (uint64_t)rows * raw_row_bytes ||
+            (uint64_t)rows * DS4_N_HEAD_DIM * sizeof(float) ||
         ds4_gpu_tensor_bytes(capture->cp4_heads_raw[layer_index]) < q_bytes ||
-        (n_comp &&
+        (final_count &&
          ds4_gpu_tensor_bytes(g->layer_attn_comp_cache[layer_index]) <
-             (uint64_t)n_comp * f16_row_bytes)) {
+             (uint64_t)final_count * f16_row_bytes) ||
+        ds4_gpu_tensor_bytes(g->layer_raw_cache[layer_index]) <
+            (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float)) {
+        failed_stage = "preconditions_buffer_sizes";
         goto done;
     }
 
-    result->layer = layer_index;
-    result->ratio = ratio;
-    result->n_tokens = rows;
-    result->n_comp = n_comp;
     result->static_mixed = static_mixed;
-    result->generic_vec_reduce = rows < 20u;
+    result->generic_vec_reduce = result->zero_prefix && rows < 20u;
+    result->n_raw = n_raw;
+    result->raw_start = raw_start;
     result->head_mapping = DS4_N_HEAD != 0 && DS4_N_HEAD_DIM == 512u;
-    result->sequence_bounds = g->raw_window == 0 || rows <= g->raw_window;
+    result->sequence_bounds = true;
     for (uint32_t row = 0; result->sequence_bounds && row < rows; row++) {
-        const uint32_t expected_comp = (row + 1u) / ratio;
+        const uint32_t expected_comp =
+            (capture->start + row + 1u) / ratio;
         result->sequence_bounds =
             capture->cp3_n_comp[layer_index][row] == expected_comp;
     }
@@ -55814,7 +55895,7 @@ static bool ds4_mixed_attention_primitive_ab_run(
     }
 
     failed_stage = "generic_runtime_replay";
-    if (static_mixed) {
+    if (result->zero_prefix && static_mixed) {
         ok = ds4_gpu_attention_prefill_static_mixed_heads_tensor(
             generic_out,
             s->engine->model.map,
@@ -55825,12 +55906,12 @@ static bool ds4_mixed_attention_primitive_ab_run(
             g->layer_attn_comp_cache[layer_index],
             1,
             rows,
-            n_comp,
+            final_count,
             g->raw_window,
             ratio,
             DS4_N_HEAD,
             DS4_N_HEAD_DIM) != 0;
-    } else {
+    } else if (result->zero_prefix) {
         ok = ds4_gpu_attention_prefill_raw_heads_tensor(
             generic_out,
             s->engine->model.map,
@@ -55842,18 +55923,40 @@ static bool ds4_mixed_attention_primitive_ab_run(
             g->raw_window,
             DS4_N_HEAD,
             DS4_N_HEAD_DIM) != 0;
+    } else {
+        ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(
+            generic_out,
+            s->engine->model.map,
+            s->engine->model.size,
+            layer->attn_sinks->abs_offset,
+            capture->cp2_q_cur[layer_index],
+            g->layer_raw_cache[layer_index],
+            g->layer_attn_comp_cache[layer_index],
+            1,
+            NULL,
+            0,
+            rows,
+            capture->start,
+            n_raw,
+            g->raw_cap,
+            raw_start,
+            final_count,
+            g->raw_window,
+            ratio,
+            DS4_N_HEAD,
+            DS4_N_HEAD_DIM) != 0;
     }
     if (!ok) goto done;
 
     failed_stage = "sequential_primitive";
     for (uint32_t row = 0; ok && row < rows; row++) {
-        const uint32_t logical_raw = row + 1u;
-        const uint32_t n_raw = g->raw_window != 0 &&
-                               logical_raw > g->raw_window
-            ? g->raw_window : logical_raw;
-        const uint32_t raw_start = logical_raw - n_raw;
+        const uint32_t pos = capture->start + row;
+        const uint32_t row_n_raw =
+            metal_graph_raw_span_for_batch(g, pos, 1u);
+        const uint32_t row_raw_start =
+            metal_graph_raw_start_for_span(g, pos, row_n_raw);
         const uint32_t row_comp =
-            capture->cp3_n_comp[layer_index][row] - before;
+            capture->cp3_n_comp[layer_index][row];
         ds4_gpu_tensor *q_row = ds4_gpu_tensor_view(
             q_clone, (uint64_t)row * q_row_values * sizeof(float),
             q_row_values * sizeof(float));
@@ -55868,10 +55971,10 @@ static bool ds4_mixed_attention_primitive_ab_run(
                 s->engine->model.size,
                 layer->attn_sinks->abs_offset,
                 q_row,
-                capture->cp2_kv_r[layer_index],
-                n_raw,
-                rows,
-                raw_start,
+                g->layer_raw_cache[layer_index],
+                row_n_raw,
+                g->raw_cap,
+                row_raw_start,
                 row_comp ? g->layer_attn_comp_cache[layer_index] : NULL,
                 1,
                 row_comp,
@@ -55885,45 +55988,36 @@ static bool ds4_mixed_attention_primitive_ab_run(
     if (!ok) goto done;
 
     failed_stage = "semantic_staging";
-    ok = ds4_gpu_tensor_copy_f32_to_f16(
-        generic_stage, 0, capture->cp2_kv_r[layer_index], 0,
-        rows * DS4_N_HEAD_DIM) != 0;
-    if (ok && n_comp) {
-        ok = ds4_gpu_tensor_copy(
-            generic_stage, (uint64_t)rows * f16_row_bytes,
-            g->layer_attn_comp_cache[layer_index],
-            (uint64_t)before * f16_row_bytes,
-            (uint64_t)n_comp * f16_row_bytes) != 0;
-    }
+    ok = ds4_mixed_attention_stage_visible_kv(
+        generic_stage,
+        g->layer_raw_cache[layer_index],
+        g->raw_cap,
+        raw_start,
+        n_raw,
+        final_count ? g->layer_attn_comp_cache[layer_index] : NULL,
+        final_count);
     for (uint32_t row = 0; ok && row < rows; row++) {
-        const uint32_t logical_raw = row + 1u;
-        const uint32_t n_raw = g->raw_window != 0 &&
-                               logical_raw > g->raw_window
-            ? g->raw_window : logical_raw;
-        const uint32_t raw_start = logical_raw - n_raw;
+        const uint32_t pos = capture->start + row;
+        const uint32_t row_n_raw =
+            metal_graph_raw_span_for_batch(g, pos, 1u);
+        const uint32_t row_raw_start =
+            metal_graph_raw_start_for_span(g, pos, row_n_raw);
         const uint32_t row_comp =
-            capture->cp3_n_comp[layer_index][row] - before;
+            capture->cp3_n_comp[layer_index][row];
         ds4_gpu_tensor *stage_row = ds4_gpu_tensor_view(
             sequential_stage, (uint64_t)row * max_stage_bytes,
-            ((uint64_t)n_raw + row_comp) * f16_row_bytes);
+            ((uint64_t)row_n_raw + row_comp) * f16_row_bytes);
         if (!stage_row) {
             ok = false;
-        } else if (row_comp) {
-            ok = ds4_gpu_flash_kv_stage_f16_tensor(
-                stage_row,
-                capture->cp2_kv_r[layer_index],
-                rows,
-                raw_start,
-                n_raw,
-                g->layer_attn_comp_cache[layer_index],
-                1,
-                row_comp,
-                DS4_N_HEAD_DIM) != 0;
         } else {
-            ok = ds4_gpu_tensor_copy_f32_to_f16(
-                stage_row, 0, capture->cp2_kv_r[layer_index],
-                (uint64_t)raw_start * raw_row_bytes,
-                n_raw * DS4_N_HEAD_DIM) != 0;
+            ok = ds4_mixed_attention_stage_visible_kv(
+                stage_row,
+                g->layer_raw_cache[layer_index],
+                g->raw_cap,
+                row_raw_start,
+                row_n_raw,
+                row_comp ? g->layer_attn_comp_cache[layer_index] : NULL,
+                row_comp);
         }
         ds4_gpu_tensor_free(stage_row);
     }
@@ -55970,25 +56064,35 @@ static bool ds4_mixed_attention_primitive_ab_run(
     result->q_exact = q_comparison.bit_exact;
     result->generic_runtime_replay_exact = replay_comparison.bit_exact;
     result->staged_kv_exact = true;
+    const uint32_t batch_first_raw_pos = final_pos + 1u - n_raw;
     for (uint32_t row = 0;
          result->staged_kv_exact && row < rows;
          row++) {
-        const uint32_t logical_raw = row + 1u;
-        const uint32_t n_raw = g->raw_window != 0 &&
-                               logical_raw > g->raw_window
-            ? g->raw_window : logical_raw;
-        const uint32_t raw_start = logical_raw - n_raw;
-        const uint32_t row_comp =
-            capture->cp3_n_comp[layer_index][row] - before;
+        const uint32_t pos = capture->start + row;
+        const uint32_t row_n_raw =
+            metal_graph_raw_span_for_batch(g, pos, 1u);
+        const uint32_t row_first_raw_pos = pos + 1u - row_n_raw;
+        const uint32_t row_comp = capture->cp3_n_comp[layer_index][row];
+        if (row_first_raw_pos < batch_first_raw_pos ||
+            row_first_raw_pos - batch_first_raw_pos > n_raw ||
+            row_n_raw > n_raw -
+                (row_first_raw_pos - batch_first_raw_pos) ||
+            row_comp > final_count) {
+            result->staged_kv_exact = false;
+            break;
+        }
+        const size_t generic_raw_offset =
+            (size_t)(row_first_raw_pos - batch_first_raw_pos) *
+            DS4_N_HEAD_DIM;
         const uint16_t *seq = sequential_stage_cpu +
             (size_t)row * stage_value_count;
-        const size_t raw_values = (size_t)n_raw * DS4_N_HEAD_DIM;
+        const size_t raw_values = (size_t)row_n_raw * DS4_N_HEAD_DIM;
         result->staged_kv_exact = memcmp(
-            generic_stage_cpu + (size_t)raw_start * DS4_N_HEAD_DIM,
+            generic_stage_cpu + generic_raw_offset,
             seq, raw_values * sizeof(uint16_t)) == 0;
         if (result->staged_kv_exact && row_comp) {
             result->staged_kv_exact = memcmp(
-                generic_stage_cpu + (size_t)rows * DS4_N_HEAD_DIM,
+                generic_stage_cpu + (size_t)n_raw * DS4_N_HEAD_DIM,
                 seq + raw_values,
                 (size_t)row_comp * DS4_N_HEAD_DIM * sizeof(uint16_t)) == 0;
         }
@@ -55998,9 +56102,23 @@ static bool ds4_mixed_attention_primitive_ab_run(
     result->executed = true;
     ok = true;
 
-done:
+done:;
+    const char *generic_path = result->zero_prefix
+        ? (result->static_mixed ? "static_mixed_batch" : "raw_batch")
+        : "prefixed_mixed_batch";
+    const char *generic_kernel = !result->executed
+        ? "UNKNOWN"
+        : result->generic_vec_reduce
+            ? "kernel_flash_attn_ext_vec_f16_dk512_dv512"
+            : "kernel_flash_attn_ext_f16_dk512_dv512";
+    const char *generic_reduction = !result->executed
+        ? "UNKNOWN"
+        : result->generic_vec_reduce ? "kernel_flash_attn_reduce"
+                                     : "direct_output";
     fprintf(stderr,
-            "MIXED_ATTN_SOURCE_AUDIT layer=%u ratio=%u "
+            "MIXED_ATTN_SOURCE_AUDIT layer=%u ratio=%u pos0=%u "
+            "n_tokens=%u n_raw=%u raw_start=%u "
+            "n_comp_before=%u n_comp=%u "
             "generic_path=%s sequential_path=gathered_single_vec_reduce "
             "generic_kernel=%s generic_reduction=%s "
             "sequential_kernel=kernel_flash_attn_ext_vec_f16_dk512_dv512 "
@@ -56008,15 +56126,20 @@ done:
             "kv_role=shared_K_and_V head_mapping=all_query_heads_to_one_KV_head "
             "scale=1/sqrt(head_dim) softmax_parameters=same "
             "causal_window_metadata=same compressed_visibility=(qpos+1)/ratio "
-            "evidence=PROVEN_BY_SOURCE_AND_RUNTIME_PATH\n",
+            "evidence=%s\n",
             layer_index,
             result->ratio,
-            result->static_mixed ? "static_mixed_batch" : "raw_batch",
-            result->generic_vec_reduce
-                ? "kernel_flash_attn_ext_vec_f16_dk512_dv512"
-                : "kernel_flash_attn_ext_f16_dk512_dv512",
-            result->generic_vec_reduce
-                ? "kernel_flash_attn_reduce" : "direct_output");
+            result->pos0,
+            result->n_tokens,
+            result->n_raw,
+            result->raw_start,
+            result->n_comp_before,
+            result->n_comp,
+            generic_path,
+            generic_kernel,
+            generic_reduction,
+            result->executed ? "PROVEN_BY_SOURCE_AND_RUNTIME_PATH"
+                             : "UNKNOWN");
     fprintf(stderr,
             "MIXED_ATTN_GENERIC_RUNTIME_REPLAY result=%s layer=%u",
             result->executed
@@ -56027,12 +56150,14 @@ done:
     fputc('\n', stderr);
     fprintf(stderr,
             "MIXED_ATTN_STAGING_AB semantic_visible_kv=%s "
-            "generic_order=raw_chunk_then_compressed "
+            "generic_order=%s "
             "sequential_order=visible_raw_then_visible_compressed "
             "storage=F16 layer=%u\n",
             result->executed
                 ? (result->staged_kv_exact ? "EXACT" : "MISMATCH")
                 : "ERROR",
+            result->zero_prefix ? "raw_chunk_then_compressed"
+                                : "chronological_raw_ring_then_compressed",
             layer_index);
     fprintf(stderr,
             "MIXED_FLASH_ATTN_PRIMITIVE_AB input_bits_equal=%s "
@@ -56266,7 +56391,10 @@ static bool ds4_mixed_attention_emit_closure_and_causal(
     fprintf(stderr,
             "CAUSAL_SUBSTITUTION_FRONTIER site=layer%u_%s_attention "
             "FIRST_DIVERGENCE=",
-            ab->layer, ab->static_mixed ? "static_mixed" : "raw");
+            ab->layer,
+            ab->zero_prefix
+                ? (ab->static_mixed ? "static_mixed" : "raw")
+                : "prefixed_mixed");
     ds4_first_divergence_print_report_location(report);
     fputc('\n', stderr);
     return arithmetic && cp2_exact && cp3p_exact && cp3f_exact &&
