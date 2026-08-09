@@ -406,6 +406,52 @@ int main(void) {
                    "HC_ATTN_PRE_SPLIT_ADJUDICATION result=RESIDUAL_REMAINS first_divergence_beyond_cp4=NO family=UNCLASSIFIED") != NULL);
     REQUIRE(fclose(q_log) == 0);
 
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_cp4_tail_causal_summary(
+        q_log, true, true, true, false,
+        true, false, false, true, true, true));
+    REQUIRE(fflush(q_log) == 0);
+    REQUIRE(fseek(q_log, 0, SEEK_SET) == 0);
+    q_log_bytes = fread(q_log_text, 1, sizeof(q_log_text) - 1, q_log);
+    q_log_text[q_log_bytes] = '\0';
+    REQUIRE(strstr(q_log_text,
+                   "CP4_TAIL_AB inputs_equal=PASS weights_same=PASS metadata_same=PASS after_attn_hc=MISMATCH") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "CP4_TAIL_CAUSAL_SUBSTITUTION after_attn_hc=EXACT result=PASS") != NULL);
+    REQUIRE(strstr(q_log_text, "FIRST_DIVERGENCE=beyond_CP4") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "family_candidate=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV narrowest_producer_pair=Q8_output_B_small_batch_vs_single_row fusion_contribution=UNKNOWN") != NULL);
+    REQUIRE(fclose(q_log) == 0);
+
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_cp4_tail_causal_summary(
+        q_log, true, true, true, false,
+        true, true, false, true, true, true));
+    REQUIRE(fflush(q_log) == 0);
+    REQUIRE(fseek(q_log, 0, SEEK_SET) == 0);
+    q_log_bytes = fread(q_log_text, 1, sizeof(q_log_text) - 1, q_log);
+    q_log_text[q_log_bytes] = '\0';
+    REQUIRE(strstr(q_log_text,
+                   "family_candidate=FAMILY_HC_FUSION_STORE_BOUNDARY narrowest_producer_pair=standalone_HC_epilogue_vs_fused_HC_epilogue") != NULL);
+    REQUIRE(fclose(q_log) == 0);
+
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_cp4_tail_causal_summary(
+        q_log, true, true, true, true,
+        true, true, true, false, false, false));
+    REQUIRE(fflush(q_log) == 0);
+    REQUIRE(fseek(q_log, 0, SEEK_SET) == 0);
+    q_log_bytes = fread(q_log_text, 1, sizeof(q_log_text) - 1, q_log);
+    q_log_text[q_log_bytes] = '\0';
+    REQUIRE(strstr(q_log_text,
+                   "CP4_TAIL_CAUSAL_SUBSTITUTION result=SKIPPED reason=same_input_tail_exact") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "CP4_TAIL_ADJUDICATION status=REJECTED family=UNCLASSIFIED reason=same_input_tail_exact") != NULL);
+    REQUIRE(fclose(q_log) == 0);
+
     puts("first-divergence forced pair: OK");
     return 0;
 }

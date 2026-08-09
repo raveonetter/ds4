@@ -95,3 +95,44 @@ git diff --check
 
 The implementation host is not an M4 Max. No C5 numerical result is claimed by
 this commit.
+
+## Strict same-input CP4 tail closure
+
+`DS4_CP4_TAIL_AB=1` extends the proven canonical prefix through the already
+isolated `hc_attn_pre_split` repair, then evaluates the real CP4 tail only.
+The diagnostic requires `DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB,ATTN-RAW`.
+
+Before adjudicating the tail, the restored shadow Pass B must remain exact to
+the untouched authoritative Pass B, and repaired Pass A must match ordinary
+Pass B for layer-0 row-0 `cp4_heads`, `cur_hc`, `post`, and `comb`. The same
+model weights and tensor metadata are also mandatory. These checks emit:
+
+```text
+CP4_TAIL_INPUT_GATE cp4_heads=... cur_hc=... post=... comb=...
+CP4_TAIL_AB inputs_equal=PASS weights_same=PASS metadata_same=PASS after_attn_hc=...
+```
+
+The isolated A/B uses the real generic small-batch output projection plus
+standalone HC epilogue and the E1 sequential single-row output projection plus
+fused HC epilogue. A controlled intermediate run feeds the sequential
+`attn_low` bits to both output-B paths, allowing separate bitwise comparisons
+of `attn_low`, output-B, output-B plus HC, and the complete tail.
+
+If the complete tail mismatches, the diagnostic restores S0 and reruns generic
+Pass A with only `hc_attn_pre_split` and CP4 tail canonicalized. Production
+fusion and scheduling remain unchanged outside this diagnostic rerun. Family
+classification is withheld until both the same-input gate and causal
+substitution succeed.
+
+```sh
+DS4_FIRST_DIVERGENCE=1 \
+DS4_FIRST_DIVERGENCE_CANONICAL='QA,KV,QB,ATTN-RAW' \
+DS4_CP4_TAIL_AB=1 \
+DS4_DSPARK_SCHEDULER=0 \
+./ds4 --dspark --dspark-confidence 0 \
+  -m "$PWD/ds4flash.gguf" \
+  --mtp "$PWD/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf" \
+  --tokens 16 --temp 0 --nothink \
+  -p 'Explain Redis in one sentence.' \
+  2>&1 | tee canonical-sweep-cp4-tail-same-input-ab.log
+```

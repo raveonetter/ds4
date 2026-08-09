@@ -52431,8 +52431,11 @@ typedef struct {
     bool executed;
     bool input_bits_equal;
     bool weights_same;
-    bool semantics_preserved;
+    bool metadata_same;
     bool numerical_non_equivalence;
+    ds4_float_compare_result low_comparison;
+    ds4_float_compare_result output_b_comparison;
+    ds4_float_compare_result output_b_hc_comparison;
     ds4_float_compare_result output_comparison;
     ds4_first_divergence_float_signature output_signature;
 } ds4_cp4_tail_primitive_ab_result;
@@ -52452,6 +52455,8 @@ static bool ds4_cp4_tail_primitive_ab_run(
     ds4_gpu_tensor *generic_low = NULL;
     ds4_gpu_tensor *generic_attn_out = NULL;
     ds4_gpu_tensor *generic_after = NULL;
+    ds4_gpu_tensor *generic_b_attn_out = NULL;
+    ds4_gpu_tensor *generic_b_after = NULL;
     ds4_gpu_tensor *sequential_low = NULL;
     ds4_gpu_tensor *sequential_attn_out = NULL;
     ds4_gpu_tensor *sequential_after = NULL;
@@ -52459,6 +52464,11 @@ static bool ds4_cp4_tail_primitive_ab_run(
     float *sequential_input_cpu = NULL;
     float *generic_output_cpu = NULL;
     float *sequential_output_cpu = NULL;
+    float *generic_low_cpu = NULL;
+    float *sequential_low_cpu = NULL;
+    float *generic_b_output_cpu = NULL;
+    float *sequential_b_output_cpu = NULL;
+    float *generic_b_after_cpu = NULL;
     ds4_float_compare_result input_comparison;
     const char *failure_stage = "preconditions";
     bool ok = false;
@@ -52466,11 +52476,11 @@ static bool ds4_cp4_tail_primitive_ab_run(
     fputs("CP4_TAIL_SOURCE_AUDIT "
           "generic_path=metal_graph_attention_output_dense_quant_batch+ds4_gpu_hc_expand_split_tensor "
           "sequential_path=ds4_gpu_attention_output_low_q8_tensor+ds4_gpu_matmul_q8_0_hc_expand_tensor "
-          "unavailable_fastpath=ds4_gpu_attention_output_q8_batch_f16_tensor+ds4_gpu_hc_expand_split_half_tensor "
-          "generic_primitives=Q8_output_A_batch+Q8_output_B_batch+F32_HC_split_expand_residual_add "
+          "controlled_output_b_pair=ds4_gpu_matmul_q8_0_tensor_rows+ds4_gpu_hc_expand_split_tensor_vs_ds4_gpu_matmul_q8_0_hc_expand_tensor_rows "
+          "generic_primitives=Q8_output_A_small_batch+Q8_output_B_small_batch+standalone_F32_HC_epilogue "
           "sequential_primitives=Q8_output_A_single_F32+Q8_output_B_single+fused_HC_expand_residual_add "
-          "candidate_family=FAMILY_Q8_ATTN_OUTPUT_BATCH_F32_HC_SPLIT_VS_SINGLE_F32_FUSED_HC "
-          "component_attribution=UNKNOWN evidence=PROVEN_BY_SOURCE\n",
+          "candidate_family=UNCLASSIFIED component_attribution=UNKNOWN "
+          "evidence=PROVEN_BY_SOURCE\n",
           stderr);
 
     if (!result) return false;
@@ -52479,8 +52489,8 @@ static bool ds4_cp4_tail_primitive_ab_run(
         capture->n_tokens < 2u || !capture->cp4_heads[0] ||
         !capture->cp4_tail_cur_hc[0] ||
         !capture->cp4_tail_hc_split[0]) {
-        fputs("CP4_TAIL_PRIMITIVE_AB input_bits_equal=FAIL weights_same=FAIL "
-              "semantics_preserved=FAIL elements=0 result=ERROR "
+        fputs("CP4_TAIL_ISOLATED_AB input_bits_equal=FAIL weights_same=FAIL "
+              "metadata_same=FAIL elements=0 result=ERROR "
               "reason=invalid_real_shape_fixture evidence=UNKNOWN\n",
               stderr);
         return false;
@@ -52522,7 +52532,7 @@ static bool ds4_cp4_tail_primitive_ab_run(
         layer->attn_output_a->dim[1] == low_values_per_row &&
         layer->attn_output_b->dim[0] == low_values_per_row &&
         layer->attn_output_b->dim[1] == DS4_N_EMBD;
-    result->semantics_preserved = result->weights_same &&
+    result->metadata_same =
         s->graph.tp_world <= 1u && !s->graph.placement &&
         !metal_graph_directional_steering_attn_enabled(&s->graph) &&
         !metal_graph_debug_wants("attn_low", 0, capture->start) &&
@@ -52530,10 +52540,10 @@ static bool ds4_cp4_tail_primitive_ab_run(
         ds4_gpu_tensor_bytes(capture->cp4_heads[0]) >= heads_bytes &&
         ds4_gpu_tensor_bytes(capture->cp4_tail_cur_hc[0]) >= hc_bytes &&
         ds4_gpu_tensor_bytes(capture->cp4_tail_hc_split[0]) >= split_bytes;
-    if (!result->semantics_preserved) {
+    if (!result->metadata_same) {
         fprintf(stderr,
-                "CP4_TAIL_PRIMITIVE_AB input_bits_equal=FAIL weights_same=%s "
-                "semantics_preserved=FAIL elements=%zu result=ERROR "
+                "CP4_TAIL_ISOLATED_AB input_bits_equal=FAIL weights_same=%s "
+                "metadata_same=FAIL elements=%zu result=ERROR "
                 "reason=real_tail_preconditions_not_met evidence=UNKNOWN\n",
                 result->weights_same ? "PASS" : "FAIL", output_values);
         return false;
@@ -52546,11 +52556,14 @@ static bool ds4_cp4_tail_primitive_ab_run(
     generic_low = ds4_gpu_tensor_alloc(low_bytes);
     generic_attn_out = ds4_gpu_tensor_alloc(attn_out_bytes);
     generic_after = ds4_gpu_tensor_alloc(hc_bytes);
+    generic_b_attn_out = ds4_gpu_tensor_alloc(attn_out_bytes);
+    generic_b_after = ds4_gpu_tensor_alloc(hc_bytes);
     sequential_low = ds4_gpu_tensor_alloc(low_bytes);
     sequential_attn_out = ds4_gpu_tensor_alloc(attn_out_bytes);
     sequential_after = ds4_gpu_tensor_alloc(hc_bytes);
     if (!seq_heads || !seq_cur_hc || !seq_hc_split || !generic_low ||
-        !generic_attn_out || !generic_after || !sequential_low ||
+        !generic_attn_out || !generic_after || !generic_b_attn_out ||
+        !generic_b_after || !sequential_low ||
         !sequential_attn_out || !sequential_after) goto done;
 
     failure_stage = "input_clone_begin";
@@ -52578,6 +52591,11 @@ static bool ds4_cp4_tail_primitive_ab_run(
     sequential_input_cpu = xmalloc(input_values * sizeof(float));
     generic_output_cpu = xmalloc(output_values * sizeof(float));
     sequential_output_cpu = xmalloc(output_values * sizeof(float));
+    generic_low_cpu = xmalloc((size_t)low_bytes);
+    sequential_low_cpu = xmalloc((size_t)low_bytes);
+    generic_b_output_cpu = xmalloc((size_t)attn_out_bytes);
+    sequential_b_output_cpu = xmalloc((size_t)attn_out_bytes);
+    generic_b_after_cpu = xmalloc((size_t)hc_bytes);
     const size_t heads_values = (size_t)(heads_bytes / sizeof(float));
     const size_t hc_values = (size_t)(hc_bytes / sizeof(float));
     failure_stage = "input_read_compare";
@@ -52629,6 +52647,22 @@ static bool ds4_cp4_tail_primitive_ab_run(
                 seq_heads, seq_cur_hc, seq_hc_split, rows);
     }
     if (ok) {
+        failure_stage = "controlled_generic_output_b";
+        ok = ds4_gpu_matmul_q8_0_tensor(
+                generic_b_attn_out,
+                s->engine->model.map, s->engine->model.size,
+                layer->attn_output_b->abs_offset,
+                low_values_per_row, DS4_N_EMBD,
+                sequential_low, rows) != 0;
+    }
+    if (ok) {
+        failure_stage = "controlled_generic_hc_epilogue";
+        ok = ds4_gpu_hc_expand_split_tensor(
+                generic_b_after, generic_b_attn_out,
+                seq_cur_hc, seq_hc_split,
+                DS4_N_EMBD, DS4_N_HC) != 0;
+    }
+    if (ok) {
         failure_stage = "tail_end";
         ok = ds4_gpu_end_commands() != 0;
     }
@@ -52638,9 +52672,31 @@ static bool ds4_cp4_tail_primitive_ab_run(
     if (!ds4_gpu_tensor_read(generic_after, 0,
                              generic_output_cpu, hc_bytes) ||
         !ds4_gpu_tensor_read(sequential_after, 0,
-                             sequential_output_cpu, hc_bytes)) goto done;
+                             sequential_output_cpu, hc_bytes) ||
+        !ds4_gpu_tensor_read(generic_low, 0,
+                             generic_low_cpu, low_bytes) ||
+        !ds4_gpu_tensor_read(sequential_low, 0,
+                             sequential_low_cpu, low_bytes) ||
+        !ds4_gpu_tensor_read(generic_b_attn_out, 0,
+                             generic_b_output_cpu, attn_out_bytes) ||
+        !ds4_gpu_tensor_read(sequential_attn_out, 0,
+                             sequential_b_output_cpu, attn_out_bytes) ||
+        !ds4_gpu_tensor_read(generic_b_after, 0,
+                             generic_b_after_cpu, hc_bytes)) goto done;
     failure_stage = "output_compare";
-    if (!ds4_float_compare_exact(generic_output_cpu,
+    if (!ds4_float_compare_exact(generic_low_cpu,
+                                 sequential_low_cpu,
+                                 (size_t)(low_bytes / sizeof(float)),
+                                 &result->low_comparison) ||
+        !ds4_float_compare_exact(generic_b_output_cpu,
+                                 sequential_b_output_cpu,
+                                 (size_t)(attn_out_bytes / sizeof(float)),
+                                 &result->output_b_comparison) ||
+        !ds4_float_compare_exact(generic_b_after_cpu,
+                                 sequential_output_cpu,
+                                 output_values,
+                                 &result->output_b_hc_comparison) ||
+        !ds4_float_compare_exact(generic_output_cpu,
                                  sequential_output_cpu,
                                  output_values,
                                  &result->output_comparison)) goto done;
@@ -52654,11 +52710,11 @@ static bool ds4_cp4_tail_primitive_ab_run(
 
 done:
     fprintf(stderr,
-            "CP4_TAIL_PRIMITIVE_AB input_bits_equal=%s weights_same=%s "
-            "semantics_preserved=%s elements=%zu result=%s",
+            "CP4_TAIL_ISOLATED_AB input_bits_equal=%s weights_same=%s "
+            "metadata_same=%s elements=%zu result=%s",
             result->input_bits_equal ? "PASS" : "FAIL",
             result->weights_same ? "PASS" : "FAIL",
-            result->semantics_preserved ? "PASS" : "FAIL",
+            result->metadata_same ? "PASS" : "FAIL",
             output_values,
             result->executed
                 ? (result->output_comparison.bit_exact ? "EXACT" : "MISMATCH")
@@ -52678,24 +52734,23 @@ done:
     }
     fprintf(stderr, " evidence=%s\n",
             result->executed ? "PROVEN_BY_TEST" : "UNKNOWN");
-    if (result->executed && result->input_bits_equal &&
-        result->weights_same && result->semantics_preserved &&
-        result->numerical_non_equivalence) {
-        fputs("DRIFT_SOURCE site=CP4 "
-              "family=FAMILY_Q8_ATTN_OUTPUT_BATCH_F32_HC_SPLIT_VS_SINGLE_F32_FUSED_HC "
-              "generic=metal_graph_attention_output_dense_quant_batch+ds4_gpu_hc_expand_split_tensor "
-              "sequential=ds4_gpu_attention_output_low_q8_tensor+ds4_gpu_matmul_q8_0_hc_expand_tensor "
-              "component_attribution=UNKNOWN evidence=PROVEN_BY_TEST\n",
-              stderr);
-    } else if (result->executed) {
-        fputs("CP4_TAIL_CANDIDATE "
-              "family=FAMILY_Q8_ATTN_OUTPUT_BATCH_F32_HC_SPLIT_VS_SINGLE_F32_FUSED_HC "
-              "result=REJECTED evidence=PROVEN_BY_TEST\n",
-              stderr);
+    if (result->executed) {
+        fprintf(stderr,
+                "CP4_TAIL_STAGE_AB attn_low=%s output_b=%s "
+                "output_b_plus_hc=%s full_tail=%s\n",
+                ds4_exact_word(result->low_comparison.bit_exact),
+                ds4_exact_word(result->output_b_comparison.bit_exact),
+                ds4_exact_word(result->output_b_hc_comparison.bit_exact),
+                ds4_exact_word(result->output_comparison.bit_exact));
     }
     ok = result->executed && result->input_bits_equal &&
-         result->weights_same && result->semantics_preserved;
+         result->weights_same && result->metadata_same;
 
+    free(generic_b_after_cpu);
+    free(sequential_b_output_cpu);
+    free(generic_b_output_cpu);
+    free(sequential_low_cpu);
+    free(generic_low_cpu);
     free(sequential_output_cpu);
     free(generic_output_cpu);
     free(sequential_input_cpu);
@@ -52706,6 +52761,8 @@ done:
     ds4_gpu_tensor_free(generic_after);
     ds4_gpu_tensor_free(generic_attn_out);
     ds4_gpu_tensor_free(generic_low);
+    ds4_gpu_tensor_free(generic_b_after);
+    ds4_gpu_tensor_free(generic_b_attn_out);
     ds4_gpu_tensor_free(seq_hc_split);
     ds4_gpu_tensor_free(seq_cur_hc);
     ds4_gpu_tensor_free(seq_heads);
@@ -53196,6 +53253,88 @@ static bool ds4_hc_attn_pre_split_causal_close(
                post.bit_exact, comb.bit_exact, after.bit_exact);
 }
 
+static bool ds4_cp4_tail_causal_close(
+        const ds4_c2b_capture *pass_a,
+        const ds4_c2b_capture *pass_b,
+        const ds4_c2b_capture *pass_b_probe,
+        const ds4_cp4_tail_primitive_ab_result *ab,
+        bool substitution_performed,
+        const ds4_first_divergence_report *report) {
+    const uint32_t layer = 0;
+    const uint32_t row = 0;
+    const uint64_t heads_values =
+        (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t hc_values = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t split_values =
+        2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t heads_offset =
+        (uint64_t)row * heads_values * sizeof(float);
+    const uint64_t hc_offset = (uint64_t)row * hc_values * sizeof(float);
+    const uint64_t split_offset =
+        (uint64_t)row * split_values * sizeof(float);
+    ds4_float_compare_result heads;
+    ds4_float_compare_result cur_hc;
+    ds4_float_compare_result post;
+    ds4_float_compare_result comb;
+    ds4_float_compare_result after;
+    const bool compared = pass_a && pass_b && pass_b_probe && ab &&
+        ab->executed &&
+        ds4_cp4_prefix_compare_gpu_f32(
+            pass_a->cp4_heads[layer], heads_offset,
+            pass_b_probe->cp4_heads[layer], heads_offset,
+            (size_t)heads_values, &heads) &&
+        ds4_cp4_prefix_compare_gpu_f32(
+            pass_a->cp4_tail_cur_hc[layer], hc_offset,
+            pass_b_probe->cp4_tail_cur_hc[layer], hc_offset,
+            (size_t)hc_values, &cur_hc) &&
+        ds4_cp4_prefix_compare_gpu_f32(
+            pass_a->cp4_tail_hc_split[layer],
+            split_offset + (uint64_t)DS4_N_HC * sizeof(float),
+            pass_b_probe->cp4_tail_hc_split[layer],
+            split_offset + (uint64_t)DS4_N_HC * sizeof(float),
+            DS4_N_HC, &post) &&
+        ds4_cp4_prefix_compare_gpu_f32(
+            pass_a->cp4_tail_hc_split[layer],
+            split_offset + 2ull * DS4_N_HC * sizeof(float),
+            pass_b_probe->cp4_tail_hc_split[layer],
+            split_offset + 2ull * DS4_N_HC * sizeof(float),
+            (size_t)DS4_N_HC * DS4_N_HC, &comb) &&
+        ds4_cp4_prefix_compare_gpu_f32(
+            pass_a->cp4[layer], hc_offset,
+            pass_b->cp4[layer], hc_offset,
+            (size_t)hc_values, &after);
+    if (!compared) {
+        fputs("CP4_TAIL_AB inputs_equal=FAIL weights_same=FAIL "
+              "metadata_same=FAIL after_attn_hc=ERROR reason=compare\n",
+              stderr);
+        return false;
+    }
+
+    const bool inputs_equal = heads.bit_exact && cur_hc.bit_exact &&
+        post.bit_exact && comb.bit_exact;
+    fprintf(stderr,
+            "CP4_TAIL_INPUT_GATE cp4_heads=%s cur_hc=%s post=%s comb=%s\n",
+            ds4_exact_word(heads.bit_exact),
+            ds4_exact_word(cur_hc.bit_exact),
+            ds4_exact_word(post.bit_exact),
+            ds4_exact_word(comb.bit_exact));
+    const bool beyond_cp4 =
+        ds4_first_divergence_report_after_layer0_checkpoint(
+            report, DS4_FIRST_DIVERGENCE_CP4);
+    return ds4_first_divergence_emit_cp4_tail_causal_summary(
+        stderr,
+        inputs_equal,
+        ab->weights_same,
+        ab->metadata_same,
+        ab->output_comparison.bit_exact,
+        ab->low_comparison.bit_exact,
+        ab->output_b_comparison.bit_exact,
+        ab->output_b_hc_comparison.bit_exact,
+        substitution_performed,
+        after.bit_exact,
+        beyond_cp4);
+}
+
 static int ds4_first_divergence_run(ds4_session *s,
                                     const int *drafts,
                                     uint32_t n_tokens,
@@ -53229,11 +53368,18 @@ static int ds4_first_divergence_run(ds4_session *s,
         strcmp(cp4_prefix_input_env, "0") != 0;
     const char *hc_attn_pre_split_ab_env =
         getenv("DS4_HC_ATTN_PRE_SPLIT_AB");
-    const bool hc_attn_pre_split_ab_requested =
+    const bool hc_attn_pre_split_ab_explicit =
         hc_attn_pre_split_ab_env && hc_attn_pre_split_ab_env[0] &&
         strcmp(hc_attn_pre_split_ab_env, "0") != 0;
+    const char *cp4_tail_ab_env = getenv("DS4_CP4_TAIL_AB");
+    const bool cp4_tail_ab_requested =
+        cp4_tail_ab_env && cp4_tail_ab_env[0] &&
+        strcmp(cp4_tail_ab_env, "0") != 0;
+    const bool hc_attn_pre_split_ab_requested =
+        hc_attn_pre_split_ab_explicit || cp4_tail_ab_requested;
     const bool prefix_operand_probe_requested =
-        cp4_prefix_input_requested || hc_attn_pre_split_ab_requested;
+        cp4_prefix_input_requested || hc_attn_pre_split_ab_requested ||
+        cp4_tail_ab_requested;
     bool canonical_config_ok = ds4_first_divergence_parse_canonical_mask(
         canonical_env, &canonical_mask);
     if (legacy_canonical_qa_env && legacy_canonical_qa_env[0] &&
@@ -53409,22 +53555,36 @@ static int ds4_first_divergence_run(ds4_session *s,
     canonical_rerun_ok = canonical_rerun_ok &&
         hc_attn_pre_split_ab_ok && hc_attn_pre_split_substitution_ok;
 
-    const bool cp4_tail_ab_requested = !prefix_operand_probe_requested &&
-        (pre_tail_canonical_mask &
-         DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW) != 0;
-    const bool cp4_tail_ab_ok = !cp4_tail_ab_requested ||
+    const bool cp4_tail_isolated_requested = cp4_tail_ab_requested ||
+        (!prefix_operand_probe_requested &&
+         (pre_tail_canonical_mask &
+          DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW) != 0);
+    const bool cp4_tail_ab_ok = !cp4_tail_isolated_requested ||
         (canonical_rerun_ok && a2_ok &&
+         (!cp4_tail_ab_requested ||
+          (hc_attn_pre_split_substitution_performed &&
+           hc_attn_pre_split_substitution_ok)) &&
          ds4_cp4_tail_primitive_ab_run(s, &capture_a, &cp4_tail_ab));
-    bool cp4_tail_substitution_ok = !cp4_tail_selected;
-    if (cp4_tail_selected && cp4_tail_ab_ok &&
+    const bool cp4_tail_substitution_requested =
+        cp4_tail_selected || cp4_tail_ab_requested;
+    bool cp4_tail_substitution_performed = false;
+    bool cp4_tail_substitution_ok = !cp4_tail_substitution_requested ||
+        (cp4_tail_ab_ok && !cp4_tail_ab.numerical_non_equivalence);
+    if (cp4_tail_substitution_requested && cp4_tail_ab_ok &&
         cp4_tail_ab.numerical_non_equivalence) {
+        cp4_tail_substitution_performed = true;
         ds4_c2b_observable_free(&a0);
         ds4_c2b_observable_free(&a1);
         ds4_c2b_observable_free(&a2);
         const bool restore_tail_ok = ds4_c2b_restore_s0(
             s, &frontier, &raw, start, batch_cur, batch_next);
         g_ds4_first_divergence_canonical_mask = restore_tail_ok
-            ? canonical_mask : 0;
+            ? (cp4_tail_ab_requested
+                   ? pre_tail_canonical_mask |
+                         DS4_FIRST_DIVERGENCE_CANON_HC_ATTN_PRE_SPLIT |
+                         DS4_FIRST_DIVERGENCE_CANON_CP4_TAIL
+                   : canonical_mask)
+            : 0;
         a0_ok = restore_tail_ok &&
             ds4_c2b_run_pass(s, forced_tokens, n_tokens, start, NULL,
                               &a0, n_comp_before, n_index_before);
@@ -53497,8 +53657,10 @@ static int ds4_first_divergence_run(ds4_session *s,
     bool cp4_prefix_input_attempted = false;
     bool hc_attn_pre_split_causal_ok =
         !hc_attn_pre_split_ab_requested ||
-        !hc_attn_pre_split_substitution_performed;
+        !hc_attn_pre_split_substitution_performed || cp4_tail_ab_requested;
     bool hc_attn_pre_split_causal_attempted = false;
+    bool cp4_tail_causal_ok = !cp4_tail_ab_requested;
+    bool cp4_tail_causal_attempted = false;
     if (control && probe && qa_ab_proven && kv_ab_proven && qb_ab_proven) {
         pass_b_init_ok = ds4_first_divergence_capture_init(&pass_b, "PASS_B");
         pass_b_run_ok = pass_b_init_ok && ds4_c45_run_pass_b(
@@ -53683,7 +53845,8 @@ static int ds4_first_divergence_run(ds4_session *s,
         }
         if (report_ok &&
             (cp4_prefix_input_requested ||
-             hc_attn_pre_split_substitution_performed)) {
+             hc_attn_pre_split_substitution_performed ||
+             cp4_tail_ab_requested)) {
             cp4_prefix_input_attempted = cp4_prefix_input_requested;
             hc_attn_pre_split_causal_attempted =
                 hc_attn_pre_split_substitution_performed;
@@ -53707,23 +53870,37 @@ static int ds4_first_divergence_run(ds4_session *s,
                     ds4_cp4_prefix_input_close(
                         &capture_a, &capture_b, &capture_b_probe);
             }
-            if (hc_attn_pre_split_substitution_performed) {
+            if (hc_attn_pre_split_substitution_performed &&
+                !cp4_tail_ab_requested) {
                 hc_attn_pre_split_causal_ok = shadow_control_ok &&
                     ds4_hc_attn_pre_split_causal_close(
                         &capture_a, &capture_b, &capture_b_probe);
             }
+            if (cp4_tail_ab_requested) {
+                cp4_tail_causal_attempted = true;
+                cp4_tail_causal_ok = shadow_control_ok &&
+                    ds4_cp4_tail_causal_close(
+                        &capture_a, &capture_b, &capture_b_probe,
+                        &cp4_tail_ab, cp4_tail_substitution_performed,
+                        &report);
+            }
             if ((cp4_prefix_input_requested && !cp4_prefix_input_ok) ||
                 (hc_attn_pre_split_substitution_performed &&
-                 !hc_attn_pre_split_causal_ok)) {
+                 !cp4_tail_ab_requested &&
+                 !hc_attn_pre_split_causal_ok) ||
+                (cp4_tail_ab_requested &&
+                 !cp4_tail_causal_ok)) {
                 fprintf(stderr,
                         "PREFIX_OPERAND_PROBE_ERROR restore=%d run=%d sync=%d "
-                        "probe_control=%d cp4_compare=%d hc_pre_causal=%d\n",
+                        "probe_control=%d cp4_compare=%d hc_pre_causal=%d "
+                        "cp4_tail_causal=%d\n",
                         shadow_restore_ok ? 1 : 0,
                         shadow_run_ok ? 1 : 0,
                         shadow_sync_ok ? 1 : 0,
                         shadow_control_ok ? 1 : 0,
                         cp4_prefix_input_ok ? 1 : 0,
-                        hc_attn_pre_split_causal_ok ? 1 : 0);
+                        hc_attn_pre_split_causal_ok ? 1 : 0,
+                        cp4_tail_causal_ok ? 1 : 0);
             }
         }
     }
@@ -53735,7 +53912,8 @@ static int ds4_first_divergence_run(ds4_session *s,
                     : "c2b_non_perturbation_gate");
     }
     if (hc_attn_pre_split_ab_requested &&
-        !hc_attn_pre_split_causal_attempted) {
+        !hc_attn_pre_split_causal_attempted &&
+        !cp4_tail_ab_requested) {
         fprintf(stderr,
                 "HC_ATTN_PRE_SPLIT_CAUSAL_SUBSTITUTION result=SKIPPED "
                 "reason=%s\n",
@@ -53744,6 +53922,15 @@ static int ds4_first_divergence_run(ds4_session *s,
                     : control && probe
                         ? "isolated_ab_or_canonical_prefix_not_proven"
                     : "c2b_non_perturbation_gate");
+    }
+    if (cp4_tail_ab_requested && !cp4_tail_causal_attempted) {
+        fprintf(stderr,
+                "CP4_TAIL_CAUSAL_SUBSTITUTION result=SKIPPED reason=%s\n",
+                control && probe && cp4_tail_ab_ok
+                    ? "same_input_tail_did_not_mismatch"
+                    : control && probe
+                        ? "isolated_ab_or_repaired_prefix_not_proven"
+                        : "c2b_non_perturbation_gate");
     }
     if (control && probe && qa_ab_proven && kv_ab_proven &&
         qb_ab_proven && !report_ok) {
@@ -53770,7 +53957,7 @@ static int ds4_first_divergence_run(ds4_session *s,
     spec_frontier_free(&frontier);
     return control && probe && qa_ab_proven && kv_ab_proven && qb_ab_proven &&
         canonical_rerun_ok && report_ok && cp4_prefix_input_ok &&
-        hc_attn_pre_split_causal_ok ? 0 : 1;
+        hc_attn_pre_split_causal_ok && cp4_tail_causal_ok ? 0 : 1;
 }
 
 /* Commit an intermediate state captured by a tiny speculative verifier.

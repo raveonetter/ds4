@@ -183,6 +183,19 @@ bool ds4_first_divergence_emit_hc_attn_pre_split_causal_summary(
         bool comb_exact,
         bool after_attn_hc_exact);
 
+bool ds4_first_divergence_emit_cp4_tail_causal_summary(
+        FILE *stream,
+        bool inputs_equal,
+        bool weights_same,
+        bool metadata_same,
+        bool isolated_after_exact,
+        bool attn_low_exact,
+        bool output_b_exact,
+        bool output_b_hc_exact,
+        bool substitution_performed,
+        bool substituted_after_exact,
+        bool first_divergence_beyond_cp4);
+
 bool ds4_first_divergence_float_signature_compute(
         const float *actual,
         const float *expected,

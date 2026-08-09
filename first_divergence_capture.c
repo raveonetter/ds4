@@ -826,6 +826,78 @@ bool ds4_first_divergence_emit_hc_attn_pre_split_causal_summary(
     return ferror(stream) == 0;
 }
 
+bool ds4_first_divergence_emit_cp4_tail_causal_summary(
+        FILE *stream,
+        bool inputs_equal,
+        bool weights_same,
+        bool metadata_same,
+        bool isolated_after_exact,
+        bool attn_low_exact,
+        bool output_b_exact,
+        bool output_b_hc_exact,
+        bool substitution_performed,
+        bool substituted_after_exact,
+        bool first_divergence_beyond_cp4) {
+    if (!stream) return false;
+    const bool preconditions = inputs_equal && weights_same && metadata_same;
+    const bool isolated_mismatch = !isolated_after_exact;
+    const bool causal_closure = preconditions && isolated_mismatch &&
+        substitution_performed &&
+        substituted_after_exact && first_divergence_beyond_cp4;
+
+    fprintf(stream,
+            "CP4_TAIL_AB inputs_equal=%s weights_same=%s metadata_same=%s "
+            "after_attn_hc=%s\n",
+            inputs_equal ? "PASS" : "FAIL",
+            weights_same ? "PASS" : "FAIL",
+            metadata_same ? "PASS" : "FAIL",
+            isolated_after_exact ? "EXACT" : "MISMATCH");
+    if (substitution_performed) {
+        fprintf(stream,
+                "CP4_TAIL_CAUSAL_SUBSTITUTION after_attn_hc=%s result=%s\n",
+                substituted_after_exact ? "EXACT" : "MISMATCH",
+                causal_closure ? "PASS" : "FAIL");
+        fprintf(stream, "FIRST_DIVERGENCE=%s\n",
+                first_divergence_beyond_cp4
+                    ? "beyond_CP4" : "AT_OR_BEFORE_CP4");
+    } else {
+        fputs("CP4_TAIL_CAUSAL_SUBSTITUTION result=SKIPPED "
+              "reason=same_input_tail_exact\n", stream);
+    }
+
+    if (!preconditions) {
+        fputs("CP4_TAIL_ADJUDICATION status=INVALID_PRECONDITIONS "
+              "family=UNCLASSIFIED\n", stream);
+    } else if (!isolated_mismatch) {
+        fputs("CP4_TAIL_ADJUDICATION status=REJECTED "
+              "family=UNCLASSIFIED reason=same_input_tail_exact\n",
+              stream);
+    } else if (!causal_closure) {
+        fputs("CP4_TAIL_ADJUDICATION status=RESIDUAL_REMAINS "
+              "family=UNCLASSIFIED\n", stream);
+    } else if (attn_low_exact && !output_b_exact) {
+        fprintf(stream,
+                "CP4_TAIL_ADJUDICATION status=PROVEN_INDEPENDENT_CAUSE "
+                "family_candidate=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV "
+                "narrowest_producer_pair=Q8_output_B_small_batch_vs_single_row "
+                "fusion_contribution=%s evidence=PROVEN_BY_SAME_INPUT_CAUSAL_SUBSTITUTION\n",
+                output_b_hc_exact ? "REJECTED" : "UNKNOWN");
+    } else if (attn_low_exact && output_b_exact && !output_b_hc_exact) {
+        fputs("CP4_TAIL_ADJUDICATION status=PROVEN_INDEPENDENT_CAUSE "
+              "family_candidate=FAMILY_HC_FUSION_STORE_BOUNDARY "
+              "narrowest_producer_pair=standalone_HC_epilogue_vs_fused_HC_epilogue "
+              "evidence=PROVEN_BY_SAME_INPUT_CAUSAL_SUBSTITUTION\n",
+              stream);
+    } else {
+        fputs("CP4_TAIL_ADJUDICATION status=PROVEN_INDEPENDENT_CAUSE "
+              "family_candidate=COMPOSITE_UNRESOLVED "
+              "narrowest_producer_pair=generic_output_projection_plus_standalone_HC_vs_sequential_single_row_plus_fused_HC "
+              "evidence=PROVEN_BY_SAME_INPUT_CAUSAL_SUBSTITUTION\n",
+              stream);
+    }
+    return ferror(stream) == 0;
+}
+
 bool ds4_first_divergence_emit_report(
         const ds4_first_divergence_capture *pass_a,
         const ds4_first_divergence_capture *pass_b,
