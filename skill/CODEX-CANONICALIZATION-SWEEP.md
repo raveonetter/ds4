@@ -820,8 +820,9 @@ The diagnostic performs:
    sequence (physical masked slots are ignored);
 3. a same-input comparison against ordinary gathered decode, row by row;
 4. a layer-2-only causal substitution;
-5. up to two further natural compressed attention sites, each
-   with its own primitive replay, input gate, A0/A1/A2 gate, and substitution.
+5. every subsequent natural compressed attention site until no CP4-HEADS-RAW
+   frontier remains, each with its own primitive replay, input gate, A0/A1/A2
+   gate, and substitution.
 
 The documented command prefills a nonempty prompt, so its real generic path is
 the absolute-position prefixed mixed-batch wrapper over the persistent raw KV
@@ -829,6 +830,12 @@ ring and compressed cache.  A true `pos0 == 0` run instead selects the static
 prefill wrapper.  The source audit prints `pos0`, raw-ring span, compressed
 counts, and the selected runtime topology; family adjudication must use that
 line rather than the wrapper name.
+
+The first comparison emits the complete per-object report.  Forward sites use
+the same bitwise comparison and capture gates but emit compact frontier lines,
+so closing all compressed layers does not duplicate thousands of object rows
+per layer.  A complete Flash-model run should report `sites_proven=41` and
+`FIRST_DIVERGENCE=NONE`; any earlier frontier remains a failed closure.
 
 Run:
 

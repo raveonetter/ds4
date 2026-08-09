@@ -15403,9 +15403,9 @@ enum {
 static uint32_t g_ds4_first_divergence_canonical_mask;
 static uint32_t g_ds4_cp3_projection_substitution_mask;
 /* Diagnostic-only attention producer substitution.  A selected compressed
- * zero-prefix layer still executes its real batch attention first; its output
- * rows are then replaced by the ordinary-decode-compatible gathered result.
- * The array avoids assuming that the runtime model has at most 64 layers. */
+ * layer still executes its real batch attention first; its output rows are
+ * then replaced by the ordinary-decode-compatible gathered result.  The
+ * array avoids assuming a fixed runtime layer count. */
 static uint8_t g_ds4_attention_layer_substitution[DS4_MAX_LAYER];
 
 static bool ds4_first_divergence_canonical_enabled(uint32_t bit) {
@@ -56427,7 +56427,7 @@ static int ds4_first_divergence_run(ds4_session *s,
     ds4_hc_attn_pre_split_ab_result hc_attn_pre_split_ab = {0};
     ds4_cp4_tail_primitive_ab_result cp4_tail_ab = {0};
     ds4_cp3_projection_family_ab_result cp3_family_ab = {0};
-    enum { DS4_MIXED_ATTN_MAX_SITES = 3 };
+    enum { DS4_MIXED_ATTN_MAX_SITES = DS4_MAX_LAYER };
     ds4_mixed_attention_ab_result
         mixed_attn_ab[DS4_MIXED_ATTN_MAX_SITES] = {0};
     uint32_t mixed_attn_site_count = 0;
@@ -57230,13 +57230,23 @@ static int ds4_first_divergence_run(ds4_session *s,
 
                 ds4_first_divergence_capture next_pass_a = {0};
                 ds4_first_divergence_report next_report = {0};
-                const bool next_ok =
+                /* The initial report already establishes the complete object
+                 * ordering.  Subsequent sites retain the same capture and
+                 * comparison gates, but send the thousands of per-object
+                 * lines to a sink; the compact causal frontier below remains
+                 * in the user-visible log.  This keeps a full-model family
+                 * closure bounded in log size. */
+                FILE *report_sink = tmpfile();
+                bool next_ok = report_sink &&
                     ds4_first_divergence_capture_init(
                         &next_pass_a, "PASS_A_MIXED_FORWARD") &&
                     ds4_c2b_materialize_capture(
                         &capture_a, &next_pass_a) &&
                     ds4_first_divergence_emit_report(
-                        &next_pass_a, &pass_b, stderr, &next_report);
+                        &next_pass_a, &pass_b, report_sink, &next_report);
+                if (report_sink && fclose(report_sink) != 0) {
+                    next_ok = false;
+                }
                 if (!next_ok) {
                     ds4_first_divergence_capture_free(&next_pass_a);
                     mixed_attn_report_ok = false;
