@@ -17267,23 +17267,37 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
     @autoreleasepool {
         const uint64_t x_row_bytes = in_dim * sizeof(float);
         const uint64_t out_row_bytes = out_dim * sizeof(float);
+        const int diagnostics =
+            getenv("DS4_METAL_PROJECTION_REPAIR_DIAGNOSTICS") != NULL;
+        if (diagnostics) {
+            fprintf(stderr,
+                    "PROJECTION_REPAIR_IMPL family=Q8_0 op=projection "
+                    "mode=CANONICAL_ROW_API rows=%u\n",
+                    n_rows);
+        }
         for (uint32_t row = 0; row < n_rows; row++) {
             ds4_gpu_tensor *x_row = ds4_gpu_tensor_view(
                 x, (uint64_t)row * x_row_bytes, x_row_bytes);
             ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
                 out, (uint64_t)row * out_row_bytes, out_row_bytes);
-            const int ok = x_row && out_row &&
-                ds4_gpu_matmul_q8_0_tensor(out_row,
-                                           model_map,
-                                           model_size,
-                                           weight_offset,
-                                           in_dim,
-                                           out_dim,
-                                           x_row,
-                                           1u);
+            const int views_ok = x_row && out_row;
+            const int call_ok = views_ok &&
+                ds4_gpu_matmul_q8_0_tensor(out_row, model_map, model_size,
+                                           weight_offset, in_dim, out_dim,
+                                           x_row, 1u);
             ds4_gpu_tensor_free(out_row);
             ds4_gpu_tensor_free(x_row);
-            if (!ok) return 0;
+            if (!call_ok) {
+                if (diagnostics) {
+                    fprintf(stderr,
+                            "PROJECTION_REPAIR_API_ERROR family=Q8_0 "
+                            "op=projection row=%u views=%s call=%s\n",
+                            row,
+                            views_ok ? "PASS" : "FAIL",
+                            call_ok ? "PASS" : "FAIL");
+                }
+                return 0;
+            }
         }
     }
 
@@ -18257,6 +18271,14 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
             fprintf(stderr, "ds4: Metal shared expert scalar-row fused gate/up received undersized activation buffers\n");
             return 0;
         }
+        const int diagnostics =
+            getenv("DS4_METAL_PROJECTION_REPAIR_DIAGNOSTICS") != NULL;
+        if (diagnostics) {
+            fprintf(stderr,
+                    "PROJECTION_REPAIR_IMPL family=Q8_0 op=shared_gate_up "
+                    "mode=CANONICAL_ROW_API rows=%llu\n",
+                    (unsigned long long)n_tok);
+        }
         for (uint32_t row = 0; row < (uint32_t)n_tok; row++) {
             const uint64_t x_offset = (uint64_t)row * x_row_bytes;
             const uint64_t out_offset = (uint64_t)row * out_row_bytes;
@@ -18268,7 +18290,8 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
                 ds4_gpu_tensor_view(up, out_offset, out_row_bytes);
             ds4_gpu_tensor *mid_row =
                 ds4_gpu_tensor_view(mid, out_offset, out_row_bytes);
-            const int ok = x_row && gate_row && up_row && mid_row &&
+            const int views_ok = x_row && gate_row && up_row && mid_row;
+            const int call_ok = views_ok &&
                 ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
                     gate_row,
                     up_row,
@@ -18285,7 +18308,17 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
             ds4_gpu_tensor_free(up_row);
             ds4_gpu_tensor_free(gate_row);
             ds4_gpu_tensor_free(x_row);
-            if (!ok) return 0;
+            if (!call_ok) {
+                if (diagnostics) {
+                    fprintf(stderr,
+                            "PROJECTION_REPAIR_API_ERROR family=Q8_0 "
+                            "op=shared_gate_up row=%u views=%s call=%s\n",
+                            row,
+                            views_ok ? "PASS" : "FAIL",
+                            call_ok ? "PASS" : "FAIL");
+                }
+                return 0;
+            }
         }
     }
 
@@ -18499,23 +18532,37 @@ int ds4_gpu_matmul_f16_decode_rows_exact_tensor(
     @autoreleasepool {
         const uint64_t x_row_bytes = in_dim * sizeof(float);
         const uint64_t out_row_bytes = out_dim * sizeof(float);
+        const int diagnostics =
+            getenv("DS4_METAL_PROJECTION_REPAIR_DIAGNOSTICS") != NULL;
+        if (diagnostics) {
+            fprintf(stderr,
+                    "PROJECTION_REPAIR_IMPL family=F16 op=projection "
+                    "mode=CANONICAL_ROW_API rows=%u\n",
+                    n_rows);
+        }
         for (uint32_t row = 0; row < n_rows; row++) {
             ds4_gpu_tensor *x_row = ds4_gpu_tensor_view(
                 x, (uint64_t)row * x_row_bytes, x_row_bytes);
             ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
                 out, (uint64_t)row * out_row_bytes, out_row_bytes);
-            const int ok = x_row && out_row &&
-                ds4_gpu_matmul_f16_tensor(out_row,
-                                          model_map,
-                                          model_size,
-                                          weight_offset,
-                                          in_dim,
-                                          out_dim,
-                                          x_row,
-                                          1u);
+            const int views_ok = x_row && out_row;
+            const int call_ok = views_ok &&
+                ds4_gpu_matmul_f16_tensor(out_row, model_map, model_size,
+                                          weight_offset, in_dim, out_dim,
+                                          x_row, 1u);
             ds4_gpu_tensor_free(out_row);
             ds4_gpu_tensor_free(x_row);
-            if (!ok) return 0;
+            if (!call_ok) {
+                if (diagnostics) {
+                    fprintf(stderr,
+                            "PROJECTION_REPAIR_API_ERROR family=F16 "
+                            "op=projection row=%u views=%s call=%s\n",
+                            row,
+                            views_ok ? "PASS" : "FAIL",
+                            call_ok ? "PASS" : "FAIL");
+                }
+                return 0;
+            }
         }
     }
 
@@ -18637,6 +18684,14 @@ int ds4_gpu_matmul_f16_pair_decode_rows_exact_tensor(
     @autoreleasepool {
         const uint64_t x_row_bytes = in_dim * sizeof(float);
         const uint64_t out_row_bytes = out_dim * sizeof(float);
+        const int diagnostics =
+            getenv("DS4_METAL_PROJECTION_REPAIR_DIAGNOSTICS") != NULL;
+        if (diagnostics) {
+            fprintf(stderr,
+                    "PROJECTION_REPAIR_IMPL family=F16_PAIR op=projection "
+                    "mode=CANONICAL_ROW_API rows=%u\n",
+                    n_rows);
+        }
         for (uint32_t row = 0; row < n_rows; row++) {
             const uint64_t x_offset = (uint64_t)row * x_row_bytes;
             const uint64_t out_offset = (uint64_t)row * out_row_bytes;
@@ -18646,7 +18701,8 @@ int ds4_gpu_matmul_f16_pair_decode_rows_exact_tensor(
                 ds4_gpu_tensor_view(out_a, out_offset, out_row_bytes);
             ds4_gpu_tensor *out_b_row =
                 ds4_gpu_tensor_view(out_b, out_offset, out_row_bytes);
-            const int ok = x_row && out_a_row && out_b_row &&
+            const int views_ok = x_row && out_a_row && out_b_row;
+            const int call_ok = views_ok &&
                 ds4_gpu_matmul_f16_pair_tensor(out_a_row,
                                                out_b_row,
                                                model_map,
@@ -18660,7 +18716,17 @@ int ds4_gpu_matmul_f16_pair_decode_rows_exact_tensor(
             ds4_gpu_tensor_free(out_b_row);
             ds4_gpu_tensor_free(out_a_row);
             ds4_gpu_tensor_free(x_row);
-            if (!ok) return 0;
+            if (!call_ok) {
+                if (diagnostics) {
+                    fprintf(stderr,
+                            "PROJECTION_REPAIR_API_ERROR family=F16_PAIR "
+                            "op=projection row=%u views=%s call=%s\n",
+                            row,
+                            views_ok ? "PASS" : "FAIL",
+                            call_ok ? "PASS" : "FAIL");
+                }
+                return 0;
+            }
         }
     }
 

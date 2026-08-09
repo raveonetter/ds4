@@ -465,6 +465,7 @@ int main(void) {
 
     unsetenv("DS4_METAL_ENABLE_Q8_DECODE_EXACT_VIEWS");
     unsetenv("DS4_METAL_ENABLE_F32_DECODE_EXACT_VIEWS");
+    setenv("DS4_METAL_PROJECTION_REPAIR_DIAGNOSTICS", "1", 1);
     if (ok) {
         ok = ds4_gpu_init() != 0;
         initialized = ok;
