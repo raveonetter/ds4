@@ -25515,6 +25515,26 @@ static bool metal_graph_attention_output_dense_quant_batch(
         return false;
     }
     if (out_a->type == DS4_TENSOR_Q8_0 && out_b->type == DS4_TENSOR_Q8_0) {
+#if defined(__APPLE__)
+        if (ds4_family1_candidate_enabled(DS4_REPAIR_SITE_CP4_OUTPUT_B) &&
+            getenv("DS4_METAL_Q8_DECODE_MPP") == NULL) {
+            return ds4_gpu_attention_output_q8_canonical_b_batch_tensor(
+                       out,
+                       low,
+                       metal_graph_batch_group_tmp(g),
+                       metal_graph_batch_low_tmp(g),
+                       model->map,
+                       model->size,
+                       out_a->abs_offset,
+                       out_b->abs_offset,
+                       group_dim,
+                       rank,
+                       n_groups,
+                       out_dim,
+                       heads,
+                       n_tokens) != 0;
+        }
+#endif
         return ds4_gpu_attention_output_q8_batch_tensor(
                    out,
                    low,
@@ -25605,10 +25625,12 @@ static bool metal_graph_matmul_q8_0_named_tensor(
     (void)il;
     (void)pos0;
 #if defined(__APPLE__)
-    const bool qa_candidate =
-        ds4_family1_qa_candidate_enabled() &&
+    const ds4_repair_site site = ds4_family1_site_for_module(module);
+    const bool family1_candidate =
+        site != DS4_REPAIR_SITE_CLASS_COUNT &&
+        ds4_family1_candidate_enabled(site) &&
         getenv("DS4_METAL_Q8_DECODE_MPP") == NULL;
-    if (qa_candidate && module && strcmp(module, "attn_q_a") == 0 &&
+    if (family1_candidate &&
         w && w->type == DS4_TENSOR_Q8_0 && n_tok > 1 &&
         n_tok <= UINT32_MAX) {
         return ds4_gpu_matmul_q8_0_canonical_batch_tensor(
@@ -28444,6 +28466,10 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok && !q_path_debug &&
         !ds4_first_divergence_canonical_enabled(
             DS4_FIRST_DIVERGENCE_CANON_QB) &&
+#if defined(__APPLE__)
+        !(ds4_family1_candidate_enabled(DS4_REPAIR_SITE_QB) &&
+          getenv("DS4_METAL_Q8_DECODE_MPP") == NULL) &&
+#endif
         layer->attn_q_b->type == DS4_TENSOR_Q8_0) {
         q_b_f16_out = ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(tp_q ? tp_q : metal_graph_batch_q(g),
                                                                      tp_q_half ? tp_q_half : g->batch_q_half,
@@ -29848,6 +29874,13 @@ static bool metal_graph_encode_layer_attention_batch(
     const bool canonical_cp4_tail =
         ds4_first_divergence_canonical_enabled(
             DS4_FIRST_DIVERGENCE_CANON_CP4_TAIL);
+#if defined(__APPLE__)
+    const bool repair_cp4_output_b =
+        ds4_family1_candidate_enabled(DS4_REPAIR_SITE_CP4_OUTPUT_B) &&
+        getenv("DS4_METAL_Q8_DECODE_MPP") == NULL;
+#else
+    const bool repair_cp4_output_b = false;
+#endif
     bool cp4_tail_done = false;
     if (ok && canonical_cp4_tail && !attn_out_debug &&
         !tp_row_split_attn &&
@@ -29868,6 +29901,7 @@ static bool metal_graph_encode_layer_attention_batch(
     bool attn_out_f16 = false;
     if (ok && !cp4_tail_done &&
         !attn_out_debug &&
+        !repair_cp4_output_b &&
         !tp_row_split_attn &&
         layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
         layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&

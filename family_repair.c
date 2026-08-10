@@ -245,9 +245,48 @@ bool ds4_family_repair_runtime_enabled(ds4_repair_family family) {
         ds4_family_repair_family(family)->status == DS4_FAMILY_REPAIR_EXACT;
 }
 
+bool ds4_family1_candidate_enabled(ds4_repair_site site) {
+    const ds4_family_repair_site_entry *entry = ds4_family_repair_site(site);
+    const char *value = getenv("DS4_FAMILY1_REPAIR");
+    if (!entry ||
+        entry->family != DS4_REPAIR_FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV ||
+        !value || !value[0]) {
+        return false;
+    }
+
+    while (*value) {
+        const char *begin;
+        size_t length;
+        while (*value && (isspace((unsigned char)*value) || *value == ',')) {
+            value++;
+        }
+        begin = value;
+        while (*value && *value != ',') value++;
+        length = (size_t)(value - begin);
+        while (length && isspace((unsigned char)begin[length - 1u])) length--;
+        if ((length == 3u && strncasecmp(begin, "ALL", length) == 0) ||
+            (strlen(entry->name) == length &&
+             strncasecmp(begin, entry->name, length) == 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool ds4_family1_qa_candidate_enabled(void) {
-    const char *site = getenv("DS4_FAMILY1_REPAIR");
-    return site && strcasecmp(site, "QA") == 0;
+    return ds4_family1_candidate_enabled(DS4_REPAIR_SITE_QA);
+}
+
+ds4_repair_site ds4_family1_site_for_module(const char *module) {
+    if (!module) return DS4_REPAIR_SITE_CLASS_COUNT;
+    if (strcmp(module, "attn_q_a") == 0) return DS4_REPAIR_SITE_QA;
+    if (strcmp(module, "attn_kv") == 0) return DS4_REPAIR_SITE_KV;
+    if (strcmp(module, "attn_q_b") == 0) return DS4_REPAIR_SITE_QB;
+    if (strcmp(module, "shared_gate") == 0 ||
+        strcmp(module, "shared_up") == 0) {
+        return DS4_REPAIR_SITE_SHARED_GATE_UP;
+    }
+    return DS4_REPAIR_SITE_CLASS_COUNT;
 }
 
 bool ds4_family_repair_select(ds4_repair_site site,

@@ -22360,7 +22360,7 @@ static int ds4_gpu_encode_fill_f32_rows(
     return 1;
 }
 
-int ds4_gpu_attention_output_q8_batch_tensor(
+static int ds4_gpu_attention_output_q8_batch_impl(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
         ds4_gpu_tensor       *group_tmp,
@@ -22374,7 +22374,8 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         uint32_t                n_groups,
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        bool                    canonical_out_b) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !low || !group_tmp || !low_tmp || !heads || !model_map ||
         group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 || n_tokens == 0 ||
@@ -22688,9 +22689,13 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         DS4_METAL_PROFILE_ATTN_OUT_STAGE("low_proj");
 
         if (ok) {
-            ok = ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
-                                              out_b_offset,
-                                              low_dim, out_dim, low, n_tokens) != 0;
+            ok = canonical_out_b
+                ? ds4_gpu_matmul_q8_0_canonical_batch_tensor(
+                      out, model_map, model_size, out_b_offset,
+                      low_dim, out_dim, low, n_tokens) != 0
+                : ds4_gpu_matmul_q8_0_tensor(
+                      out, model_map, model_size, out_b_offset,
+                      low_dim, out_dim, low, n_tokens) != 0;
         }
         DS4_METAL_PROFILE_ATTN_OUT_STAGE("out_proj");
 
@@ -22700,6 +22705,48 @@ int ds4_gpu_attention_output_q8_batch_tensor(
 #undef DS4_METAL_PROFILE_ATTN_OUT_STAGE
         return ok ? 1 : 0;
     }
+}
+
+int ds4_gpu_attention_output_q8_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens) {
+    return ds4_gpu_attention_output_q8_batch_impl(
+        out, low, group_tmp, low_tmp, model_map, model_size,
+        out_a_offset, out_b_offset, group_dim, rank, n_groups, out_dim,
+        heads, n_tokens, false);
+}
+
+int ds4_gpu_attention_output_q8_canonical_b_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens) {
+    return ds4_gpu_attention_output_q8_batch_impl(
+        out, low, group_tmp, low_tmp, model_map, model_size,
+        out_a_offset, out_b_offset, group_dim, rank, n_groups, out_dim,
+        heads, n_tokens, true);
 }
 
 int ds4_gpu_attention_output_q4_K_batch_tensor(

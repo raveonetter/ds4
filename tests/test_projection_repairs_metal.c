@@ -33,6 +33,11 @@ enum {
     TEST_ATTN_HEADS = 2,
     TEST_ATTN_DIM = 512,
     TEST_ATTN_RAW_CAP = 8,
+    TEST_CP4_GROUP_DIM = 64,
+    TEST_CP4_RANK = 32,
+    TEST_CP4_GROUPS = 2,
+    TEST_CP4_LOW_DIM = TEST_CP4_RANK * TEST_CP4_GROUPS,
+    TEST_CP4_OUT = 64,
 };
 
 typedef struct __attribute__((packed)) {
@@ -221,10 +226,14 @@ static int run_q8_contract(const void *model, uint64_t model_size,
         ds4_gpu_tensor_free(in_row);
     }
     if (ok) {
-        ok = ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
-                 gate, up, mid, model, model_size,
-                 gate_offset, up_offset, TEST_IN, TEST_Q8_OUT,
-                 input, TEST_ROWS, 7.0f) != 0;
+        ok = ds4_gpu_matmul_q8_0_canonical_batch_tensor(
+                 gate, model, model_size, gate_offset,
+                 TEST_IN, TEST_Q8_OUT, input, TEST_ROWS) != 0 &&
+             ds4_gpu_matmul_q8_0_canonical_batch_tensor(
+                 up, model, model_size, up_offset,
+                 TEST_IN, TEST_Q8_OUT, input, TEST_ROWS) != 0 &&
+             ds4_gpu_swiglu_tensor(
+                 mid, gate, up, (uint32_t)count, 7.0f, 1.0f) != 0;
     }
     for (uint32_t row = 0; ok && row < TEST_ROWS; row++) {
         const uint64_t in_off = (uint64_t)row * TEST_IN * sizeof(float);
@@ -355,7 +364,8 @@ static int run_q8_contract(const void *model, uint64_t model_size,
            ok ? "PASS" : "FAIL");
     printf("EXACT_ROW_ORACLE_AB "
            "family=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV "
-           "site=shared_gate_up rows=%u result=%s performance=UNMEASURED\n",
+           "site=shared_gate_up rows=%u batch_parallelism=PRESERVED "
+           "candidate_dispatches=2 result=%s performance=UNMEASURED\n",
            TEST_ROWS, shared_gate_exact ? "EXACT" : "MISMATCH");
 
     ds4_gpu_tensor_free(mid_ref);
@@ -376,6 +386,79 @@ static int run_q8_contract(const void *model, uint64_t model_size,
     free(expected);
     free(candidate_host);
     free(generic_host);
+    return ok;
+}
+
+static int run_cp4_output_b_contract(const void *model, uint64_t model_size,
+                                     uint64_t out_a_offset,
+                                     uint64_t out_b_offset) {
+    const uint64_t heads_count = (uint64_t)TEST_ROWS * TEST_CP4_GROUPS *
+                                 TEST_CP4_GROUP_DIM;
+    const uint64_t low_count = (uint64_t)TEST_ROWS * TEST_CP4_LOW_DIM;
+    const uint64_t out_count = (uint64_t)TEST_ROWS * TEST_CP4_OUT;
+    float *heads_host = calloc((size_t)heads_count, sizeof(float));
+    float *actual = calloc((size_t)out_count, sizeof(float));
+    float *expected = calloc((size_t)out_count, sizeof(float));
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(heads_count * sizeof(float));
+    ds4_gpu_tensor *low = ds4_gpu_tensor_alloc(low_count * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_count * sizeof(float));
+    ds4_gpu_tensor *reference = ds4_gpu_tensor_alloc(out_count * sizeof(float));
+    ds4_gpu_tensor *group_tmp = ds4_gpu_tensor_alloc(sizeof(float));
+    ds4_gpu_tensor *low_tmp = ds4_gpu_tensor_alloc(sizeof(float));
+    int ok = heads_host && actual && expected && heads && low && out &&
+             reference && group_tmp && low_tmp;
+
+    for (uint64_t i = 0; ok && i < heads_count; i++) {
+        uint32_t bits = 0x3f000000u |
+            ((uint32_t)(i * 0x45d9f3bu + 0x27d4eb2du) & 0x007fffffu);
+        memcpy(&heads_host[i], &bits, sizeof(float));
+        if (i & 1u) heads_host[i] = -heads_host[i];
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_write(heads, 0, heads_host,
+                                  heads_count * sizeof(float)) &&
+             ds4_gpu_attention_output_q8_canonical_b_batch_tensor(
+                 out, low, group_tmp, low_tmp, model, model_size,
+                 out_a_offset, out_b_offset, TEST_CP4_GROUP_DIM,
+                 TEST_CP4_RANK, TEST_CP4_GROUPS, TEST_CP4_OUT,
+                 heads, TEST_ROWS) != 0;
+    }
+    for (uint32_t row = 0; ok && row < TEST_ROWS; row++) {
+        ds4_gpu_tensor *low_row = ds4_gpu_tensor_view(
+            low, (uint64_t)row * TEST_CP4_LOW_DIM * sizeof(float),
+            (uint64_t)TEST_CP4_LOW_DIM * sizeof(float));
+        ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
+            reference, (uint64_t)row * TEST_CP4_OUT * sizeof(float),
+            (uint64_t)TEST_CP4_OUT * sizeof(float));
+        ok = low_row && out_row && ds4_gpu_matmul_q8_0_tensor(
+                 out_row, model, model_size, out_b_offset,
+                 TEST_CP4_LOW_DIM, TEST_CP4_OUT, low_row, 1) != 0;
+        ds4_gpu_tensor_free(out_row);
+        ds4_gpu_tensor_free(low_row);
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_read(out, 0, actual,
+                                 out_count * sizeof(float)) &&
+             ds4_gpu_tensor_read(reference, 0, expected,
+                                 out_count * sizeof(float)) &&
+             compare_exact("cp4_output_b_candidate", actual, expected,
+                           (size_t)out_count);
+    }
+    printf("FAMILY1_REPAIR_TEST "
+           "family=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV site=CP4_output_B "
+           "new_kernel=kernel_mul_mv_q8_0_f32_canonical_batch "
+           "new_vs_seq=%s batch_parallelism=PRESERVED result=%s\n",
+           ok ? "EXACT" : "MISMATCH", ok ? "PASS" : "FAIL");
+
+    ds4_gpu_tensor_free(low_tmp);
+    ds4_gpu_tensor_free(group_tmp);
+    ds4_gpu_tensor_free(reference);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(low);
+    ds4_gpu_tensor_free(heads);
+    free(expected);
+    free(actual);
+    free(heads_host);
     return ok;
 }
 
@@ -1009,6 +1092,12 @@ int main(void) {
     const uint64_t cp5_q8_bytes =
         (uint64_t)TEST_CP5_EMBD * (TEST_CP5_IN / 32u) *
         sizeof(test_block_q8_0);
+    const uint64_t cp4_a_bytes =
+        (uint64_t)TEST_CP4_LOW_DIM * (TEST_CP4_GROUP_DIM / 32u) *
+        sizeof(test_block_q8_0);
+    const uint64_t cp4_b_bytes =
+        (uint64_t)TEST_CP4_OUT * (TEST_CP4_LOW_DIM / 32u) *
+        sizeof(test_block_q8_0);
     const uint64_t moe_iq2_bytes =
         (uint64_t)TEST_MOE_TOTAL_EXPERTS * TEST_MOE_DIM *
         sizeof(test_block_iq2_xxs);
@@ -1029,15 +1118,18 @@ int main(void) {
         align_up(moe_up_offset + moe_iq2_bytes, page);
     const uint64_t attn_sinks_offset =
         align_up(moe_down_offset + moe_q2_bytes, page);
+    const uint64_t cp4_a_offset = align_up(
+        attn_sinks_offset + (uint64_t)TEST_ATTN_HEADS * sizeof(float), page);
+    const uint64_t cp4_b_offset = align_up(cp4_a_offset + cp4_a_bytes, page);
     const uint64_t model_size =
-        align_up(attn_sinks_offset +
-                 (uint64_t)TEST_ATTN_HEADS * sizeof(float), page);
+        align_up(cp4_b_offset + cp4_b_bytes, page);
     void *model = NULL;
     float *input_host = calloc(
         (size_t)TEST_ROWS * TEST_IN, sizeof(float));
     ds4_gpu_tensor *input = NULL;
     int initialized = 0;
     int q8_ok = 0;
+    int cp4_ok = 0;
     int cp5_ok = 0;
     int flash_attention_ok = 0;
     int routed_moe_ok = 0;
@@ -1069,6 +1161,12 @@ int main(void) {
                              ((uint8_t *)model + moe_up_offset), 23u);
         fill_q2_k_experts((test_block_q2_k *)
                           ((uint8_t *)model + moe_down_offset), 31u);
+        fill_q8_matrix((test_block_q8_0 *)
+                       ((uint8_t *)model + cp4_a_offset),
+                       TEST_CP4_GROUP_DIM, TEST_CP4_LOW_DIM, 37u);
+        fill_q8_matrix((test_block_q8_0 *)
+                       ((uint8_t *)model + cp4_b_offset),
+                       TEST_CP4_LOW_DIM, TEST_CP4_OUT, 41u);
         float *attn_sinks = (float *)
             ((uint8_t *)model + attn_sinks_offset);
         for (uint32_t head = 0; head < TEST_ATTN_HEADS; head++) {
@@ -1113,6 +1211,8 @@ int main(void) {
     if (ok) {
         q8_ok = run_q8_contract(model, model_size,
                                 q8_gate_offset, q8_up_offset, input);
+        cp4_ok = run_cp4_output_b_contract(
+            model, model_size, cp4_a_offset, cp4_b_offset);
         cp5_ok = run_cp5_tail_contract(model, model_size, cp5_q8_offset);
         flash_attention_ok = run_flash_attention_contract(
             model, model_size, attn_sinks_offset);
@@ -1122,7 +1222,7 @@ int main(void) {
         f16_results = run_f16_contracts(model, model_size,
                                          f16_a_offset, f16_b_offset, input);
         router_ok = run_router_contract();
-        ok = q8_ok && cp5_ok && flash_attention_ok && routed_moe_ok &&
+        ok = q8_ok && cp4_ok && cp5_ok && flash_attention_ok && routed_moe_ok &&
              f16_results == 3u && router_ok;
     }
 
@@ -1134,20 +1234,20 @@ int main(void) {
            flash_attention_ok ? "EXACT" : "MISMATCH");
     printf("EXACT_ROW_ORACLE_STATUS families_total=7 families_exact=%u "
            "families_failed=%u\n",
-           families_exact + (q8_ok ? 1u : 0u) +
+           families_exact + (q8_ok && cp4_ok ? 1u : 0u) +
                (flash_attention_ok ? 1u : 0u),
-           7u - families_exact - (q8_ok ? 1u : 0u) -
+           7u - families_exact - (q8_ok && cp4_ok ? 1u : 0u) -
                (flash_attention_ok ? 1u : 0u));
     printf("FAMILY_REPAIR_CANDIDATE_STATUS "
            "family=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV "
            "completed_sites=%u pending_sites=%u result=%s\n",
-           q8_ok ? 1u : 0u, q8_ok ? 4u : 5u,
-           q8_ok ? "PASS" : "FAIL");
+           q8_ok && cp4_ok ? 5u : 0u, q8_ok && cp4_ok ? 0u : 5u,
+           q8_ok && cp4_ok ? "PASS" : "FAIL");
     printf("PROJECTION_REPAIR_STATUS families_total=7 families_exact=%u "
            "families_partial=%u families_not_implemented=1 "
            "families_failed=%u\n",
-           families_exact, q8_ok ? 1u : 0u,
-           5u - families_exact + (q8_ok ? 0u : 1u));
+           families_exact, q8_ok && cp4_ok ? 1u : 0u,
+           5u - families_exact + (q8_ok && cp4_ok ? 0u : 1u));
     ds4_gpu_tensor_free(input);
     if (initialized) ds4_gpu_cleanup();
     free(input_host);

@@ -103,8 +103,11 @@ bool ds4_family_repair_parse_selection(const char *value,
 bool ds4_family_repair_enabled(ds4_family_repair_mask mask,
                                ds4_repair_family family);
 bool ds4_family_repair_runtime_enabled(ds4_repair_family family);
-/* Progressive Family 1 rollout.  Only QA is accepted in the first phase. */
+/* Progressive Family 1 rollout.  DS4_FAMILY1_REPAIR accepts one or more
+ * comma-separated site names, or ALL. */
+bool ds4_family1_candidate_enabled(ds4_repair_site site);
 bool ds4_family1_qa_candidate_enabled(void);
+ds4_repair_site ds4_family1_site_for_module(const char *module);
 bool ds4_family_repair_select(ds4_repair_site site,
                               ds4_family_repair_mask enabled,
                               ds4_family_repair_dispatch *dispatch);

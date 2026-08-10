@@ -2017,6 +2017,21 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
+int ds4_gpu_attention_output_q8_canonical_b_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens);
 int ds4_gpu_attention_output_q4_K_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,

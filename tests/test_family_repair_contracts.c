@@ -56,7 +56,31 @@ int main(void) {
     REQUIRE(ds4_family1_qa_candidate_enabled());
     REQUIRE(setenv("DS4_FAMILY1_REPAIR", "KV", 1) == 0);
     REQUIRE(!ds4_family1_qa_candidate_enabled());
+    REQUIRE(ds4_family1_candidate_enabled(DS4_REPAIR_SITE_KV));
+    REQUIRE(setenv("DS4_FAMILY1_REPAIR",
+                   "QA,KV,QB,CP4_output_B,shared_gate_up", 1) == 0);
+    REQUIRE(ds4_family1_candidate_enabled(DS4_REPAIR_SITE_QA));
+    REQUIRE(ds4_family1_candidate_enabled(DS4_REPAIR_SITE_KV));
+    REQUIRE(ds4_family1_candidate_enabled(DS4_REPAIR_SITE_QB));
+    REQUIRE(ds4_family1_candidate_enabled(DS4_REPAIR_SITE_CP4_OUTPUT_B));
+    REQUIRE(ds4_family1_candidate_enabled(DS4_REPAIR_SITE_SHARED_GATE_UP));
+    REQUIRE(setenv("DS4_FAMILY1_REPAIR", "all", 1) == 0);
+    REQUIRE(ds4_family1_candidate_enabled(DS4_REPAIR_SITE_QA));
+    REQUIRE(ds4_family1_candidate_enabled(DS4_REPAIR_SITE_KV));
+    REQUIRE(ds4_family1_candidate_enabled(DS4_REPAIR_SITE_QB));
+    REQUIRE(ds4_family1_candidate_enabled(DS4_REPAIR_SITE_CP4_OUTPUT_B));
+    REQUIRE(ds4_family1_candidate_enabled(DS4_REPAIR_SITE_SHARED_GATE_UP));
     REQUIRE(unsetenv("DS4_FAMILY1_REPAIR") == 0);
+    REQUIRE(ds4_family1_site_for_module("attn_q_a") == DS4_REPAIR_SITE_QA);
+    REQUIRE(ds4_family1_site_for_module("attn_kv") == DS4_REPAIR_SITE_KV);
+    REQUIRE(ds4_family1_site_for_module("attn_q_b") == DS4_REPAIR_SITE_QB);
+    REQUIRE(ds4_family1_site_for_module("shared_gate") ==
+            DS4_REPAIR_SITE_SHARED_GATE_UP);
+    REQUIRE(ds4_family1_site_for_module("shared_up") ==
+            DS4_REPAIR_SITE_SHARED_GATE_UP);
+    REQUIRE(ds4_family1_site_for_module("unrelated") ==
+            DS4_REPAIR_SITE_CLASS_COUNT);
+    REQUIRE(ds4_family1_site_for_module(NULL) == DS4_REPAIR_SITE_CLASS_COUNT);
 
     for (i = 0; i < site_class_count; i++) {
         ds4_family_repair_dispatch disabled;
