@@ -1,30 +1,18 @@
 #!/usr/bin/env python3
-"""Benchmark DSpark configurations on decode speed and first token divergence.
+"""DSpark speed/fidelity Pareto benchmark.
 
-The sequential arm is the oracle.  Every other arm runs the same prompt and
-same generation horizon.  The primary metrics are:
+Primary objectives:
+  1. generation_tps (maximize)
+  2. first_diff_token vs sequential oracle (maximize; NONE = exact through horizon)
 
-  * generation_tps: throughput reported by ds4's real generation loop.
-  * first_diff_token: 1-based first generated-token position that differs from
-    the sequential oracle; NONE means equality through the measured horizon.
-
-The current ds4 CLI does not expose generated token IDs directly.  This harness
-therefore captures generated stdout and retokenizes it with the same ds4 binary
-using --raw-prompt --dump-tokens.  Results explicitly report
-``token_source=retokenized_output`` so a future native token trace can replace
-this collector without changing the benchmark definition.
-
-Configuration is JSON.  Arms can use different binaries, which makes branch or
-family builds (generic, F1, F1+F3, ...) first-class benchmark configurations.
-No benchmark prompt is hard-coded or rewritten.
+Prompts are supplied verbatim by config. Arms may vary CLI args, environment
+variables, binaries, or models, so family repairs can be benchmarked as knobs.
 """
-
 from __future__ import annotations
 
 import argparse
 import csv
 import json
-import math
 import os
 import re
 import subprocess
@@ -32,450 +20,388 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 TPS_RE = re.compile(r"generation:\s*([0-9]+(?:\.[0-9]+)?)\s*tokens/s")
 
 
 @dataclass
-class RunResult:
+class Run:
     prompt: str
     arm: str
     confidence: str
     oracle: bool
-    generation_tps: float
-    token_ids: list[int]
-    stdout: str
-    stderr: str
-    command: list[str]
+    tps: float
+    tokens: list[int]
 
 
 @dataclass
-class MetricRow:
+class Row:
     prompt: str
     arm: str
     confidence: str
-    generation_tps: float
-    speedup_vs_sequential: float
-    first_diff_token: int | None
-    first_diff_token_numeric: int
-    matched_prefix_tokens: int
+    tps: float
+    speedup: float
+    first_diff: int | None
+    first_diff_numeric: int
+    matched_prefix: int
     oracle_tokens: int
-    normalized_fidelity: float
-    exact_through_horizon: bool
+    fidelity: float
+    exact: bool
     pareto: bool = False
 
 
-def fail(message: str) -> "NoReturn":
-    raise SystemExit(f"dspark_pareto_bench: {message}")
+def die(msg: str) -> None:
+    raise SystemExit(f"dspark_pareto_bench: {msg}")
 
 
-def load_config(path: Path) -> dict[str, Any]:
-    try:
-        obj = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        fail(f"cannot read config {path}: {exc}")
-    if not isinstance(obj, dict):
-        fail("top-level config must be a JSON object")
-    return obj
-
-
-def string_list(value: Any, field: str) -> list[str]:
-    if value is None:
+def str_list(v: Any, name: str) -> list[str]:
+    if v is None:
         return []
-    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
-        fail(f"{field} must be an array of strings")
-    return list(value)
+    if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+        die(f"{name} must be an array of strings")
+    return list(v)
 
 
-def resolve_path(value: str, config_dir: Path) -> str:
-    p = Path(value).expanduser()
-    if not p.is_absolute():
-        p = config_dir / p
-    return str(p.resolve())
+def str_env(v: Any, name: str) -> dict[str, str]:
+    if v is None:
+        return {}
+    if not isinstance(v, dict) or not all(
+        isinstance(k, str) and isinstance(x, str) for k, x in v.items()
+    ):
+        die(f"{name} must be an object of string:string pairs")
+    return dict(v)
 
 
-def prompt_arg(prompt_cfg: dict[str, Any], config_dir: Path, stack: Any) -> tuple[str, list[str]]:
-    name = prompt_cfg.get("name")
-    if not isinstance(name, str) or not name:
-        fail("every prompt needs a non-empty name")
-
-    has_file = "file" in prompt_cfg
-    has_text = "text" in prompt_cfg
-    if has_file == has_text:
-        fail(f"prompt {name!r} must contain exactly one of 'file' or 'text'")
-
-    if has_file:
-        value = prompt_cfg["file"]
-        if not isinstance(value, str):
-            fail(f"prompt {name!r} file must be a string")
-        return name, ["--prompt-file", resolve_path(value, config_dir)]
-
-    text = prompt_cfg["text"]
-    if not isinstance(text, str):
-        fail(f"prompt {name!r} text must be a string")
-    f = stack.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False)
-    f.write(text)
-    f.close()
-    stack.paths.append(f.name)
-    return name, ["--prompt-file", f.name]
+def resolve(v: str, base: Path) -> str:
+    p = Path(v).expanduser()
+    return str((p if p.is_absolute() else base / p).resolve())
 
 
-class TempStack:
-    def __init__(self) -> None:
-        self.paths: list[str] = []
-
-    def NamedTemporaryFile(self, *args: Any, **kwargs: Any) -> Any:
-        return tempfile.NamedTemporaryFile(*args, **kwargs)
-
-    def cleanup(self) -> None:
-        for path in self.paths:
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
-
-
-def run_command(command: Sequence[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
+def run_cmd(
+    cmd: Sequence[str], env: dict[str, str], timeout: float | None
+) -> subprocess.CompletedProcess[str]:
+    merged = os.environ.copy()
+    merged.update(env)
     try:
-        proc = subprocess.run(
-            list(command),
+        p = subprocess.run(
+            list(cmd),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=merged,
             timeout=timeout,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        fail(f"command failed to start/finish: {command!r}: {exc}")
-    if proc.returncode != 0:
-        sys.stderr.write(proc.stderr)
-        fail(f"command returned {proc.returncode}: {command!r}")
-    return proc
+        die(f"command failed: {cmd!r}: {exc}")
+    if p.returncode != 0:
+        sys.stderr.write(p.stderr)
+        die(f"command returned {p.returncode}: {cmd!r}")
+    return p
 
 
 def parse_tps(stderr: str) -> float:
-    matches = TPS_RE.findall(stderr)
-    if not matches:
-        fail("generation throughput not found in ds4 stderr")
-    return float(matches[-1])
+    m = TPS_RE.findall(stderr)
+    if not m:
+        die("generation throughput not found in stderr")
+    return float(m[-1])
 
 
-def _json_token_ids(text: str) -> list[int] | None:
+def parse_token_dump(text: str) -> list[int]:
+    s = text.strip()
     try:
-        obj = json.loads(text)
+        obj = json.loads(s)
+        if isinstance(obj, list) and all(isinstance(x, int) for x in obj):
+            return list(obj)
+        if isinstance(obj, dict):
+            for key in ("tokens", "token_ids", "ids"):
+                v = obj.get(key)
+                if isinstance(v, list) and all(isinstance(x, int) for x in v):
+                    return list(v)
     except json.JSONDecodeError:
-        return None
-    if isinstance(obj, list) and all(isinstance(x, int) for x in obj):
-        return list(obj)
-    if isinstance(obj, dict):
-        for key in ("tokens", "token_ids", "ids"):
-            value = obj.get(key)
-            if isinstance(value, list) and all(isinstance(x, int) for x in value):
-                return list(value)
-    return None
+        pass
 
-
-def parse_dump_tokens(text: str) -> list[int]:
-    """Accept the common human and JSON forms emitted by --dump-tokens.
-
-    Deliberately avoids extracting arbitrary integers from token text.  This is
-    strict so a changed CLI format fails loudly instead of silently corrupting
-    the fidelity metric.
-    """
-    parsed = _json_token_ids(text.strip())
-    if parsed is not None:
-        return parsed
-
-    ids: list[int] = []
+    out: list[int] = []
+    patterns = [
+        re.compile(r"^(-?\d+)$"),
+        re.compile(
+            r"^(?:token(?:_id)?|id)\s*[:=]\s*(-?\d+)(?:\s|$)", re.I
+        ),
+        re.compile(r"^token\[\d+\]\s*[:=]\s*(-?\d+)(?:\s|$)", re.I),
+        re.compile(r"^\d+\s*(?::|\t)\s*(-?\d+)(?:\s|$)"),
+    ]
     for raw in text.splitlines():
         line = raw.strip()
-        if not line:
-            continue
-        # "123"
-        m = re.fullmatch(r"(-?\d+)", line)
-        if m:
-            ids.append(int(m.group(1)))
-            continue
-        # "token=123 ...", "id: 123 ...", "token_id=123 ..."
-        m = re.match(r"(?:token(?:_id)?|id)\s*[:=]\s*(-?\d+)(?:\s|$)", line, re.I)
-        if m:
-            ids.append(int(m.group(1)))
-            continue
-        # "17: 123 ..." or "17\t123 ..." (index then token id)
-        m = re.match(r"\d+\s*(?::|\t)\s*(-?\d+)(?:\s|$)", line)
-        if m:
-            ids.append(int(m.group(1)))
-            continue
-        # Ignore known summary/header lines; reject anything else below if no
-        # token IDs were recognized at all.
-
-    if not ids:
-        sample = "\\n".join(text.splitlines()[:8])
-        fail(f"could not parse --dump-tokens output; first lines:\n{sample}")
-    return ids
+        for pat in patterns:
+            m = pat.match(line)
+            if m:
+                out.append(int(m.group(1)))
+                break
+    if not out:
+        die(
+            "cannot parse --dump-tokens output; sample:\n"
+            + "\n".join(text.splitlines()[:8])
+        )
+    return out
 
 
-def retokenize_generated(
+def retokenize(
     binary: str,
     model: str,
-    generated_text: str,
-    tokenizer_args: Sequence[str],
+    text: str,
+    args: list[str],
+    env: dict[str, str],
     timeout: float | None,
 ) -> list[int]:
-    # --raw-prompt is required: generated text must be tokenized as bytes/text,
-    # never wrapped in a chat template.
-    command = [binary, "-m", model, "--raw-prompt", "--dump-tokens", "-p", generated_text]
-    command.extend(tokenizer_args)
-    proc = run_command(command, timeout)
-    # Some ds4 diagnostics use stdout, some builds use stderr.  Prefer stdout,
-    # then fall back to stderr without mixing the streams.
-    try:
-        return parse_dump_tokens(proc.stdout)
-    except SystemExit:
-        return parse_dump_tokens(proc.stderr)
+    cmd = [
+        binary,
+        "-m",
+        model,
+        "--raw-prompt",
+        "--dump-tokens",
+        "-p",
+        text,
+        *args,
+    ]
+    p = run_cmd(cmd, env, timeout)
+    for stream in (p.stdout, p.stderr):
+        try:
+            return parse_token_dump(stream)
+        except SystemExit:
+            pass
+    die("--dump-tokens produced no parseable token IDs")
 
 
-def first_divergence(oracle: Sequence[int], candidate: Sequence[int]) -> tuple[int | None, int]:
-    """Return (1-based first diff position or None, matched prefix count)."""
-    common = min(len(oracle), len(candidate))
-    for i in range(common):
-        if oracle[i] != candidate[i]:
+def first_diff(a: Sequence[int], b: Sequence[int]) -> tuple[int | None, int]:
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
             return i + 1, i
-    if len(oracle) != len(candidate):
-        return common + 1, common
-    return None, len(oracle)
+    if len(a) != len(b):
+        return n + 1, n
+    return None, len(a)
 
 
-def build_generation_command(
-    config: dict[str, Any],
-    arm: dict[str, Any],
-    prompt_args: Sequence[str],
-    config_dir: Path,
-) -> tuple[str, str, list[str]]:
-    binary_value = arm.get("binary", config.get("binary", "./ds4"))
-    model_value = arm.get("model", config.get("model"))
-    if not isinstance(binary_value, str) or not binary_value:
-        fail("binary must be a non-empty string")
-    if not isinstance(model_value, str) or not model_value:
-        fail("model must be set globally or per arm")
-
-    binary = resolve_path(binary_value, config_dir)
-    model = resolve_path(model_value, config_dir)
-    command = [binary, "-m", model]
-    command.extend(prompt_args)
-
-    tokens = arm.get("tokens", config.get("tokens"))
-    if tokens is not None:
-        if not isinstance(tokens, int) or tokens <= 0:
-            fail("tokens must be a positive integer")
-        command.extend(["--tokens", str(tokens)])
-
-    command.extend(string_list(config.get("common_args"), "common_args"))
-    command.extend(string_list(arm.get("args"), f"arm {arm.get('name')} args"))
-    return binary, model, command
+def prompt_args(
+    p: dict[str, Any], base: Path, temps: list[str]
+) -> tuple[str, list[str]]:
+    name = p.get("name")
+    if not isinstance(name, str) or not name:
+        die("every prompt needs name")
+    if ("file" in p) == ("text" in p):
+        die(f"prompt {name}: set exactly one of file/text")
+    if "file" in p:
+        if not isinstance(p["file"], str):
+            die(f"prompt {name}: file must be string")
+        return name, ["--prompt-file", resolve(p["file"], base)]
+    if not isinstance(p["text"], str):
+        die(f"prompt {name}: text must be string")
+    f = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", suffix=".txt", delete=False
+    )
+    f.write(p["text"])
+    f.close()
+    temps.append(f.name)
+    return name, ["--prompt-file", f.name]
 
 
 def run_arm(
-    config: dict[str, Any],
+    cfg: dict[str, Any],
     arm: dict[str, Any],
-    prompt_name: str,
-    prompt_args: Sequence[str],
-    config_dir: Path,
+    pname: str,
+    pargs: list[str],
+    base: Path,
     timeout: float | None,
-) -> RunResult:
+) -> Run:
     name = arm.get("name")
     if not isinstance(name, str) or not name:
-        fail("every arm needs a non-empty name")
-    binary, model, command = build_generation_command(config, arm, prompt_args, config_dir)
-    proc = run_command(command, timeout)
-    tps = parse_tps(proc.stderr)
-    tokenizer_args = string_list(config.get("tokenizer_args"), "tokenizer_args")
-    token_ids = retokenize_generated(binary, model, proc.stdout, tokenizer_args, timeout)
-    confidence = arm.get("confidence", "NA")
-    return RunResult(
-        prompt=prompt_name,
-        arm=name,
-        confidence=str(confidence),
-        oracle=bool(arm.get("oracle", False)),
-        generation_tps=tps,
-        token_ids=token_ids,
-        stdout=proc.stdout,
-        stderr=proc.stderr,
-        command=command,
+        die("every arm needs name")
+    b = arm.get("binary", cfg.get("binary", "./ds4"))
+    m = arm.get("model", cfg.get("model"))
+    if not isinstance(b, str) or not isinstance(m, str):
+        die(f"arm {name}: binary/model missing")
+    binary, model = resolve(b, base), resolve(m, base)
+
+    cmd = [binary, "-m", model, *pargs]
+    n = arm.get("tokens", cfg.get("tokens"))
+    if n is not None:
+        if not isinstance(n, int) or n <= 0:
+            die("tokens must be positive integer")
+        cmd += ["--tokens", str(n)]
+    cmd += str_list(cfg.get("common_args"), "common_args")
+    cmd += str_list(arm.get("args"), f"arm {name}.args")
+
+    env = str_env(cfg.get("env"), "env")
+    env.update(str_env(arm.get("env"), f"arm {name}.env"))
+    p = run_cmd(cmd, env, timeout)
+    tps = parse_tps(p.stderr)
+
+    # Current CLI has no generated-token-ID trace. Re-tokenization happens
+    # after timing with the same model/tokenizer and is explicitly labeled.
+    tok_env = str_env(cfg.get("tokenizer_env"), "tokenizer_env")
+    toks = retokenize(
+        binary,
+        model,
+        p.stdout,
+        str_list(cfg.get("tokenizer_args"), "tokenizer_args"),
+        tok_env,
+        timeout,
+    )
+    return Run(
+        pname,
+        name,
+        str(arm.get("confidence", "NA")),
+        bool(arm.get("oracle", False)),
+        tps,
+        toks,
     )
 
 
-def mark_pareto(rows: list[MetricRow]) -> None:
-    """Mark non-dominated speed/first-divergence points per prompt.
-
-    first_diff_token_numeric is capped by the oracle horizon.  NONE is encoded
-    as oracle_tokens + 1, so exact-through-horizon is strictly better than a
-    divergence at the last measured token.
-    """
-    for row in rows:
-        dominated = False
-        for other in rows:
-            if other is row:
-                continue
-            speed_ge = other.generation_tps >= row.generation_tps
-            fidelity_ge = other.first_diff_token_numeric >= row.first_diff_token_numeric
-            strict = (
-                other.generation_tps > row.generation_tps
-                or other.first_diff_token_numeric > row.first_diff_token_numeric
-            )
-            if speed_ge and fidelity_ge and strict:
-                dominated = True
-                break
-        row.pareto = not dominated
-
-
-def evaluate_prompt(runs: list[RunResult]) -> list[MetricRow]:
-    oracles = [r for r in runs if r.oracle]
-    if len(oracles) != 1:
-        fail(f"prompt {runs[0].prompt!r} requires exactly one oracle arm, got {len(oracles)}")
-    oracle = oracles[0]
-    horizon = len(oracle.token_ids)
+def rows_for_prompt(runs: list[Run]) -> list[Row]:
+    oracle = [r for r in runs if r.oracle]
+    if len(oracle) != 1:
+        die(f"prompt {runs[0].prompt}: exactly one oracle arm required")
+    o = oracle[0]
+    horizon = len(o.tokens)
     if horizon == 0:
-        fail(f"prompt {oracle.prompt!r}: oracle produced zero retokenized tokens")
-
-    rows: list[MetricRow] = []
-    for run in runs:
-        if run.oracle:
-            first = None
-            matched = horizon
-        else:
-            first, matched = first_divergence(oracle.token_ids, run.token_ids)
-        numeric = first if first is not None else horizon + 1
-        fidelity = min(matched, horizon) / horizon
+        die(f"prompt {o.prompt}: oracle produced zero tokens")
+    rows: list[Row] = []
+    for r in runs:
+        d, matched = (None, horizon) if r.oracle else first_diff(o.tokens, r.tokens)
+        numeric = horizon + 1 if d is None else d
         rows.append(
-            MetricRow(
-                prompt=run.prompt,
-                arm=run.arm,
-                confidence=run.confidence,
-                generation_tps=run.generation_tps,
-                speedup_vs_sequential=run.generation_tps / oracle.generation_tps,
-                first_diff_token=first,
-                first_diff_token_numeric=numeric,
-                matched_prefix_tokens=matched,
-                oracle_tokens=horizon,
-                normalized_fidelity=fidelity,
-                exact_through_horizon=(first is None),
+            Row(
+                r.prompt,
+                r.arm,
+                r.confidence,
+                r.tps,
+                r.tps / o.tps,
+                d,
+                numeric,
+                matched,
+                horizon,
+                min(matched, horizon) / horizon,
+                d is None,
             )
         )
-    mark_pareto(rows)
+    for r in rows:
+        r.pareto = not any(
+            q is not r
+            and q.tps >= r.tps
+            and q.first_diff_numeric >= r.first_diff_numeric
+            and (q.tps > r.tps or q.first_diff_numeric > r.first_diff_numeric)
+            for q in rows
+        )
     return rows
 
 
-def print_matrix(rows: Sequence[MetricRow]) -> None:
+def print_rows(rows: list[Row]) -> None:
     print("PARETO_MATRIX")
-    header = (
-        "prompt", "arm", "confidence", "generation_tps", "speedup_vs_sequential",
-        "first_diff_token", "matched_prefix_tokens", "oracle_tokens",
-        "normalized_fidelity", "pareto",
+    print(
+        "prompt\tarm\tconfidence\tgeneration_tps\tspeedup_vs_sequential\t"
+        "first_diff_token\tmatched_prefix_tokens\toracle_tokens\t"
+        "normalized_fidelity\tpareto"
     )
-    print("\t".join(header))
-    for row in rows:
-        first = "NONE" if row.first_diff_token is None else str(row.first_diff_token)
+    for r in rows:
+        d = "NONE" if r.first_diff is None else str(r.first_diff)
         print(
-            "\t".join(
-                [
-                    row.prompt,
-                    row.arm,
-                    row.confidence,
-                    f"{row.generation_tps:.2f}",
-                    f"{row.speedup_vs_sequential:.4f}",
-                    first,
-                    str(row.matched_prefix_tokens),
-                    str(row.oracle_tokens),
-                    f"{row.normalized_fidelity:.6f}",
-                    "YES" if row.pareto else "NO",
-                ]
-            )
+            f"{r.prompt}\t{r.arm}\t{r.confidence}\t{r.tps:.2f}\t"
+            f"{r.speedup:.4f}\t{d}\t{r.matched_prefix}\t{r.oracle_tokens}\t"
+            f"{r.fidelity:.6f}\t{'YES' if r.pareto else 'NO'}"
         )
     print("TOKEN_SOURCE\tretokenized_output")
 
 
-def write_csv(path: Path, rows: Sequence[MetricRow]) -> None:
+def write_csv(path: Path, rows: list[Row]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(
+        w = csv.writer(f)
+        w.writerow(
             [
-                "prompt", "arm", "confidence", "generation_tps",
-                "speedup_vs_sequential", "first_diff_token",
-                "first_diff_token_numeric", "matched_prefix_tokens",
-                "oracle_tokens", "normalized_fidelity",
-                "exact_through_horizon", "pareto", "token_source",
+                "prompt",
+                "arm",
+                "confidence",
+                "generation_tps",
+                "speedup_vs_sequential",
+                "first_diff_token",
+                "first_diff_token_numeric",
+                "matched_prefix_tokens",
+                "oracle_tokens",
+                "normalized_fidelity",
+                "exact_through_horizon",
+                "pareto",
+                "token_source",
             ]
         )
-        for row in rows:
-            writer.writerow(
+        for r in rows:
+            w.writerow(
                 [
-                    row.prompt,
-                    row.arm,
-                    row.confidence,
-                    f"{row.generation_tps:.6f}",
-                    f"{row.speedup_vs_sequential:.6f}",
-                    "NONE" if row.first_diff_token is None else row.first_diff_token,
-                    row.first_diff_token_numeric,
-                    row.matched_prefix_tokens,
-                    row.oracle_tokens,
-                    f"{row.normalized_fidelity:.9f}",
-                    int(row.exact_through_horizon),
-                    int(row.pareto),
+                    r.prompt,
+                    r.arm,
+                    r.confidence,
+                    f"{r.tps:.6f}",
+                    f"{r.speedup:.6f}",
+                    "NONE" if r.first_diff is None else r.first_diff,
+                    r.first_diff_numeric,
+                    r.matched_prefix,
+                    r.oracle_tokens,
+                    f"{r.fidelity:.9f}",
+                    int(r.exact),
+                    int(r.pareto),
                     "retokenized_output",
                 ]
             )
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--config", required=True, type=Path, help="benchmark JSON config")
-    p.add_argument("--csv", type=Path, help="optional CSV output path")
-    p.add_argument("--timeout", type=float, default=None, help="per-process timeout in seconds")
-    return p.parse_args()
-
-
 def main() -> int:
-    args = parse_args()
-    config_path = args.config.expanduser().resolve()
-    config_dir = config_path.parent
-    config = load_config(config_path)
-
-    prompts = config.get("prompts")
-    arms = config.get("arms")
-    if not isinstance(prompts, list) or not prompts:
-        fail("config.prompts must be a non-empty array")
-    if not isinstance(arms, list) or not arms:
-        fail("config.arms must be a non-empty array")
-    if sum(bool(a.get("oracle", False)) for a in arms if isinstance(a, dict)) != 1:
-        fail("config.arms must contain exactly one oracle=true arm")
-
-    all_rows: list[MetricRow] = []
-    stack = TempStack()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True, type=Path)
+    ap.add_argument("--csv", type=Path)
+    ap.add_argument("--timeout", type=float)
+    a = ap.parse_args()
+    cp = a.config.expanduser().resolve()
     try:
-        for prompt_obj in prompts:
-            if not isinstance(prompt_obj, dict):
-                fail("each prompt must be an object")
-            prompt_name, prompt_args = prompt_arg(prompt_obj, config_dir, stack)
-            runs: list[RunResult] = []
-            for arm_obj in arms:
-                if not isinstance(arm_obj, dict):
-                    fail("each arm must be an object")
-                run = run_arm(
-                    config, arm_obj, prompt_name, prompt_args, config_dir, args.timeout
-                )
-                runs.append(run)
-            all_rows.extend(evaluate_prompt(runs))
-    finally:
-        stack.cleanup()
+        cfg = json.loads(cp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        die(f"cannot load config: {exc}")
+    if not isinstance(cfg, dict):
+        die("config must be object")
+    prompts, arms = cfg.get("prompts"), cfg.get("arms")
+    if (
+        not isinstance(prompts, list)
+        or not prompts
+        or not isinstance(arms, list)
+        or not arms
+    ):
+        die("prompts and arms must be non-empty arrays")
+    if sum(bool(x.get("oracle")) for x in arms if isinstance(x, dict)) != 1:
+        die("arms must contain exactly one oracle=true")
 
-    print_matrix(all_rows)
-    if args.csv is not None:
-        write_csv(args.csv.expanduser().resolve(), all_rows)
+    rows: list[Row] = []
+    temps: list[str] = []
+    try:
+        for p in prompts:
+            if not isinstance(p, dict):
+                die("prompt entries must be objects")
+            pname, pargs = prompt_args(p, cp.parent, temps)
+            runs = [
+                run_arm(cfg, arm, pname, pargs, cp.parent, a.timeout)
+                for arm in arms
+                if isinstance(arm, dict)
+            ]
+            rows.extend(rows_for_prompt(runs))
+    finally:
+        for t in temps:
+            try:
+                os.unlink(t)
+            except FileNotFoundError:
+                pass
+    print_rows(rows)
+    if a.csv:
+        write_csv(a.csv.expanduser().resolve(), rows)
     return 0
 
 
