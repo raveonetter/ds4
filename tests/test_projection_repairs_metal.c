@@ -471,6 +471,7 @@ static unsigned run_f16_contracts(const void *model, uint64_t model_size,
     const uint64_t pair_count = (uint64_t)TEST_ROWS * TEST_PAIR_OUT;
     float *single_actual = calloc((size_t)single_count, sizeof(float));
     float *single_expected = calloc((size_t)single_count, sizeof(float));
+    float *single_old_actual = calloc((size_t)single_count, sizeof(float));
     float *pair_a_actual = calloc((size_t)pair_count, sizeof(float));
     float *pair_a_expected = calloc((size_t)pair_count, sizeof(float));
     float *pair_b_actual = calloc((size_t)pair_count, sizeof(float));
@@ -479,23 +480,30 @@ static unsigned run_f16_contracts(const void *model, uint64_t model_size,
         single_count * sizeof(float));
     ds4_gpu_tensor *single_ref = ds4_gpu_tensor_alloc(
         single_count * sizeof(float));
+    ds4_gpu_tensor *single_old = ds4_gpu_tensor_alloc(
+        single_count * sizeof(float));
     ds4_gpu_tensor *pair_a = ds4_gpu_tensor_alloc(pair_count * sizeof(float));
     ds4_gpu_tensor *pair_b = ds4_gpu_tensor_alloc(pair_count * sizeof(float));
     ds4_gpu_tensor *pair_a_ref = ds4_gpu_tensor_alloc(
         pair_count * sizeof(float));
     ds4_gpu_tensor *pair_b_ref = ds4_gpu_tensor_alloc(
         pair_count * sizeof(float));
-    int setup_ok = single_actual && single_expected && pair_a_actual &&
+    int setup_ok = single_actual && single_expected && single_old_actual && pair_a_actual &&
                    pair_a_expected && pair_b_actual && pair_b_expected &&
-                   single && single_ref && pair_a && pair_b &&
+                   single && single_ref && single_old && pair_a && pair_b &&
                    pair_a_ref && pair_b_ref;
     int single_ok = setup_ok;
     int pair_ok = setup_ok;
 
     if (single_ok) {
-        single_ok = ds4_gpu_matmul_f16_decode_rows_exact_tensor(
+        single_ok = ds4_gpu_matmul_f16_canonical_batch_tensor(
                         single, model, model_size, weight_a_offset,
                         TEST_IN, TEST_F16_OUT, input, TEST_ROWS) != 0;
+        if (single_ok) {
+            single_ok = ds4_gpu_matmul_f16_tensor(
+                            single_old, model, model_size, weight_a_offset,
+                            TEST_IN, TEST_F16_OUT, input, TEST_ROWS) != 0;
+        }
     }
     if (pair_ok) {
         pair_ok = ds4_gpu_matmul_f16_pair_decode_rows_exact_tensor(
@@ -538,15 +546,41 @@ static unsigned run_f16_contracts(const void *model, uint64_t model_size,
         ds4_gpu_tensor_free(single_row);
         ds4_gpu_tensor_free(in_row);
     }
+    int old_generic_mismatch = 0;
     if (single_ok) {
         single_ok = ds4_gpu_tensor_read(
                         single, 0, single_actual,
+                        single_count * sizeof(float)) &&
+                    ds4_gpu_tensor_read(
+                        single_old, 0, single_old_actual,
                         single_count * sizeof(float)) &&
                     ds4_gpu_tensor_read(
                         single_ref, 0, single_expected,
                         single_count * sizeof(float)) &&
                     compare_exact("f16_projection", single_actual,
                                   single_expected, (size_t)single_count);
+        old_generic_mismatch = single_ok &&
+            memcmp(single_old_actual, single_expected,
+                   (size_t)single_count * sizeof(float)) != 0;
+        single_ok = single_ok && old_generic_mismatch;
+    }
+    if (single_ok) {
+        static const uint32_t row_cases[] = {1u, 2u, TEST_ROWS};
+        for (size_t i = 0; single_ok && i < sizeof(row_cases) / sizeof(row_cases[0]); i++) {
+            const uint32_t rows = row_cases[i];
+            const size_t count = (size_t)rows * TEST_F16_OUT;
+            single_ok = ds4_gpu_matmul_f16_canonical_batch_tensor(
+                            single, model, model_size, weight_a_offset,
+                            TEST_IN, TEST_F16_OUT, input, rows) != 0 &&
+                        ds4_gpu_tensor_read(
+                            single, 0, single_actual,
+                            (uint64_t)count * sizeof(float)) != 0 &&
+                        memcmp(single_actual, single_expected,
+                               count * sizeof(float)) == 0;
+            printf("FAMILY3_ROW_AB rows=%u candidate_dispatches=1 "
+                   "oracle_dispatches=%u result=%s\n",
+                   rows, rows, single_ok ? "EXACT" : "MISMATCH");
+        }
     }
     if (pair_ok) {
         pair_ok = ds4_gpu_tensor_read(
@@ -567,11 +601,15 @@ static unsigned run_f16_contracts(const void *model, uint64_t model_size,
                                 pair_b_expected, (size_t)pair_count);
     }
 
-    printf("EXACT_ROW_ORACLE_AB family=FAMILY_F16_BATCH_EXT_VS_SINGLE_MV "
+    printf("FAMILY3_PRIMITIVE_AB family=FAMILY_F16_BATCH_EXT_VS_SINGLE_MV "
            "rows=%u sites=hc_attn_pre_split,hc_ffn_pre,ffn_router_projection "
-           "input_bits_equal=PASS weights_same=PASS "
-           "metadata_same=PASS result=%s\n",
-           TEST_ROWS, single_ok ? "EXACT" : "MISMATCH");
+           "input_bits_equal=PASS weights_same=PASS metadata_same=PASS "
+           "old_generic_vs_oracle=%s new_batch_vs_oracle=%s "
+           "mismatch_count=%u batch_parallelism=PRESERVED "
+           "candidate_dispatches=1 oracle_dispatches=%u result=%s\n",
+           TEST_ROWS, old_generic_mismatch ? "MISMATCH" : "EXACT",
+           single_ok ? "EXACT" : "MISMATCH", single_ok ? 0u : 1u,
+           TEST_ROWS, single_ok ? "PASS" : "FAIL");
     printf("EXACT_ROW_ORACLE_AB "
            "family=FAMILY_F16_BATCH_EXT_VS_SINGLE_PAIR_MV rows=%u "
            "sites=attention_kv,attention_score,indexer_kv,indexer_score "
@@ -583,7 +621,9 @@ static unsigned run_f16_contracts(const void *model, uint64_t model_size,
     ds4_gpu_tensor_free(pair_b);
     ds4_gpu_tensor_free(pair_a);
     ds4_gpu_tensor_free(single_ref);
+    ds4_gpu_tensor_free(single_old);
     ds4_gpu_tensor_free(single);
+    free(single_old_actual);
     free(pair_b_expected);
     free(pair_b_actual);
     free(pair_a_expected);

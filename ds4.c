@@ -27878,7 +27878,7 @@ static bool metal_graph_hc_rms_scale_project(
                       norm_scratch, x, (uint32_t)in_dim,
                       n_tokens, DS4_RMS_EPS) != 0;
         if (ok) {
-            ok = ds4_gpu_matmul_f16_decode_rows_exact_tensor(
+            ok = ds4_gpu_matmul_f16_canonical_batch_tensor(
                      out, model->map, model->size, weight->abs_offset,
                      in_dim,
                      2u * DS4_N_HC + DS4_N_HC * DS4_N_HC,
@@ -30231,7 +30231,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     } else if (ok && layer->ffn_gate_inp->type == DS4_TENSOR_F16 &&
                ds4_family_repair_runtime_enabled(
                    DS4_REPAIR_FAMILY_F16_BATCH_EXT_VS_SINGLE_MV)) {
-        ok = ds4_gpu_matmul_f16_decode_rows_exact_tensor(
+        ok = ds4_gpu_matmul_f16_canonical_batch_tensor(
                  metal_graph_batch_router_logits(g),
                  model->map, model->size,
                  layer->ffn_gate_inp->abs_offset,

@@ -700,6 +700,23 @@ typedef decltype(kernel_mul_mv_t_t<half, half>) mul_mv_t_t;
 template [[host_name("kernel_mul_mv_f32_f32")]] kernel mul_mv_t_t kernel_mul_mv_t_t<float, float>;
 template [[host_name("kernel_mul_mv_f16_f32")]] kernel mul_mv_t_t kernel_mul_mv_t_t<half,  float>;
 
+// Batch-row schedule with the ordinary F16 decode reduction topology.  The
+// host expands grid.y across activation rows; arithmetic inside every
+// (row, output-group) threadgroup is identical to kernel_mul_mv_f16_f32.
+[[host_name("kernel_mul_mv_f16_f32_canonical_batch")]]
+kernel void kernel_mul_mv_f16_f32_canonical_batch(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_t_t_disp<half, float, constant ds4_metal_args_mul_mv &>(
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t>
 void kernel_mul_mv_t_t_4_impl(
         args_t args,
@@ -817,6 +834,21 @@ typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4>) mul_mv_t_t_4;
 // Host-visible vectorized dense matvec variants for F32 and F16 weights.
 template [[host_name("kernel_mul_mv_f32_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, float, float4>;
 template [[host_name("kernel_mul_mv_f16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  float, float4>;
+
+[[host_name("kernel_mul_mv_f16_f32_4_canonical_batch")]]
+kernel void kernel_mul_mv_f16_f32_4_canonical_batch(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_t_t_4_disp<half, half4, float, float4,
+                             constant ds4_metal_args_mul_mv &>(
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
 
 // DS4 compressor projections always compute two same-shaped F16 matvecs from
 // the same normalized activation: one for projected KV and one for pooling

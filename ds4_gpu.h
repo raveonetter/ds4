@@ -752,6 +752,18 @@ int ds4_gpu_matmul_f16_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* One batched Metal dispatch whose per-row arithmetic is identical to the
+ * ordinary F16 single-MV decode kernel. */
+int ds4_gpu_matmul_f16_canonical_batch_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
+
 /* Metal family repairs: invoke the ordinary one-row decode entry per row.
  * Model mapping, pipeline selection, command encoding, tensor shape, grid
  * geometry, and reduction order therefore match canonical decode. */
