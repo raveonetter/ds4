@@ -39,9 +39,23 @@ def die(msg: str) -> None:
 
 
 def parse_token_ids(text: str, probe: bool = False) -> list[int]:
+    """Parse the token-ID vector emitted by ds4 --dump-tokens.
+
+    Current ds4 output is intentionally human-readable.  Its first line is a
+    bare JSON-compatible integer vector, followed by one line per token:
+
+        [123, 456, ...]
+           123  token-text
+           456  token-text
+
+    Older/diagnostic variants are accepted as fallbacks so the postprocessor
+    remains usable across nearby experiment branches.
+    """
     s = text.strip()
     if not s:
         return []
+
+    # Some builds may emit only the vector.  Accept that directly.
     try:
         obj = json.loads(s)
         if isinstance(obj, list) and all(isinstance(x, int) for x in obj):
@@ -54,17 +68,41 @@ def parse_token_ids(text: str, probe: bool = False) -> list[int]:
     except json.JSONDecodeError:
         pass
 
-    for line in text.splitlines():
+    lines = text.splitlines()
+
+    # Current ds4 format: the first non-empty line is the complete bare vector,
+    # while subsequent lines contain the human-readable token table.
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                obj = None
+            if isinstance(obj, list) and all(isinstance(x, int) for x in obj):
+                return list(obj)
+        break
+
+    # Compatibility with labeled one-line vectors.
+    for line in lines:
         m = re.match(
-            r"^\s*(?:tokens|token_ids|ids)\s*[:=]\s*\[([^]]*)\]",
+            r"^\s*(?:tokens|token_ids|ids)\s*[:=]\s*(\[[^]]*\])\s*$",
             line,
             re.I,
         )
         if m:
-            vals = re.findall(r"-?\d+", m.group(1))
-            if vals:
-                return [int(x) for x in vals]
+            try:
+                obj = json.loads(m.group(1))
+            except json.JSONDecodeError:
+                obj = None
+            if isinstance(obj, list) and all(isinstance(x, int) for x in obj):
+                return list(obj)
 
+    # Last-resort compatibility with line-oriented ID dumps.  The final pattern
+    # also matches ds4's human table ("   123  token-text"), but current builds
+    # should already have returned from the bare-vector path above.
     ids: list[int] = []
     patterns = [
         re.compile(r"^\s*(-?\d+)\s*$"),
@@ -73,8 +111,9 @@ def parse_token_ids(text: str, probe: bool = False) -> list[int]:
         ),
         re.compile(r"^\s*token\[\d+\]\s*[:=]\s*(-?\d+)(?:\s|$)", re.I),
         re.compile(r"^\s*\d+\s*(?::|\t)\s*(-?\d+)(?:\s|$)"),
+        re.compile(r"^\s*(-?\d+)\s{2,}.*$"),
     ]
-    for line in text.splitlines():
+    for line in lines:
         for pat in patterns:
             m = pat.match(line)
             if m:
@@ -109,7 +148,12 @@ def run_tokenizer(ds4: Path, model: Path, text_file: Path) -> list[int]:
         ids = parse_token_ids(stream, probe=True)
         if ids:
             return ids
-    die(f"no parseable token IDs from --dump-tokens for {text_file}")
+    stdout_head = "\\n".join(p.stdout.splitlines()[:3])
+    stderr_head = "\\n".join(p.stderr.splitlines()[:3])
+    die(
+        f"no parseable token IDs from --dump-tokens for {text_file}; "
+        f"stdout_head={stdout_head!r} stderr_head={stderr_head!r}"
+    )
 
 
 def first_divergence(oracle: Sequence[int], candidate: Sequence[int]) -> int | None:
