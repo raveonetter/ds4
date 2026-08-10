@@ -10,7 +10,12 @@ set -euo pipefail
 # For every confidence threshold:
 #   replay           generic DSpark verifier + normal accepted-token replay
 #   fast_generic     full-accept fast commit, all production repairs disabled
-#   fast_repaired    same fast commit + REPAIRED_ENV production repairs
+#   fast_f1          fast commit + Family 1 production repair
+#   fast_f1_f3       fast commit + Family 1 + Family 3 production repairs
+#
+# Family 3 is FAMILY_F16_BATCH_EXT_VS_SINGLE_MV and uses the unified
+# DS4_FAMILY_REPAIRS selector. Keeping fast_f1 and fast_f1_f3 separate makes
+# Family 3's incremental correctness/performance effect directly measurable.
 #
 # fast_* is NOT fully replay-free: full accepts bypass replay; partial accepts
 # still take the normal rollback/replay path. DS4_DSPARK_STATS=1 is enabled for
@@ -32,7 +37,9 @@ OUT_DIR="$OUT_ROOT/$RUN_ID"
 
 FAST_COMMIT_ENV=${FAST_COMMIT_ENV:-DS4_DSPARK_FULL_ACCEPT_FAST_COMMIT=1}
 FAST_COMMIT_SENTINEL=${FAST_COMMIT_SENTINEL:-DS4_DSPARK_FULL_ACCEPT_FAST_COMMIT}
-REPAIRED_ENV=${REPAIRED_ENV:-DS4_FAMILY1_REPAIR=ALL}
+FAMILY1_ENV=${FAMILY1_ENV:-DS4_FAMILY1_REPAIR=ALL}
+FAMILY3_ENV=${FAMILY3_ENV:-DS4_FAMILY_REPAIRS=FAMILY_F16_BATCH_EXT_VS_SINGLE_MV}
+FAMILY1_FAMILY3_ENV=${FAMILY1_FAMILY3_ENV:-"$FAMILY1_ENV $FAMILY3_ENV"}
 ALLOW_UNVERIFIED_FAST_COMMIT=${ALLOW_UNVERIFIED_FAST_COMMIT:-0}
 
 COMMON_ARGS=(
@@ -288,12 +295,23 @@ run_arm() {
         echo FAIL > "$status_file"; return 1
       fi
       ;;
-    fast_repaired_*)
+    fast_f1_*)
       if ! fast_commit_available "$REPAIRED_BIN"; then
         echo "SKIP: fast-commit hook '$FAST_COMMIT_SENTINEL' not found in $REPAIRED_BIN" | tee "$log"
         : > "$out"; echo SKIP > "$status_file"; return 0
       fi
-      if run_dspark "$REPAIRED_BIN" "$prompt_file" "$out" "$log" "$conf" "$FAST_COMMIT_ENV $REPAIRED_ENV" 0; then
+      if run_dspark "$REPAIRED_BIN" "$prompt_file" "$out" "$log" "$conf" "$FAST_COMMIT_ENV $FAMILY1_ENV" 0; then
+        echo PASS > "$status_file"
+      else
+        echo FAIL > "$status_file"; return 1
+      fi
+      ;;
+    fast_f1_f3_*)
+      if ! fast_commit_available "$REPAIRED_BIN"; then
+        echo "SKIP: fast-commit hook '$FAST_COMMIT_SENTINEL' not found in $REPAIRED_BIN" | tee "$log"
+        : > "$out"; echo SKIP > "$status_file"; return 0
+      fi
+      if run_dspark "$REPAIRED_BIN" "$prompt_file" "$out" "$log" "$conf" "$FAST_COMMIT_ENV $FAMILY1_FAMILY3_ENV" 0; then
         echo PASS > "$status_file"
       else
         echo FAIL > "$status_file"; return 1
@@ -377,7 +395,9 @@ TOKENS=$TOKENS
 CONFIDENCES=$CONFIDENCES
 FAST_COMMIT_ENV=$FAST_COMMIT_ENV
 FAST_COMMIT_SENTINEL=$FAST_COMMIT_SENTINEL
-REPAIRED_ENV=$REPAIRED_ENV
+FAMILY1_ENV=$FAMILY1_ENV
+FAMILY3_ENV=$FAMILY3_ENV
+FAMILY1_FAMILY3_ENV=$FAMILY1_FAMILY3_ENV
 FAST_COMMIT_SCOPE=FULL_ACCEPT_ONLY_PARTIAL_ACCEPTS_REPLAY
 BYTE_ORACLE=sequential
 EOF_CONFIG
@@ -408,7 +428,7 @@ for prompt_name in warehouse intervals; do
 
   for conf in "${CONF_LIST[@]}"; do
     tag=$(confidence_tag "$conf")
-    for mode in replay fast_generic fast_repaired; do
+    for mode in replay fast_generic fast_f1 fast_f1_f3; do
       arm="${mode}_${tag}"
       run_arm "$prompt_name" "$prompt_file" "$arm" "$conf"
       record_result "$prompt_name" "$arm" "$conf"
@@ -432,4 +452,5 @@ echo
 echo "results: $OUT_DIR"
 echo "Sequential is the byte oracle. speedup_vs_sequential > 1.0 is the end-to-end speedup gate."
 echo "fast_* bypasses replay only on full accepts; partial accepts still replay."
+echo "fast_f1_f3 - fast_f1 isolates Family 3's incremental production effect."
 echo "Raw DSpark stats are preserved in stats_raw.tsv even when a field name is not recognized by the parser."
