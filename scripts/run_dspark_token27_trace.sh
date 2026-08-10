@@ -31,13 +31,11 @@ MODEL=$(abs_path "$MODEL")
 DSPARK_MODEL=$(abs_path "$DSPARK_MODEL")
 OUT_DIR=$(abs_path "$OUT_DIR")
 PROMPT_FILE="$SOURCE_RUN_DIR/prompts/warehouse.txt"
-ORACLE_FILE="$SOURCE_RUN_DIR/warehouse/sequential.txt"
 
 [[ -d "$ROOT_DIR/.git" || -f "$ROOT_DIR/.git" ]] || { echo "not a git worktree: $ROOT_DIR" >&2; exit 2; }
 [[ -f "$MODEL" ]] || { echo "missing model $MODEL" >&2; exit 2; }
 [[ -f "$DSPARK_MODEL" ]] || { echo "missing DSpark support model $DSPARK_MODEL" >&2; exit 2; }
 [[ -f "$PROMPT_FILE" ]] || { echo "missing warehouse prompt $PROMPT_FILE" >&2; exit 2; }
-[[ -f "$ORACLE_FILE" ]] || { echo "missing sequential oracle $ORACLE_FILE" >&2; exit 2; }
 [[ -f "$TRACE_TOOL" ]] || { echo "missing trace tool $TRACE_TOOL" >&2; exit 2; }
 [[ "$TOKENS" =~ ^[1-9][0-9]*$ ]] || { echo "TOKENS must be a positive integer" >&2; exit 2; }
 [[ "$EXPECTED_FIRST_DIFF_ORDINAL" =~ ^[1-9][0-9]*$ ]] || { echo "EXPECTED_FIRST_DIFF_ORDINAL must be positive" >&2; exit 2; }
@@ -90,6 +88,15 @@ clear_experiment_env() {
   unset DS4_FAMILY4_REPAIR DS4_FAMILY5_REPAIR DS4_FAMILY6_REPAIR DS4_FAMILY7_REPAIR
 }
 
+ORACLE_OUT="$OUT_DIR/sequential_oracle.txt"
+ORACLE_LOG="$OUT_DIR/sequential_oracle.log"
+echo "TOKEN27_RUN arm=SEQUENTIAL_ORACLE"
+(
+  clear_experiment_env
+  "$TRACE_BIN" -m "$MODEL" --temp 0 --tokens "$TOKENS" --nothink -p "$PROMPT"
+) >"$ORACLE_OUT" 2>"$ORACLE_LOG"
+echo "TOKEN27_ORACLE status=PASS source=fresh_same_binary horizon_tokens=$TOKENS"
+
 run_arm() {
   local arm=$1 fast_commit=$2 trace=$3
   local out="$OUT_DIR/${arm}.txt"
@@ -119,7 +126,7 @@ run_arm E2_full_accept_replay 0 1
 python3 "$TRACE_TOOL" analyze-ab \
   --ds4-bin "$TRACE_BIN" \
   --model "$MODEL" \
-  --oracle "$ORACLE_FILE" \
+  --oracle "$ORACLE_OUT" \
   --e0-out "$OUT_DIR/E0_fast_trace_off.txt" \
   --e0-log "$OUT_DIR/E0_fast_trace_off.log" \
   --e1-out "$OUT_DIR/E1_fast_trace_on.txt" \
