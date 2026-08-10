@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Append additional fast-commit family configurations to an existing
-# run_dspark_quality_matrix.sh result directory. Prompts are reused verbatim.
+# Append fast-commit family ablations to an existing DSpark quality-matrix run.
+# Prompts are reused verbatim. The default search is generic-based:
+#   F3, F4, F5, F6, F7, and the targeted F4+F5 interaction.
+#
+# F1 is already present in run_dspark_quality_matrix.sh as fast_f1_*.
+# F1+F3 is also already present there as fast_f1_f3_*.
+# F2 is absent because the experiment-line manifest still marks it
+# NOT_IMPLEMENTED.
 
 ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT_DIR"
@@ -13,7 +19,7 @@ MODEL=${MODEL:-./ds4flash.gguf}
 DSPARK_MODEL=${DSPARK_MODEL:-./gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf}
 TOKENS=${TOKENS:-768}
 CONFIDENCES=${CONFIDENCES:-"0 0.3 0.5 0.7"}
-FAMILY_SWEEP_MODE=${FAMILY_SWEEP_MODE:-cumulative}
+FAMILY_SWEEP_MODE=${FAMILY_SWEEP_MODE:-ablation}
 
 F3=FAMILY_F16_BATCH_EXT_VS_SINGLE_MV
 F4=FAMILY_ROUTER_WEIGHT_NORMALIZATION_BATCH_REDUCE_VS_SINGLE_KERNEL
@@ -25,29 +31,38 @@ F7=FAMILY_F16_BATCH_EXT_VS_SINGLE_PAIR_MV
 [[ -x "$REPAIRED_BIN" ]] || { echo "missing executable $REPAIRED_BIN" >&2; exit 2; }
 [[ -f "$MODEL" && -f "$DSPARK_MODEL" ]] || { echo "missing model/support model" >&2; exit 2; }
 
-tag_conf() { local x=${1//./p}; printf 'c%s' "$x"; }
+tag_conf() {
+  local x=${1//./p}
+  printf 'c%s' "$x"
+}
 
 extract_tps() {
   local log=$1
   local v
-  v=$(grep -Eo '[0-9]+([.][0-9]+)?[[:space:]]*t/s' "$log" 2>/dev/null | tail -n 1 | sed -E 's/[[:space:]]*t\/s//' || true)
+  v=$(grep -Eo '[0-9]+([.][0-9]+)?[[:space:]]*t/s' "$log" 2>/dev/null |
+      tail -n 1 | sed -E 's/[[:space:]]*t\/s//' || true)
   [[ -n "$v" ]] && printf '%s' "$v" || printf 'NA'
 }
 
 base_tps() {
   local prompt=$1
-  awk -F '\t' -v p="$prompt" '$1==p && $2=="sequential" {print $5; exit}' "$RUN_DIR/performance.tsv"
+  awk -F '\t' -v p="$prompt" '$1==p && $2=="sequential" {print $5; exit}' \
+    "$RUN_DIR/performance.tsv"
 }
 
 speedup() {
   local x=$1 b=$2
-  [[ "$x" == NA || -z "$b" || "$b" == NA || "$b" == 0 ]] && { printf 'NA'; return; }
+  [[ "$x" == NA || -z "$b" || "$b" == NA || "$b" == 0 ]] && {
+    printf 'NA'
+    return
+  }
   awk -v x="$x" -v b="$b" 'BEGIN {printf "%.4f", x/b}'
 }
 
 arm_exists() {
   local prompt=$1 arm=$2
-  awk -F '\t' -v p="$prompt" -v a="$arm" '$1==p && $2==a {found=1} END {exit !found}' "$RUN_DIR/performance.tsv"
+  awk -F '\t' -v p="$prompt" -v a="$arm" \
+    '$1==p && $2==a {found=1} END {exit !found}' "$RUN_DIR/performance.tsv"
 }
 
 run_variant() {
@@ -89,13 +104,7 @@ run_variant() {
     "$prompt_name" "$arm" "$conf" "$status" "$tps" "$sp" >> "$RUN_DIR/performance.tsv"
 }
 
-cumulative_variants=(
-  "f1_f3_f4|$F3,$F4|1"
-  "f1_f3_f4_f5|$F3,$F4,$F5|1"
-  "f1_f3_f4_f5_f6|$F3,$F4,$F5,$F6|1"
-  "f1_f3_f4_f5_f6_f7|$F3,$F4,$F5,$F6,$F7|1"
-)
-individual_variants=(
+singleton_variants=(
   "f3|$F3|0"
   "f4|$F4|0"
   "f5|$F5|0"
@@ -103,12 +112,45 @@ individual_variants=(
   "f7|$F7|0"
 )
 
+targeted_pair_variants=(
+  "f4_f5|$F4,$F5|0"
+)
+
+# Retained only for historical comparison with the previous experiment.
+cumulative_variants=(
+  "f1_f3_f4|$F3,$F4|1"
+  "f1_f3_f4_f5|$F3,$F4,$F5|1"
+  "f1_f3_f4_f5_f6|$F3,$F4,$F5,$F6|1"
+  "f1_f3_f4_f5_f6_f7|$F3,$F4,$F5,$F6,$F7|1"
+)
+
 case "$FAMILY_SWEEP_MODE" in
-  cumulative) variants=("${cumulative_variants[@]}") ;;
-  individual) variants=("${individual_variants[@]}") ;;
-  all) variants=("${individual_variants[@]}" "${cumulative_variants[@]}") ;;
-  off|none|0) exit 0 ;;
-  *) echo "unknown FAMILY_SWEEP_MODE=$FAMILY_SWEEP_MODE" >&2; exit 2 ;;
+  ablation)
+    variants=("${singleton_variants[@]}" "${targeted_pair_variants[@]}")
+    ;;
+  singleton|individual)
+    variants=("${singleton_variants[@]}")
+    ;;
+  targeted|pairs)
+    variants=("${targeted_pair_variants[@]}")
+    ;;
+  cumulative)
+    variants=("${cumulative_variants[@]}")
+    ;;
+  all)
+    variants=(
+      "${singleton_variants[@]}"
+      "${targeted_pair_variants[@]}"
+      "${cumulative_variants[@]}"
+    )
+    ;;
+  off|none|0)
+    exit 0
+    ;;
+  *)
+    echo "unknown FAMILY_SWEEP_MODE=$FAMILY_SWEEP_MODE" >&2
+    exit 2
+    ;;
 esac
 
 for prompt in warehouse intervals; do
@@ -119,6 +161,3 @@ for prompt in warehouse intervals; do
     done
   done
 done
-
-# Family 2 (flash-attention batch-direct family) is intentionally absent:
-# family_repair manifest on this experiment line marks it NOT_IMPLEMENTED.
