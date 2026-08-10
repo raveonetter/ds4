@@ -4,17 +4,17 @@
 #include "ds4_float_compare.h"
 #include "ds4_gpu.h"
 
-#include <float.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 enum {
     TEST_ROWS = 5,
+    TEST_BENCH_TRIALS = 20,
     TEST_IN = 4096,
     TEST_Q8_OUT = 1024,
     TEST_F16_OUT = 256,
@@ -156,10 +156,10 @@ static int compare_exact(const char *label, const float *actual,
     return 1;
 }
 
-static double monotonic_ms(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+static double wall_clock_ms(void) {
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) != 0) return 0.0;
+    return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
 }
 
 static int run_q8_contract(const void *model, uint64_t model_size,
@@ -189,9 +189,9 @@ static int run_q8_contract(const void *model, uint64_t model_size,
     int candidate_exact = 0;
     int shared_gate_exact = 0;
     int performance_ok = 0;
-    double generic_best_ms = DBL_MAX;
-    double candidate_best_ms = DBL_MAX;
-    double exact_best_ms = DBL_MAX;
+    double generic_total_ms = 0.0;
+    double candidate_total_ms = 0.0;
+    double exact_total_ms = 0.0;
     int ok = generic_host && candidate_host && expected &&
              gate_actual && gate_expected &&
              up_actual && up_expected && mid_actual && mid_expected &&
@@ -284,56 +284,72 @@ static int run_q8_contract(const void *model, uint64_t model_size,
         }
     }
 
-    for (unsigned trial = 0; ok && trial < 5u; trial++) {
-        double start = monotonic_ms();
+    /* Warm all three pipelines before measuring.  Every timed operation is
+     * followed by an explicit synchronization so a future batched command
+     * context cannot turn this into CPU enqueue timing. */
+    if (ok) {
         ok = ds4_gpu_matmul_q8_0_tensor(
                  generic, model, model_size, gate_offset,
-                 TEST_IN, TEST_Q8_OUT, input, TEST_ROWS) != 0;
-        double elapsed = monotonic_ms() - start;
-        if (ok && elapsed < generic_best_ms) generic_best_ms = elapsed;
+                 TEST_IN, TEST_Q8_OUT, input, TEST_ROWS) != 0 &&
+             ds4_gpu_matmul_q8_0_canonical_batch_tensor(
+                 candidate, model, model_size, gate_offset,
+                 TEST_IN, TEST_Q8_OUT, input, TEST_ROWS) != 0 &&
+             ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                 reference, model, model_size, gate_offset,
+                 TEST_IN, TEST_Q8_OUT, input, TEST_ROWS) != 0 &&
+             ds4_gpu_synchronize() != 0;
+    }
+    for (unsigned trial = 0; ok && trial < TEST_BENCH_TRIALS; trial++) {
+        double start = wall_clock_ms();
+        ok = ds4_gpu_matmul_q8_0_tensor(
+                 generic, model, model_size, gate_offset,
+                 TEST_IN, TEST_Q8_OUT, input, TEST_ROWS) != 0 &&
+             ds4_gpu_synchronize() != 0;
+        generic_total_ms += wall_clock_ms() - start;
 
-        start = monotonic_ms();
+        start = wall_clock_ms();
         if (ok) {
             ok = ds4_gpu_matmul_q8_0_canonical_batch_tensor(
                      candidate, model, model_size, gate_offset,
-                     TEST_IN, TEST_Q8_OUT, input, TEST_ROWS) != 0;
+                     TEST_IN, TEST_Q8_OUT, input, TEST_ROWS) != 0 &&
+                 ds4_gpu_synchronize() != 0;
         }
-        elapsed = monotonic_ms() - start;
-        if (ok && elapsed < candidate_best_ms) candidate_best_ms = elapsed;
+        candidate_total_ms += wall_clock_ms() - start;
 
-        start = monotonic_ms();
+        start = wall_clock_ms();
         if (ok) {
             ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
                      reference, model, model_size, gate_offset,
-                     TEST_IN, TEST_Q8_OUT, input, TEST_ROWS) != 0;
+                     TEST_IN, TEST_Q8_OUT, input, TEST_ROWS) != 0 &&
+                 ds4_gpu_synchronize() != 0;
         }
-        elapsed = monotonic_ms() - start;
-        if (ok && elapsed < exact_best_ms) exact_best_ms = elapsed;
+        exact_total_ms += wall_clock_ms() - start;
     }
     if (ok) {
-        performance_ok = candidate_best_ms < exact_best_ms;
+        performance_ok = candidate_total_ms > 0.0 && exact_total_ms > 0.0 &&
+            candidate_total_ms < exact_total_ms;
         ok = performance_ok;
     }
 
     printf("FAMILY1_REPAIR_TEST "
            "family=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV site=QA "
-           "old_kernel=kernel_mul_mv_ext_q8_0_f32_r1 "
+           "old_kernel=kernel_mul_mv_ext_q8_0_f32_r1_5 "
            "new_kernel=kernel_mul_mv_q8_0_f32_canonical_batch "
            "input_bits_equal=PASS weights_same=PASS metadata_same=PASS "
            "old_vs_seq=%s new_vs_seq=%s batch_parallelism=PRESERVED "
            "candidate_dispatches=1 exact_dispatches=%u "
-           "generic_ms=%.3f candidate_ms=%.3f exact_ms=%.3f "
+           "timing_trials=%u generic_ms=%.3f candidate_ms=%.3f exact_ms=%.3f "
            "candidate_over_generic=%.3f "
            "candidate_faster_than_exact=%s result=%s\n",
            old_mismatch ? "MISMATCH" : "EXACT",
            candidate_exact ? "EXACT" : "MISMATCH",
            TEST_ROWS,
-           generic_best_ms == DBL_MAX ? 0.0 : generic_best_ms,
-           candidate_best_ms == DBL_MAX ? 0.0 : candidate_best_ms,
-           exact_best_ms == DBL_MAX ? 0.0 : exact_best_ms,
-           generic_best_ms > 0.0 && generic_best_ms != DBL_MAX &&
-                   candidate_best_ms != DBL_MAX
-               ? candidate_best_ms / generic_best_ms
+           TEST_BENCH_TRIALS,
+           generic_total_ms / TEST_BENCH_TRIALS,
+           candidate_total_ms / TEST_BENCH_TRIALS,
+           exact_total_ms / TEST_BENCH_TRIALS,
+           generic_total_ms > 0.0
+               ? candidate_total_ms / generic_total_ms
                : 0.0,
            performance_ok ? "PASS" : "FAIL",
            ok ? "PASS" : "FAIL");
@@ -1060,10 +1076,16 @@ int main(void) {
         }
         for (uint32_t row = 0; row < TEST_ROWS; row++) {
             for (uint32_t col = 0; col < TEST_IN; col++) {
-                const int32_t raw =
-                    (int32_t)((row * 29u + col * 31u + 7u) % 127u) - 63;
-                input_host[(uint64_t)row * TEST_IN + col] =
-                    (float)raw / 256.0f;
+                /* Avoid power-of-two fractions: the previous fixture made
+                 * every Q8 product exactly representable and accidentally
+                 * erased the reduction-topology divergence under test. */
+                uint32_t bits = 0x3f000000u |
+                    ((row * 0x1f123bb5u + col * 0x5bd1e995u +
+                      0x6d2b79f5u) & 0x007fffffu);
+                float value;
+                memcpy(&value, &bits, sizeof(value));
+                if ((row + col) & 1u) value = -value;
+                input_host[(uint64_t)row * TEST_IN + col] = value;
             }
         }
     }
