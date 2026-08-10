@@ -1,0 +1,83 @@
+{
+  "binary": "../ds4",
+  "model": "../ds4flash.gguf",
+  "tokens": 2048,
+  "common_args": ["--temp", "0"],
+  "prompts": [
+    {"name": "warehouse", "file": "../bench-prompts/warehouse.txt"},
+    {"name": "intervals", "file": "../bench-prompts/intervals.txt"}
+  ],
+  "arms": [
+    {
+      "name": "sequential",
+      "oracle": true,
+      "confidence": "NA",
+      "args": []
+    },
+    {
+      "name": "dspark_strict",
+      "confidence": "0.7",
+      "args": ["--dspark-strict"]
+    },
+    {
+      "name": "dspark_generic_c0p7",
+      "confidence": "0.7",
+      "args": ["--dspark-confidence", "0.7"]
+    },
+    {
+      "name": "dspark_f1_c0p7",
+      "confidence": "0.7",
+      "args": ["--dspark-confidence", "0.7"],
+      "env": {"DS4_FAMILY1_REPAIR": "ALL"}
+    },
+    {
+      "name": "dspark_f3_c0p7",
+      "confidence": "0.7",
+      "args": ["--dspark-confidence", "0.7"],
+      "env": {
+        "DS4_FAMILY_REPAIRS": "FAMILY_F16_BATCH_EXT_VS_SINGLE_MV"
+      }
+    },
+    {
+      "name": "dspark_f1_f3_c0p7",
+      "confidence": "0.7",
+      "args": ["--dspark-confidence", "0.7"],
+      "env": {
+        "DS4_FAMILY1_REPAIR": "ALL",
+        "DS4_FAMILY_REPAIRS": "FAMILY_F16_BATCH_EXT_VS_SINGLE_MV"
+      }
+    },
+    {
+      "name": "dspark_f1_plus_all_implemented_c0p7",
+      "confidence": "0.7",
+      "args": ["--dspark-confidence", "0.7"],
+      "env": {
+        "DS4_FAMILY1_REPAIR": "ALL",
+        "DS4_FAMILY_REPAIRS": "all"
+      }
+    },
+    {
+      "name": "fast_generic_c0p7",
+      "confidence": "0.7",
+      "binary": "../builds/ds4-fast-generic",
+      "args": ["--dspark-confidence", "0.7"]
+    },
+    {
+      "name": "fast_f1_c0p7",
+      "confidence": "0.7",
+      "binary": "../builds/ds4-fast-f1",
+      "args": ["--dspark-confidence", "0.7"],
+      "env": {"DS4_FAMILY1_REPAIR": "ALL"}
+    },
+    {
+      "name": "fast_f1_f3_c0p7",
+      "confidence": "0.7",
+      "binary": "../builds/ds4-fast-f1-f3",
+      "args": ["--dspark-confidence", "0.7"],
+      "env": {
+        "DS4_FAMILY1_REPAIR": "ALL",
+        "DS4_FAMILY_REPAIRS": "FAMILY_F16_BATCH_EXT_VS_SINGLE_MV"
+      }
+    }
+  ]
+}
