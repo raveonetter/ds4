@@ -291,8 +291,12 @@ run_arm() {
 }
 
 compare_to_sequential() {
-  local prompt_name=$1 arm=$2 dir="$OUT_DIR/$prompt_name"
-  local ref="$dir/sequential.txt" out="$dir/$arm.txt" status first_byte
+  local prompt_name=$1
+  local arm=$2
+  local dir="$OUT_DIR/$prompt_name"
+  local ref="$dir/sequential.txt"
+  local out="$dir/$arm.txt"
+  local status first_byte
   status=$(cat "$dir/$arm.status")
 
   if [[ "$status" != "PASS" ]]; then
@@ -312,7 +316,10 @@ compare_to_sequential() {
 }
 
 record_perf() {
-  local prompt_name=$1 arm=$2 dir="$OUT_DIR/$prompt_name" status tps
+  local prompt_name=$1
+  local arm=$2
+  local dir="$OUT_DIR/$prompt_name"
+  local status tps
   status=$(cat "$dir/$arm.status")
   if [[ "$status" == "PASS" ]]; then
     tps=$(extract_tps "$dir/$arm.log")
