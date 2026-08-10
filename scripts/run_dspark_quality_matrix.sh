@@ -149,8 +149,13 @@ fast_commit_available() {
   if [[ "$ALLOW_UNVERIFIED_FAST_COMMIT" == "1" ]]; then
     return 0
   fi
+
+  # Do not use grep -q here. With set -o pipefail, grep -q exits as soon as it
+  # finds the sentinel, strings(1) can then receive SIGPIPE, and the pipeline
+  # is reported as failed even though the string was present. Read the full
+  # strings output instead so the detector is reliable under pipefail.
   if command -v strings >/dev/null 2>&1 &&
-     strings "$bin" 2>/dev/null | grep -q "$FAST_COMMIT_SENTINEL"; then
+     strings "$bin" 2>/dev/null | grep -F "$FAST_COMMIT_SENTINEL" >/dev/null; then
     return 0
   fi
   return 1
