@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run a fixed DSpark correctness/performance matrix against two deterministic
-# prompts.  The matrix keeps correctness oracles separate from production
-# repair mechanisms:
+# Fixed DSpark correctness/performance matrix for two deterministic prompts.
+# Keep correctness oracles, replay baseline, and approximate full-accept
+# fast-commit controls separate:
 #
-#   sequential       ordinary target-only decode
-#   dspark_strict    DSpark CLI, forced target-only canonical decode
-#   dspark_replay    generic DSpark verifier + normal accepted-token replay
-#   dspark_generic   generic verifier + opt-in fast commit, repairs disabled
-#   dspark_repaired  fast commit + explicitly enabled production repairs
+#   sequential               ordinary target-only decode
+#   dspark_strict            DSpark CLI forced target-only canonical decode
+#   dspark_replay            generic DSpark verifier + normal accepted-token replay
+#   fast_commit_generic      PR #746 full-accept fast commit, repairs disabled
+#   fast_commit_repaired     same fast commit + explicitly enabled production repairs
 #
-# The generic/repaired arms are intended to expose free-running drift.  They
-# require an opt-in no/full-accept-replay hook (by default PR #746's
-# DS4_DSPARK_FULL_ACCEPT_FAST_COMMIT=1).  If your branch uses another hook,
-# override FAST_COMMIT_ENV.
+# IMPORTANT: fast_commit_* is NOT a fully no-replay mode. Only full accepts
+# bypass rollback/replay; partial accepts retain the normal replay path. These
+# arms are free-running drift/performance controls for production family repair.
 #
 # This script never treats the canonical oracle as a repair implementation.
 
@@ -32,19 +31,17 @@ OUT_ROOT=${OUT_ROOT:-./quality-results/dspark-matrix}
 RUN_ID=${RUN_ID:-$(date +%Y%m%d-%H%M%S)}
 OUT_DIR="$OUT_ROOT/$RUN_ID"
 
-# Default approximate/no-replay control from upstream PR #746.  Override when
-# testing a branch with a differently named fast-commit switch.
+# Upstream PR #746 opt-in full-accept fast commit. Override these only when a
+# branch deliberately uses another equivalent benchmark hook.
 FAST_COMMIT_ENV=${FAST_COMMIT_ENV:-DS4_DSPARK_FULL_ACCEPT_FAST_COMMIT=1}
 FAST_COMMIT_SENTINEL=${FAST_COMMIT_SENTINEL:-DS4_DSPARK_FULL_ACCEPT_FAST_COMMIT}
 
-# Only enable real production repairs here.  Do NOT put exact-row oracle
-# fallbacks in this default.  Family 1's batch-preserving production repair is
-# the first accepted entry; extend/override this as later families graduate.
+# Only real production repairs belong here. Do not put exact-row oracle
+# fallbacks in the default. Family 1 is the first graduated production repair.
 REPAIRED_ENV=${REPAIRED_ENV:-DS4_FAMILY1_REPAIR=ALL}
 
-# Set to 1 only if the binary uses a fast-commit switch that cannot be detected
-# with strings(1).  Otherwise generic/repaired arms are skipped rather than
-# silently becoming replay baselines.
+# Set only when a replacement fast-commit hook cannot be found by strings(1).
+# Otherwise fast-commit arms SKIP rather than silently degenerating to replay.
 ALLOW_UNVERIFIED_FAST_COMMIT=${ALLOW_UNVERIFIED_FAST_COMMIT:-0}
 
 COMMON_ARGS=(
@@ -152,7 +149,8 @@ fast_commit_available() {
   if [[ "$ALLOW_UNVERIFIED_FAST_COMMIT" == "1" ]]; then
     return 0
   fi
-  if command -v strings >/dev/null 2>&1 && strings "$bin" 2>/dev/null | grep -q "$FAST_COMMIT_SENTINEL"; then
+  if command -v strings >/dev/null 2>&1 &&
+     strings "$bin" 2>/dev/null | grep -q "$FAST_COMMIT_SENTINEL"; then
     return 0
   fi
   return 1
@@ -162,13 +160,15 @@ extract_tps() {
   local log=$1
   local value
 
-  value=$(grep -Eo '[0-9]+([.][0-9]+)?[[:space:]]*t/s' "$log" 2>/dev/null | tail -n 1 | sed -E 's/[[:space:]]*t\/s//' || true)
+  value=$(grep -Eo '[0-9]+([.][0-9]+)?[[:space:]]*t/s' "$log" 2>/dev/null |
+          tail -n 1 | sed -E 's/[[:space:]]*t\/s//' || true)
   if [[ -n "$value" ]]; then
     printf '%s' "$value"
     return
   fi
 
-  value=$(grep -Ei 'generation|decode' "$log" 2>/dev/null | grep -Eo '[0-9]+([.][0-9]+)?' | tail -n 1 || true)
+  value=$(grep -Ei 'generation|decode' "$log" 2>/dev/null |
+          grep -Eo '[0-9]+([.][0-9]+)?' | tail -n 1 || true)
   if [[ -n "$value" ]]; then
     printf '%s' "$value"
   else
@@ -177,13 +177,8 @@ extract_tps() {
 }
 
 run_plain() {
-  local bin=$1
-  local prompt_file=$2
-  local stdout_file=$3
-  local stderr_file=$4
-  local prompt
+  local bin=$1 prompt_file=$2 stdout_file=$3 stderr_file=$4 prompt
   prompt=$(cat "$prompt_file")
-
   (
     unset DS4_FAMILY_REPAIRS DS4_FAMILY1_REPAIR DS4_DSPARK_FULL_ACCEPT_FAST_COMMIT
     "$bin" "${COMMON_ARGS[@]}" -p "$prompt"
@@ -191,13 +186,8 @@ run_plain() {
 }
 
 run_dspark_strict() {
-  local bin=$1
-  local prompt_file=$2
-  local stdout_file=$3
-  local stderr_file=$4
-  local prompt
+  local bin=$1 prompt_file=$2 stdout_file=$3 stderr_file=$4 prompt
   prompt=$(cat "$prompt_file")
-
   (
     unset DS4_FAMILY_REPAIRS DS4_FAMILY1_REPAIR DS4_DSPARK_FULL_ACCEPT_FAST_COMMIT
     "$bin" "${COMMON_ARGS[@]}" "${DSPARK_ARGS[@]}" --dspark-strict -p "$prompt"
@@ -205,13 +195,8 @@ run_dspark_strict() {
 }
 
 run_dspark_replay() {
-  local bin=$1
-  local prompt_file=$2
-  local stdout_file=$3
-  local stderr_file=$4
-  local prompt
+  local bin=$1 prompt_file=$2 stdout_file=$3 stderr_file=$4 prompt
   prompt=$(cat "$prompt_file")
-
   (
     unset DS4_FAMILY_REPAIRS DS4_FAMILY1_REPAIR DS4_DSPARK_FULL_ACCEPT_FAST_COMMIT
     "$bin" "${COMMON_ARGS[@]}" "${DSPARK_ARGS[@]}" -p "$prompt"
@@ -221,21 +206,15 @@ run_dspark_replay() {
 run_with_env_spec() {
   local env_spec=$1
   shift
-  # Intentional word splitting: env_spec is a whitespace-separated list of
-  # NAME=value assignments such as "A=1 B=2".  Values used by this runner do
-  # not contain spaces.
+  # Intentional splitting: env_spec is NAME=value assignments without spaces
+  # inside individual values.
   # shellcheck disable=SC2086
   env $env_spec "$@"
 }
 
-run_dspark_generic() {
-  local bin=$1
-  local prompt_file=$2
-  local stdout_file=$3
-  local stderr_file=$4
-  local prompt
+run_fast_commit_generic() {
+  local bin=$1 prompt_file=$2 stdout_file=$3 stderr_file=$4 prompt
   prompt=$(cat "$prompt_file")
-
   (
     unset DS4_FAMILY_REPAIRS DS4_FAMILY1_REPAIR DS4_DSPARK_FULL_ACCEPT_FAST_COMMIT
     run_with_env_spec "$FAST_COMMIT_ENV" \
@@ -243,16 +222,10 @@ run_dspark_generic() {
   ) >"$stdout_file" 2>"$stderr_file"
 }
 
-run_dspark_repaired() {
-  local bin=$1
-  local prompt_file=$2
-  local stdout_file=$3
-  local stderr_file=$4
-  local prompt
-  local combined_env
+run_fast_commit_repaired() {
+  local bin=$1 prompt_file=$2 stdout_file=$3 stderr_file=$4 prompt combined_env
   prompt=$(cat "$prompt_file")
   combined_env="$FAST_COMMIT_ENV $REPAIRED_ENV"
-
   (
     unset DS4_FAMILY_REPAIRS DS4_FAMILY1_REPAIR DS4_DSPARK_FULL_ACCEPT_FAST_COMMIT
     run_with_env_spec "$combined_env" \
@@ -261,13 +234,9 @@ run_dspark_repaired() {
 }
 
 run_arm() {
-  local prompt_name=$1
-  local prompt_file=$2
-  local arm=$3
+  local prompt_name=$1 prompt_file=$2 arm=$3
   local dir="$OUT_DIR/$prompt_name"
-  local out="$dir/$arm.txt"
-  local log="$dir/$arm.log"
-  local status_file="$dir/$arm.status"
+  local out="$dir/$arm.txt" log="$dir/$arm.log" status_file="$dir/$arm.status"
 
   echo "[$prompt_name] $arm"
   case "$arm" in
@@ -275,52 +244,43 @@ run_arm() {
       if run_plain "$DS4_BIN" "$prompt_file" "$out" "$log"; then
         echo PASS > "$status_file"
       else
-        echo FAIL > "$status_file"
-        return 1
+        echo FAIL > "$status_file"; return 1
       fi
       ;;
     dspark_strict)
       if run_dspark_strict "$DS4_BIN" "$prompt_file" "$out" "$log"; then
         echo PASS > "$status_file"
       else
-        echo FAIL > "$status_file"
-        return 1
+        echo FAIL > "$status_file"; return 1
       fi
       ;;
     dspark_replay)
       if run_dspark_replay "$DS4_BIN" "$prompt_file" "$out" "$log"; then
         echo PASS > "$status_file"
       else
-        echo FAIL > "$status_file"
-        return 1
+        echo FAIL > "$status_file"; return 1
       fi
       ;;
-    dspark_generic)
+    fast_commit_generic)
       if ! fast_commit_available "$GENERIC_BIN"; then
         echo "SKIP: fast-commit hook '$FAST_COMMIT_SENTINEL' not found in $GENERIC_BIN" | tee "$log"
-        : > "$out"
-        echo SKIP > "$status_file"
-        return 0
+        : > "$out"; echo SKIP > "$status_file"; return 0
       fi
-      if run_dspark_generic "$GENERIC_BIN" "$prompt_file" "$out" "$log"; then
+      if run_fast_commit_generic "$GENERIC_BIN" "$prompt_file" "$out" "$log"; then
         echo PASS > "$status_file"
       else
-        echo FAIL > "$status_file"
-        return 1
+        echo FAIL > "$status_file"; return 1
       fi
       ;;
-    dspark_repaired)
+    fast_commit_repaired)
       if ! fast_commit_available "$REPAIRED_BIN"; then
         echo "SKIP: fast-commit hook '$FAST_COMMIT_SENTINEL' not found in $REPAIRED_BIN" | tee "$log"
-        : > "$out"
-        echo SKIP > "$status_file"
-        return 0
+        : > "$out"; echo SKIP > "$status_file"; return 0
       fi
-      if run_dspark_repaired "$REPAIRED_BIN" "$prompt_file" "$out" "$log"; then
+      if run_fast_commit_repaired "$REPAIRED_BIN" "$prompt_file" "$out" "$log"; then
         echo PASS > "$status_file"
       else
-        echo FAIL > "$status_file"
-        return 1
+        echo FAIL > "$status_file"; return 1
       fi
       ;;
     *)
@@ -331,12 +291,8 @@ run_arm() {
 }
 
 compare_to_sequential() {
-  local prompt_name=$1
-  local arm=$2
-  local dir="$OUT_DIR/$prompt_name"
-  local ref="$dir/sequential.txt"
-  local out="$dir/$arm.txt"
-  local status
+  local prompt_name=$1 arm=$2 dir="$OUT_DIR/$prompt_name"
+  local ref="$dir/sequential.txt" out="$dir/$arm.txt" status first_byte
   status=$(cat "$dir/$arm.status")
 
   if [[ "$status" != "PASS" ]]; then
@@ -348,7 +304,6 @@ compare_to_sequential() {
     printf '%s\t%s\tEXACT\tNONE\n' "$prompt_name" "$arm" >> "$OUT_DIR/comparisons.tsv"
     : > "$dir/sequential_vs_${arm}.diff"
   else
-    local first_byte
     first_byte=$(cmp -l "$ref" "$out" 2>/dev/null | head -n 1 | awk '{print $1}' || true)
     [[ -n "$first_byte" ]] || first_byte="EOF"
     printf '%s\t%s\tDIFF\t%s\n' "$prompt_name" "$arm" "$first_byte" >> "$OUT_DIR/comparisons.tsv"
@@ -357,11 +312,7 @@ compare_to_sequential() {
 }
 
 record_perf() {
-  local prompt_name=$1
-  local arm=$2
-  local dir="$OUT_DIR/$prompt_name"
-  local status
-  local tps
+  local prompt_name=$1 arm=$2 dir="$OUT_DIR/$prompt_name" status tps
   status=$(cat "$dir/$arm.status")
   if [[ "$status" == "PASS" ]]; then
     tps=$(extract_tps "$dir/$arm.log")
@@ -382,12 +333,13 @@ DSPARK_CONFIDENCE=$DSPARK_CONFIDENCE
 FAST_COMMIT_ENV=$FAST_COMMIT_ENV
 FAST_COMMIT_SENTINEL=$FAST_COMMIT_SENTINEL
 REPAIRED_ENV=$REPAIRED_ENV
+FAST_COMMIT_SCOPE=FULL_ACCEPT_ONLY_PARTIAL_ACCEPTS_REPLAY
 EOF_CONFIG
 
 printf 'prompt\tarm\tidentity_vs_sequential\tfirst_diff_byte\n' > "$OUT_DIR/comparisons.tsv"
 printf 'prompt\tarm\tstatus\tgeneration_tps\n' > "$OUT_DIR/performance.tsv"
 
-ARMS=(sequential dspark_strict dspark_replay dspark_generic dspark_repaired)
+ARMS=(sequential dspark_strict dspark_replay fast_commit_generic fast_commit_repaired)
 
 for prompt_name in warehouse intervals; do
   prompt_file="$OUT_DIR/prompts/$prompt_name.txt"
@@ -396,7 +348,7 @@ for prompt_name in warehouse intervals; do
     record_perf "$prompt_name" "$arm"
   done
 
-  for arm in dspark_strict dspark_replay dspark_generic dspark_repaired; do
+  for arm in dspark_strict dspark_replay fast_commit_generic fast_commit_repaired; do
     compare_to_sequential "$prompt_name" "$arm"
   done
 done
@@ -411,4 +363,5 @@ column -t -s $'\t' "$OUT_DIR/performance.tsv" 2>/dev/null || cat "$OUT_DIR/perfo
 
 echo
 echo "results: $OUT_DIR"
-echo "generic/repaired DIFF is data, not a script failure; command failures still fail the run."
+echo "fast_commit_* bypasses replay only on full accepts; partial accepts still replay."
+echo "DIFF in fast_commit_* is experimental data, not a script failure; command failures still fail the run."
