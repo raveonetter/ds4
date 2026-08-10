@@ -19,6 +19,8 @@ enum {
     TEST_Q8_OUT = 1024,
     TEST_F16_OUT = 256,
     TEST_PAIR_OUT = 512,
+    TEST_HC_IN = 4 * 4096,
+    TEST_HC_OUT = 2 * 4 + 4 * 4,
     TEST_CP5_IN = 1024,
     TEST_CP5_EMBD = 4096,
     TEST_CP5_HC = 4,
@@ -94,13 +96,14 @@ static void fill_q8_matrix(test_block_q8_0 *matrix, uint32_t in_dim,
     }
 }
 
-static void fill_f16_matrix(uint16_t *matrix, uint32_t out_dim,
+static void fill_f16_matrix(uint16_t *matrix, uint32_t in_dim,
+                            uint32_t out_dim,
                             uint32_t salt) {
     for (uint32_t row = 0; row < out_dim; row++) {
-        for (uint32_t col = 0; col < TEST_IN; col++) {
+        for (uint32_t col = 0; col < in_dim; col++) {
             const int32_t raw =
                 (int32_t)((row * 11u + col * 13u + salt * 17u) % 63u) - 31;
-            matrix[(uint64_t)row * TEST_IN + col] =
+            matrix[(uint64_t)row * in_dim + col] =
                 half_bits((float)raw / 512.0f);
         }
     }
@@ -462,11 +465,66 @@ static int run_cp4_output_b_contract(const void *model, uint64_t model_size,
     return ok;
 }
 
+static int run_family3_hc_shape(const void *model, uint64_t model_size,
+                                uint64_t weight_offset,
+                                ds4_gpu_tensor *input) {
+    const uint64_t count = (uint64_t)TEST_ROWS * TEST_HC_OUT;
+    float *actual = calloc((size_t)count, sizeof(float));
+    float *expected = calloc((size_t)count, sizeof(float));
+    ds4_gpu_tensor *candidate = ds4_gpu_tensor_alloc(count * sizeof(float));
+    ds4_gpu_tensor *reference = ds4_gpu_tensor_alloc(count * sizeof(float));
+    int ok = actual && expected && candidate && reference;
+
+    if (ok) {
+        ok = ds4_gpu_matmul_f16_canonical_batch_tensor(
+                 candidate, model, model_size, weight_offset,
+                 TEST_HC_IN, TEST_HC_OUT, input, TEST_ROWS) != 0;
+    }
+    for (uint32_t row = 0; ok && row < TEST_ROWS; row++) {
+        ds4_gpu_tensor *in_row = ds4_gpu_tensor_view(
+            input, (uint64_t)row * TEST_HC_IN * sizeof(float),
+            (uint64_t)TEST_HC_IN * sizeof(float));
+        ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
+            reference, (uint64_t)row * TEST_HC_OUT * sizeof(float),
+            (uint64_t)TEST_HC_OUT * sizeof(float));
+        ok = in_row && out_row &&
+             ds4_gpu_matmul_f16_tensor(
+                 out_row, model, model_size, weight_offset,
+                 TEST_HC_IN, TEST_HC_OUT, in_row, 1u) != 0;
+        ds4_gpu_tensor_free(out_row);
+        ds4_gpu_tensor_free(in_row);
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_read(candidate, 0, actual,
+                                 count * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_read(reference, 0, expected,
+                                 count * sizeof(float)) != 0 &&
+             compare_exact("family3_hc_shape", actual, expected,
+                           (size_t)count);
+    }
+    printf("FAMILY3_SHAPE_AB site=hc_attn_pre_split in_dim=%u out_dim=%u "
+           "rows=%u result=%s\n",
+           TEST_HC_IN, TEST_HC_OUT, TEST_ROWS,
+           ok ? "EXACT" : "MISMATCH");
+    printf("FAMILY3_SHAPE_AB site=hc_ffn_pre in_dim=%u out_dim=%u "
+           "rows=%u result=%s\n",
+           TEST_HC_IN, TEST_HC_OUT, TEST_ROWS,
+           ok ? "EXACT" : "MISMATCH");
+
+    ds4_gpu_tensor_free(reference);
+    ds4_gpu_tensor_free(candidate);
+    free(expected);
+    free(actual);
+    return ok;
+}
+
 /* Bit 0 is the single-projection family; bit 1 is the paired family. */
 static unsigned run_f16_contracts(const void *model, uint64_t model_size,
                                   uint64_t weight_a_offset,
                                   uint64_t weight_b_offset,
-                                  ds4_gpu_tensor *input) {
+                                  uint64_t hc_weight_offset,
+                                  ds4_gpu_tensor *input,
+                                  ds4_gpu_tensor *hc_input) {
     const uint64_t single_count = (uint64_t)TEST_ROWS * TEST_F16_OUT;
     const uint64_t pair_count = (uint64_t)TEST_ROWS * TEST_PAIR_OUT;
     float *single_actual = calloc((size_t)single_count, sizeof(float));
@@ -494,6 +552,13 @@ static unsigned run_f16_contracts(const void *model, uint64_t model_size,
                    pair_a_ref && pair_b_ref;
     int single_ok = setup_ok;
     int pair_ok = setup_ok;
+    int hc_ok = setup_ok && run_family3_hc_shape(
+        model, model_size, hc_weight_offset, hc_input);
+    int primitive_exact = 0;
+    int performance_ok = 0;
+    double generic_total_ms = 0.0;
+    double candidate_total_ms = 0.0;
+    double exact_total_ms = 0.0;
 
     if (single_ok) {
         single_ok = ds4_gpu_matmul_f16_canonical_batch_tensor(
@@ -582,6 +647,56 @@ static unsigned run_f16_contracts(const void *model, uint64_t model_size,
                    rows, rows, single_ok ? "EXACT" : "MISMATCH");
         }
     }
+    primitive_exact = single_ok;
+    printf("FAMILY3_SHAPE_AB site=ffn_router_projection in_dim=%u "
+           "out_dim=%u rows=%u result=%s\n",
+           TEST_IN, TEST_F16_OUT, TEST_ROWS,
+           single_ok ? "EXACT" : "MISMATCH");
+
+    if (single_ok) {
+        single_ok = ds4_gpu_matmul_f16_tensor(
+                        single_old, model, model_size, weight_a_offset,
+                        TEST_IN, TEST_F16_OUT, input, TEST_ROWS) != 0 &&
+                    ds4_gpu_matmul_f16_canonical_batch_tensor(
+                        single, model, model_size, weight_a_offset,
+                        TEST_IN, TEST_F16_OUT, input, TEST_ROWS) != 0 &&
+                    ds4_gpu_matmul_f16_decode_rows_exact_tensor(
+                        single_ref, model, model_size, weight_a_offset,
+                        TEST_IN, TEST_F16_OUT, input, TEST_ROWS) != 0 &&
+                    ds4_gpu_synchronize() != 0;
+    }
+    for (unsigned trial = 0;
+         single_ok && trial < TEST_BENCH_TRIALS; trial++) {
+        double start = wall_clock_ms();
+        single_ok = ds4_gpu_matmul_f16_tensor(
+                        single_old, model, model_size, weight_a_offset,
+                        TEST_IN, TEST_F16_OUT, input, TEST_ROWS) != 0 &&
+                    ds4_gpu_synchronize() != 0;
+        generic_total_ms += wall_clock_ms() - start;
+
+        start = wall_clock_ms();
+        if (single_ok) {
+            single_ok = ds4_gpu_matmul_f16_canonical_batch_tensor(
+                            single, model, model_size, weight_a_offset,
+                            TEST_IN, TEST_F16_OUT, input, TEST_ROWS) != 0 &&
+                        ds4_gpu_synchronize() != 0;
+        }
+        candidate_total_ms += wall_clock_ms() - start;
+
+        start = wall_clock_ms();
+        if (single_ok) {
+            single_ok = ds4_gpu_matmul_f16_decode_rows_exact_tensor(
+                            single_ref, model, model_size, weight_a_offset,
+                            TEST_IN, TEST_F16_OUT, input, TEST_ROWS) != 0 &&
+                        ds4_gpu_synchronize() != 0;
+        }
+        exact_total_ms += wall_clock_ms() - start;
+    }
+    if (single_ok) {
+        performance_ok = candidate_total_ms > 0.0 && exact_total_ms > 0.0 &&
+                         candidate_total_ms < exact_total_ms;
+        single_ok = performance_ok;
+    }
     if (pair_ok) {
         pair_ok = ds4_gpu_tensor_read(
                       pair_a, 0, pair_a_actual,
@@ -608,8 +723,32 @@ static unsigned run_f16_contracts(const void *model, uint64_t model_size,
            "mismatch_count=%u batch_parallelism=PRESERVED "
            "candidate_dispatches=1 oracle_dispatches=%u result=%s\n",
            TEST_ROWS, old_generic_mismatch ? "MISMATCH" : "EXACT",
-           single_ok ? "EXACT" : "MISMATCH", single_ok ? 0u : 1u,
-           TEST_ROWS, single_ok ? "PASS" : "FAIL");
+           primitive_exact ? "EXACT" : "MISMATCH",
+           primitive_exact ? 0u : 1u,
+           TEST_ROWS, primitive_exact ? "PASS" : "FAIL");
+    printf("FAMILY3_PERFORMANCE rows=%u timing_trials=%u "
+           "generic_ms=%.3f canonical_batch_ms=%.3f "
+           "exact_row_oracle_ms=%.3f generic_dispatches=1 "
+           "canonical_batch_dispatches=1 exact_row_oracle_dispatches=%u "
+           "canonical_batch_vs_generic=%.3f "
+           "canonical_batch_vs_row_oracle=%.3f "
+           "batch_parallelism=PRESERVED bitwise_exact=%s result=%s\n",
+           TEST_ROWS, TEST_BENCH_TRIALS,
+           generic_total_ms / TEST_BENCH_TRIALS,
+           candidate_total_ms / TEST_BENCH_TRIALS,
+           exact_total_ms / TEST_BENCH_TRIALS, TEST_ROWS,
+           generic_total_ms > 0.0
+               ? candidate_total_ms / generic_total_ms : 0.0,
+           exact_total_ms > 0.0
+               ? candidate_total_ms / exact_total_ms : 0.0,
+           primitive_exact ? "PASS" : "FAIL",
+           performance_ok ? "PASS" : "FAIL");
+    printf("FAMILY_REPAIR_CANDIDATE_STATUS "
+           "family=FAMILY_F16_BATCH_EXT_VS_SINGLE_MV "
+           "completed_sites=%u pending_sites=%u result=%s\n",
+           single_ok && hc_ok ? 3u : 0u,
+           single_ok && hc_ok ? 0u : 3u,
+           single_ok && hc_ok ? "PASS" : "FAIL");
     printf("EXACT_ROW_ORACLE_AB "
            "family=FAMILY_F16_BATCH_EXT_VS_SINGLE_PAIR_MV rows=%u "
            "sites=attention_kv,attention_score,indexer_kv,indexer_score "
@@ -630,7 +769,7 @@ static unsigned run_f16_contracts(const void *model, uint64_t model_size,
     free(pair_a_actual);
     free(single_expected);
     free(single_actual);
-    return (single_ok ? 1u : 0u) | (pair_ok ? 2u : 0u);
+    return (single_ok && hc_ok ? 1u : 0u) | (pair_ok ? 2u : 0u);
 }
 
 static int run_cp5_tail_contract(const void *model, uint64_t model_size,
@@ -1129,6 +1268,8 @@ int main(void) {
         (uint64_t)TEST_Q8_OUT * (TEST_IN / 32u) * sizeof(test_block_q8_0);
     const uint64_t f16_bytes =
         (uint64_t)TEST_PAIR_OUT * TEST_IN * sizeof(uint16_t);
+    const uint64_t f16_hc_bytes =
+        (uint64_t)TEST_HC_OUT * TEST_HC_IN * sizeof(uint16_t);
     const uint64_t cp5_q8_bytes =
         (uint64_t)TEST_CP5_EMBD * (TEST_CP5_IN / 32u) *
         sizeof(test_block_q8_0);
@@ -1161,12 +1302,17 @@ int main(void) {
     const uint64_t cp4_a_offset = align_up(
         attn_sinks_offset + (uint64_t)TEST_ATTN_HEADS * sizeof(float), page);
     const uint64_t cp4_b_offset = align_up(cp4_a_offset + cp4_a_bytes, page);
-    const uint64_t model_size =
+    const uint64_t f16_hc_offset =
         align_up(cp4_b_offset + cp4_b_bytes, page);
+    const uint64_t model_size =
+        align_up(f16_hc_offset + f16_hc_bytes, page);
     void *model = NULL;
     float *input_host = calloc(
         (size_t)TEST_ROWS * TEST_IN, sizeof(float));
+    float *hc_input_host = calloc(
+        (size_t)TEST_ROWS * TEST_HC_IN, sizeof(float));
     ds4_gpu_tensor *input = NULL;
+    ds4_gpu_tensor *hc_input = NULL;
     int initialized = 0;
     int q8_ok = 0;
     int cp4_ok = 0;
@@ -1175,7 +1321,7 @@ int main(void) {
     int routed_moe_ok = 0;
     int router_ok = 0;
     unsigned f16_results = 0;
-    int ok = input_host != NULL &&
+    int ok = input_host != NULL && hc_input_host != NULL &&
         posix_memalign(&model, (size_t)page, (size_t)model_size) == 0;
 
     if (ok) {
@@ -1188,10 +1334,13 @@ int main(void) {
                        TEST_IN, TEST_Q8_OUT, 11u);
         fill_f16_matrix((uint16_t *)
                         ((uint8_t *)model + f16_a_offset),
-                        TEST_PAIR_OUT, 5u);
+                        TEST_IN, TEST_PAIR_OUT, 5u);
         fill_f16_matrix((uint16_t *)
                         ((uint8_t *)model + f16_b_offset),
-                        TEST_PAIR_OUT, 17u);
+                        TEST_IN, TEST_PAIR_OUT, 17u);
+        fill_f16_matrix((uint16_t *)
+                        ((uint8_t *)model + f16_hc_offset),
+                        TEST_HC_IN, TEST_HC_OUT, 43u);
         fill_q8_matrix((test_block_q8_0 *)
                        ((uint8_t *)model + cp5_q8_offset),
                        TEST_CP5_IN, TEST_CP5_EMBD, 19u);
@@ -1225,6 +1374,15 @@ int main(void) {
                 if ((row + col) & 1u) value = -value;
                 input_host[(uint64_t)row * TEST_IN + col] = value;
             }
+            for (uint32_t col = 0; col < TEST_HC_IN; col++) {
+                uint32_t bits = 0x3e800000u |
+                    ((row * 0x27d4eb2du + col * 0x165667b1u +
+                      0x9e3779b9u) & 0x007fffffu);
+                float value;
+                memcpy(&value, &bits, sizeof(value));
+                if ((row + col) & 1u) value = -value;
+                hc_input_host[(uint64_t)row * TEST_HC_IN + col] = value;
+            }
         }
     }
 
@@ -1244,9 +1402,15 @@ int main(void) {
     if (ok) {
         input = ds4_gpu_tensor_alloc(
             (uint64_t)TEST_ROWS * TEST_IN * sizeof(float));
-        ok = input != NULL && ds4_gpu_tensor_write(
-            input, 0, input_host,
-            (uint64_t)TEST_ROWS * TEST_IN * sizeof(float));
+        hc_input = ds4_gpu_tensor_alloc(
+            (uint64_t)TEST_ROWS * TEST_HC_IN * sizeof(float));
+        ok = input != NULL && hc_input != NULL &&
+             ds4_gpu_tensor_write(
+                 input, 0, input_host,
+                 (uint64_t)TEST_ROWS * TEST_IN * sizeof(float)) &&
+             ds4_gpu_tensor_write(
+                 hc_input, 0, hc_input_host,
+                 (uint64_t)TEST_ROWS * TEST_HC_IN * sizeof(float));
     }
     if (ok) {
         q8_ok = run_q8_contract(model, model_size,
@@ -1260,7 +1424,8 @@ int main(void) {
             model, model_size, moe_gate_offset, moe_up_offset,
             moe_down_offset);
         f16_results = run_f16_contracts(model, model_size,
-                                         f16_a_offset, f16_b_offset, input);
+                                         f16_a_offset, f16_b_offset,
+                                         f16_hc_offset, input, hc_input);
         router_ok = run_router_contract();
         ok = q8_ok && cp4_ok && cp5_ok && flash_attention_ok && routed_moe_ok &&
              f16_results == 3u && router_ok;
@@ -1288,9 +1453,11 @@ int main(void) {
            "families_failed=%u\n",
            families_exact, q8_ok && cp4_ok ? 1u : 0u,
            5u - families_exact + (q8_ok && cp4_ok ? 0u : 1u));
+    ds4_gpu_tensor_free(hc_input);
     ds4_gpu_tensor_free(input);
     if (initialized) ds4_gpu_cleanup();
     free(input_host);
+    free(hc_input_host);
     free(model);
     return ok ? 0 : 1;
 }
