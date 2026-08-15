@@ -51,11 +51,15 @@ git -C "$ROOT_DIR" worktree add --detach "$TRACE_WT" HEAD >/dev/null
 WORKTREE_ADDED=1
 python3 "$STATE_TOOL" instrument --source "$TRACE_WT/ds4.c"
 
+grep -q 'DS4_DSPARK_STATE_RETURN' "$TRACE_WT/ds4.c" || { echo "state trace source sentinel missing after instrumentation" >&2; exit 2; }
+grep -q 'DS4_DSPARK_TRACE_STATE_AB' "$TRACE_WT/ds4.c" || { echo "state trace env gate missing after instrumentation" >&2; exit 2; }
+echo "FAST_COMMIT_STATE_SOURCE_CHECK status=PASS"
+
 MAKE_JOBS=${MAKE_JOBS:-4}
 make -C "$TRACE_WT" -j "$MAKE_JOBS" ds4 >/dev/null
 TRACE_BIN="$TRACE_WT/ds4"
 [[ -x "$TRACE_BIN" ]] || { echo "state trace build did not produce $TRACE_BIN" >&2; exit 2; }
-strings "$TRACE_BIN" | grep -q 'DS4_DSPARK_STATE_RETURN' || { echo "state trace sentinel missing from binary" >&2; exit 2; }
+echo "FAST_COMMIT_STATE_BUILD_CHECK status=PASS"
 
 PROMPT=$(cat "$PROMPT_FILE")
 COMMON_ARGS=(
