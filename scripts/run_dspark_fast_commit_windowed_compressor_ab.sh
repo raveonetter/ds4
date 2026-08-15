@@ -123,8 +123,12 @@ run_arm() {
       export DS4_DSPARK_E7_TARGET_POS0="$target_pos0"
       export DS4_DSPARK_E7_TARGET_N_TOKENS="$target_n"
     fi
-    export DS4_DSPARK_TRACE_COMMITS="$trace_commits"
-    export DS4_DSPARK_E7_TRACE="$e7_trace"
+    if [[ "$trace_commits" == 1 ]]; then
+      export DS4_DSPARK_TRACE_COMMITS=1
+    fi
+    if [[ "$e7_trace" == 1 ]]; then
+      export DS4_DSPARK_E7_TRACE=1
+    fi
     env DS4_DSPARK_STATS=1 \
         DS4_DSPARK_FULL_ACCEPT_FAST_COMMIT="$fast" \
         "$TRACE_BIN" "${COMMON_ARGS[@]}"
