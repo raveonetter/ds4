@@ -57,7 +57,11 @@ def instrument(source: Path) -> None:
 static bool ds4_e6_pair_scope_enabled(const char *site) {
     const char *env = getenv("DS4_DSPARK_E6_PAIR_REPAIR");
     if (!env || !env[0] || !site) return false;
-    return strcasecmp(env, "BOTH") == 0 || strcasecmp(env, site) == 0;
+    const bool enabled = strcasecmp(env, "BOTH") == 0 || strcasecmp(env, site) == 0;
+    if (enabled && getenv("DS4_DSPARK_E6_TRACE")) {
+        fprintf(stderr, "DS4_DSPARK_E6_PAIR_GATE site=%s\n", site);
+    }
+    return enabled;
 }
 
 '''
@@ -219,6 +223,13 @@ def extract_tps(log: Path) -> float | None:
     return float(vals[-1]) if vals else None
 
 
+def gate_hits(log: Path) -> tuple[int, int]:
+    text = log.read_text(encoding="utf-8", errors="replace")
+    compressor = len(re.findall(r"^DS4_DSPARK_E6_PAIR_GATE site=COMPRESSOR$", text, re.MULTILINE))
+    indexer = len(re.findall(r"^DS4_DSPARK_E6_PAIR_GATE site=INDEXER$", text, re.MULTILINE))
+    return compressor, indexer
+
+
 def fmt_index(v: int | None) -> str:
     return "NONE" if v is None else str(v)
 
@@ -263,6 +274,16 @@ def analyze(args: argparse.Namespace) -> None:
         and diffs["baseline"] + 1 == args.expected_ordinal1
     )
     replay_ok = diffs["replay"] is None
+    gate_counts = {
+        "compressor": gate_hits(args.compressor_log),
+        "indexer": gate_hits(args.indexer_log),
+        "both": gate_hits(args.both_log),
+    }
+    gate_ok = {
+        "compressor": gate_counts["compressor"][0] > 0 and gate_counts["compressor"][1] == 0,
+        "indexer": gate_counts["indexer"][0] == 0 and gate_counts["indexer"][1] > 0,
+        "both": gate_counts["both"][0] > 0 and gate_counts["both"][1] > 0,
+    }
     print(
         "FAST_COMMIT_COMPRESSOR_INDEXER_BASELINE "
         f"first_diff_index0={fmt_index(diffs['baseline'])} "
@@ -278,6 +299,14 @@ def analyze(args: argparse.Namespace) -> None:
         f"replay_tps={fmt_tps(tps['replay'])} "
         f"result={'PASS' if replay_ok else 'FAIL'}"
     )
+
+    for name in ("compressor", "indexer", "both"):
+        c_hits, i_hits = gate_counts[name]
+        print(
+            "FAST_COMMIT_COMPRESSOR_INDEXER_GATE "
+            f"arm={name.upper()} compressor_hits={c_hits} indexer_hits={i_hits} "
+            f"result={'PASS' if gate_ok[name] else 'FAIL'}"
+        )
 
     for name, label in (
         ("compressor", "FAST_COMMIT_COMPRESSOR_REPAIR_FRONTIER"),
@@ -297,11 +326,17 @@ def analyze(args: argparse.Namespace) -> None:
     if not baseline_ok or not replay_ok:
         source = "INCONCLUSIVE"
         next_step = "ADJUDICATE_CONTROL"
+    elif not all(gate_ok.values()):
+        source = "INCONCLUSIVE"
+        next_step = "ADJUDICATE_GATE_EXECUTION"
     else:
         c = moved(diffs["compressor"], diffs["baseline"])
         i = moved(diffs["indexer"], diffs["baseline"])
         b = moved(diffs["both"], diffs["baseline"])
-        if c and not i:
+        if (c or i) and not b:
+            source = "INCONCLUSIVE"
+            next_step = "ADJUDICATE_INTERACTION"
+        elif c and not i:
             source = "COMPRESSOR"
             next_step = "COMPRESSOR_MINIMAL_REPAIR"
         elif i and not c:
