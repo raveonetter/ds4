@@ -9,10 +9,36 @@ from pathlib import Path
 from typing import Sequence
 
 FAMILY = "DS4_REPAIR_FAMILY_F16_BATCH_EXT_VS_SINGLE_PAIR_MV"
+SCOPE_ENV = "DS4_DSPARK_E6_PAIR_REPAIR"
 
 
 def die(msg: str) -> None:
     raise SystemExit(f"dspark_fast_commit_compressor_indexer_repair_ab: {msg}")
+
+
+def _find_matching_paren(text: str, open_pos: int) -> int:
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(open_pos, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
 
 
 def instrument(source: Path) -> None:
@@ -36,9 +62,45 @@ static bool ds4_e6_pair_scope_enabled(const char *site) {
 
 '''
     text = text[:marker_pos] + helper + text[marker_pos:]
+    marker_pos = text.find(marker)
 
-    # The ratio-4 refresh is shared by attention compressor and indexer. head_dim
-    # identifies the caller without changing the production function signature.
+    # Add an explicit diagnostic site tag to the shared ratio-4 refresh helper.
+    # Do not infer the caller from dimensions: model shapes may make those equal.
+    old_sig_tail = "uint32_t          n_tokens) {"
+    sig_end = text.find(old_sig_tail, marker_pos, marker_pos + 1200)
+    if sig_end < 0:
+        die("ratio-4 refresh signature tail not found")
+    new_sig_tail = "uint32_t          n_tokens,\n        const char       *e6_site) {"
+    text = text[:sig_end] + new_sig_tail + text[sig_end + len(old_sig_tail):]
+
+    # Tag every production caller from its explicit weight identity.
+    call_token = "metal_graph_refresh_ratio4_compressor_state("
+    search_from = marker_pos + len(marker)
+    calls: list[tuple[int, int, str]] = []
+    pos = search_from
+    while True:
+        call_pos = text.find(call_token, pos)
+        if call_pos < 0:
+            break
+        open_pos = call_pos + len(call_token) - 1
+        close_pos = _find_matching_paren(text, open_pos)
+        if close_pos < 0:
+            die("unterminated ratio-4 refresh call")
+        body = text[open_pos + 1:close_pos]
+        has_attn = "layer->attn_compressor_kv" in body
+        has_index = "layer->indexer_compressor_kv" in body
+        if has_attn == has_index:
+            die("could not classify ratio-4 refresh caller")
+        site = "COMPRESSOR" if has_attn else "INDEXER"
+        calls.append((call_pos, close_pos, site))
+        pos = close_pos + 1
+
+    if len(calls) != 4 or {site for _, _, site in calls} != {"COMPRESSOR", "INDEXER"}:
+        die(f"unexpected ratio-4 refresh call set: {[site for _, _, site in calls]}")
+    for _call_pos, close_pos, site in reversed(calls):
+        text = text[:close_pos] + f', "{site}"' + text[close_pos:]
+
+    # Site-gate the exact-row pair projection used by the refresh helper itself.
     marker_pos = text.find(marker)
     direct_re = re.compile(
         r"if \(ds4_family_repair_runtime_enabled\(\s*"
@@ -51,8 +113,7 @@ static bool ds4_e6_pair_scope_enabled(const char *site) {
     direct_new = (
         "if (ds4_family_repair_runtime_enabled(\n"
         f"                {FAMILY}) ||\n"
-        "            ds4_e6_pair_scope_enabled(\n"
-        "                head_dim == DS4_N_INDEXER_HEAD_DIM ? \"INDEXER\" : \"COMPRESSOR\")) {"
+        "            ds4_e6_pair_scope_enabled(e6_site)) {"
     )
     text = text[: dm.start()] + direct_new + text[dm.end() :]
 
@@ -94,9 +155,13 @@ static bool ds4_e6_pair_scope_enabled(const char *site) {
         text = text[:start] + replacement + text[end:]
 
     source.write_text(text, encoding="utf-8")
+    compressor_refresh = sum(site == "COMPRESSOR" for _, _, site in calls)
+    indexer_refresh = sum(site == "INDEXER" for _, _, site in calls)
     print(
         "FAST_COMMIT_COMPRESSOR_INDEXER_INSTRUMENT "
-        "ratio4_gate=1 compressor_projection_gate=1 indexer_projection_gate=1 result=PASS"
+        f"ratio4_refresh_calls={len(calls)} compressor_refresh_calls={compressor_refresh} "
+        f"indexer_refresh_calls={indexer_refresh} compressor_projection_gate=1 "
+        "indexer_projection_gate=1 result=PASS"
     )
 
 
