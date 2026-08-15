@@ -88,11 +88,16 @@ static bool ds4_e7_window_match(uint32_t pos0, uint32_t n_tokens) {
            pos0 == target_pos0 && n_tokens == target_n;
 }
 
+static bool ds4_e7_trace_enabled(void) {
+    const char *env = getenv("DS4_DSPARK_E7_TRACE");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
 static void ds4_e7_scout_batch(uint32_t pos0, uint32_t n_tokens) {
     static bool have_last = false;
     static uint32_t last_pos0 = 0;
     static uint32_t last_n = 0;
-    if (!getenv("DS4_DSPARK_E7_TRACE")) return;
+    if (!ds4_e7_trace_enabled()) return;
     if (have_last && last_pos0 == pos0 && last_n == n_tokens) return;
     have_last = true;
     last_pos0 = pos0;
@@ -109,7 +114,7 @@ static bool ds4_e7_window_part_enabled(
     if (strcmp(part, "PROJECTION") == 0) ds4_e7_scout_batch(pos0, n_tokens);
     if (!mode || !mode[0] || !ds4_e7_window_match(pos0, n_tokens)) return false;
     enabled = strcasecmp(mode, "BOTH") == 0 || strcasecmp(mode, part) == 0;
-    if (enabled && getenv("DS4_DSPARK_E7_TRACE")) {
+    if (enabled && ds4_e7_trace_enabled()) {
         fprintf(stderr,
                 "DS4_DSPARK_E7_GATE part=%s pos0=%u n_tokens=%u\n",
                 part, pos0, n_tokens);
@@ -522,7 +527,10 @@ def analyze(args: argparse.Namespace) -> None:
         p = moved(diffs["projection"], diffs["baseline"])
         r = moved(diffs["refresh"], diffs["baseline"])
         b = moved(diffs["both"], diffs["baseline"])
-        if p and not r:
+        if (p or r) and not b:
+            source = "INCONCLUSIVE"
+            next_step = "ADJUDICATE_PROJECTION_REFRESH_COMPOSITION"
+        elif p and not r:
             source = "PROJECTION"
             next_step = "PROJECTION_MINIMAL_PRODUCTION_REPAIR"
         elif r and not p:
