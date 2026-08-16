@@ -27,7 +27,7 @@ DSPARK_MODEL=$(abs_path "$DSPARK_MODEL")
 OUT_DIR=$(abs_path "$OUT_DIR")
 PROMPT_FILE="$SOURCE_RUN_DIR/prompts/warehouse.txt"
 E10_TOOL="$ROOT_DIR/scripts/dspark_fast_commit_draft_verify_input_ab.py"
-E11_TOOL="$ROOT_DIR/scripts/dspark_fast_commit_scheduler_draft_valid_ab.py"
+E11_TOOL="$ROOT_DIR/scripts/dspark_fast_commit_scheduler_draft_valid_ab_compat.py"
 
 [[ -d "$ROOT_DIR/.git" || -f "$ROOT_DIR/.git" ]] || { echo "not a git worktree: $ROOT_DIR" >&2; exit 2; }
 for f in "$MODEL" "$DSPARK_MODEL" "$PROMPT_FILE" "$E10_TOOL" "$E11_TOOL"; do
