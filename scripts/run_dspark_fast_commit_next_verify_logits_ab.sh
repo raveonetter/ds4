@@ -28,9 +28,10 @@ OUT_DIR=$(abs_path "$OUT_DIR")
 PROMPT_FILE="$SOURCE_RUN_DIR/prompts/warehouse.txt"
 TRACE_TOOL="$ROOT_DIR/scripts/dspark_token27_trace.py"
 E9_TOOL="$ROOT_DIR/scripts/dspark_fast_commit_next_verify_logits_ab.py"
+ADJ_TOOL="$ROOT_DIR/scripts/dspark_fast_commit_next_verify_logits_adjudicate.py"
 
 [[ -d "$ROOT_DIR/.git" || -f "$ROOT_DIR/.git" ]] || { echo "not a git worktree: $ROOT_DIR" >&2; exit 2; }
-for f in "$MODEL" "$DSPARK_MODEL" "$PROMPT_FILE" "$TRACE_TOOL" "$E9_TOOL"; do
+for f in "$MODEL" "$DSPARK_MODEL" "$PROMPT_FILE" "$TRACE_TOOL" "$E9_TOOL" "$ADJ_TOOL"; do
   [[ -f "$f" ]] || { echo "missing required file $f" >&2; exit 2; }
 done
 [[ "$TOKENS" =~ ^[1-9][0-9]*$ ]] || { echo "TOKENS must be a positive integer" >&2; exit 2; }
@@ -55,9 +56,27 @@ WORKTREE_ADDED=1
 python3 "$TRACE_TOOL" instrument --source "$TRACE_WT/ds4.c"
 python3 "$E9_TOOL" instrument --source "$TRACE_WT/ds4.c"
 
+# E9.1 contract fix. metal_graph_verify_suffix_tops_impl initializes only
+# row_tops[0..n_tokens-2]; the final spec-logits row is continuation state and
+# has no row_tops entry. Never read that uninitialized automatic slot.
+python3 - "$TRACE_WT/ds4.c" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+s = p.read_text(encoding="utf-8")
+old = "row_tops ? row_tops[row] : -1"
+new = "(row_tops && row + 1u < n_tokens) ? row_tops[row] : -1"
+count = s.count(old)
+if count != 2:
+    raise SystemExit(f"E9.1 row-top contract patch expected 2 sites, found {count}")
+p.write_text(s.replace(old, new), encoding="utf-8")
+print("FAST_COMMIT_VERIFY_LOGITS_ROW_TOP_CONTRACT_PATCH sites=2 result=PASS")
+PY
+
 grep -q 'DS4_DSPARK_TRACE_RETURN' "$TRACE_WT/ds4.c" || { echo "commit trace instrumentation missing" >&2; exit 2; }
 grep -q 'ds4_e9_verify_suffix_tops' "$TRACE_WT/ds4.c" || { echo "E9 verifier wrapper missing" >&2; exit 2; }
 grep -q 'DS4_DSPARK_E9_LOGITS' "$TRACE_WT/ds4.c" || { echo "E9 logits sentinel missing" >&2; exit 2; }
+grep -q 'row + 1u < n_tokens' "$TRACE_WT/ds4.c" || { echo "E9.1 row-top contract patch missing" >&2; exit 2; }
 echo "FAST_COMMIT_VERIFY_LOGITS_SOURCE_CHECK status=PASS"
 
 MAKE_JOBS=${MAKE_JOBS:-4}
@@ -128,5 +147,9 @@ python3 "$E9_TOOL" analyze \
   --fast-trace-log "$OUT_DIR/E9_FAST_TRACE.log" \
   --expected-ordinal1 "$EXPECTED_FIRST_DIFF_ORDINAL" \
   | tee "$OUT_DIR/next-verify-logits-ab-summary.log"
+
+# E9.1 source-contract adjudication is authoritative for row_tops validity and
+# maps the rejection row as accepted_drafts-1.
+python3 "$ADJ_TOOL" "$OUT_DIR" | tee "$OUT_DIR/next-verify-logits-e91-summary.log"
 
 echo "FAST_COMMIT_VERIFY_LOGITS_RESULTS_DIR=$OUT_DIR"
