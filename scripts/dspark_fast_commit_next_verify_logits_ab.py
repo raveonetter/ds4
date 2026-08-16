@@ -86,7 +86,8 @@ static uint64_t ds4_e9_fnv1a(const void *ptr, size_t n) {
 }
 
 static void ds4_e9_emit_logits_row(
-        uint32_t verify_ordinal1,
+        uint32_t event_ordinal1,
+        uint32_t verify_call_seq,
         uint32_t start,
         uint32_t n_tokens,
         uint32_t row,
@@ -125,10 +126,11 @@ static void ds4_e9_emit_logits_row(
     const uint64_t hash = ds4_e9_fnv1a(
         logits, (size_t)DS4_N_VOCAB * sizeof(logits[0]));
     fprintf(stderr,
-            "DS4_DSPARK_E9_LOGITS verify_ordinal1=%u start=%u n_tokens=%u row=%u "
+            "DS4_DSPARK_E9_LOGITS event_ordinal1=%u verify_call_seq=%u start=%u n_tokens=%u row=%u "
             "hash=%016llx verify_top_id=%d top1_id=%u top1=%.9g "
             "top2_id=%u top2=%.9g margin=%.17g status=PASS\n",
-            verify_ordinal1,
+            event_ordinal1,
+            verify_call_seq,
             start,
             n_tokens,
             row,
@@ -142,6 +144,8 @@ static void ds4_e9_emit_logits_row(
 }
 
 static bool ds4_e9_verify_suffix_tops(
+        uint32_t              *event_ordinal1_io,
+        uint32_t              *verify_call_seq_io,
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
@@ -158,17 +162,22 @@ static bool ds4_e9_verify_suffix_tops(
         capture_prefix1, capture_dspark_hidden,
         row_tops, row_logits, timing);
     if (!ok || !ds4_e9_trace_logits_enabled()) return ok;
-
-    const uint32_t verify_ordinal1 = ++ds4_e9_verify_ordinal;
+    if (!event_ordinal1_io || !verify_call_seq_io) return ok;
+    if (*event_ordinal1_io == 0) {
+        *event_ordinal1_io = ++ds4_e9_verify_ordinal;
+    }
+    const uint32_t event_ordinal1 = *event_ordinal1_io;
+    const uint32_t verify_call_seq = (*verify_call_seq_io)++;
     float *tmp = xmalloc((size_t)DS4_N_VOCAB * sizeof(tmp[0]));
     for (uint32_t row = 0; row < n_tokens; row++) {
         const bool row_ok = metal_graph_read_spec_logits_row(g, row, tmp);
         if (!row_ok) {
             fprintf(stderr,
-                    "DS4_DSPARK_E9_LOGITS verify_ordinal1=%u start=%u n_tokens=%u "
+                    "DS4_DSPARK_E9_LOGITS event_ordinal1=%u verify_call_seq=%u start=%u n_tokens=%u "
                     "row=%u hash=0000000000000000 verify_top_id=%d top1_id=0 "
                     "top1=0 top2_id=0 top2=0 margin=0 status=ERROR\n",
-                    verify_ordinal1,
+                    event_ordinal1,
+                    verify_call_seq,
                     start,
                     n_tokens,
                     row,
@@ -176,7 +185,8 @@ static bool ds4_e9_verify_suffix_tops(
             continue;
         }
         ds4_e9_emit_logits_row(
-            verify_ordinal1,
+            event_ordinal1,
+            verify_call_seq,
             start,
             n_tokens,
             row,
@@ -209,7 +219,17 @@ def instrument(source: Path) -> None:
     call_count = fn.count(VERIFY_FN)
     if call_count < 1:
         die("no verifier call found in DSpark speculative argmax")
-    fn = fn.replace(VERIFY_FN, "ds4_e9_verify_suffix_tops(")
+    fn_open_rel = fn.find("{")
+    local_decl = (
+        "\n    uint32_t ds4_e9_event_ordinal1 = 0;\n"
+        "    uint32_t ds4_e9_verify_call_seq = 0;\n"
+    )
+    fn = fn[:fn_open_rel + 1] + local_decl + fn[fn_open_rel + 1:]
+    fn = fn.replace(
+        VERIFY_FN,
+        "ds4_e9_verify_suffix_tops(&ds4_e9_event_ordinal1, "
+        "&ds4_e9_verify_call_seq, ",
+    )
     patched = text[:fn_start] + HELPERS + "\n" + fn + text[fn_end + 1:]
     source.write_text(patched, encoding="utf-8")
     print(
@@ -220,7 +240,8 @@ def instrument(source: Path) -> None:
 
 @dataclass(frozen=True)
 class Row:
-    verify_ordinal1: int
+    event_ordinal1: int
+    verify_call_seq: int
     start: int
     n_tokens: int
     row: int
@@ -247,7 +268,8 @@ class Event:
 
 
 ROW_RE = re.compile(
-    rf"^{ROW_PREFIX} verify_ordinal1=(\d+) start=(\d+) n_tokens=(\d+) row=(\d+) "
+    rf"^{ROW_PREFIX} event_ordinal1=(\d+) verify_call_seq=(\d+) "
+    r"start=(\d+) n_tokens=(\d+) row=(\d+) "
     r"hash=([0-9a-fA-F]+) verify_top_id=(-?\d+) top1_id=(\d+) top1=([^\s]+) "
     r"top2_id=(\d+) top2=([^\s]+) margin=([^\s]+) status=(\S+)$"
 )
@@ -257,27 +279,28 @@ TRACE_RE = re.compile(
 )
 
 
-def parse_rows(log: Path) -> dict[tuple[int, int], Row]:
-    rows: dict[tuple[int, int], Row] = {}
+def parse_rows(log: Path) -> dict[tuple[int, int, int], Row]:
+    rows: dict[tuple[int, int, int], Row] = {}
     for raw in log.read_text(encoding="utf-8", errors="replace").splitlines():
         m = ROW_RE.match(raw.strip())
         if not m:
             continue
         row = Row(
-            verify_ordinal1=int(m.group(1)),
-            start=int(m.group(2)),
-            n_tokens=int(m.group(3)),
-            row=int(m.group(4)),
-            hash_hex=m.group(5).lower(),
-            verify_top_id=int(m.group(6)),
-            top1_id=int(m.group(7)),
-            top1=float(m.group(8)),
-            top2_id=int(m.group(9)),
-            top2=float(m.group(10)),
-            margin=float(m.group(11)),
-            status=m.group(12),
+            event_ordinal1=int(m.group(1)),
+            verify_call_seq=int(m.group(2)),
+            start=int(m.group(3)),
+            n_tokens=int(m.group(4)),
+            row=int(m.group(5)),
+            hash_hex=m.group(6).lower(),
+            verify_top_id=int(m.group(7)),
+            top1_id=int(m.group(8)),
+            top1=float(m.group(9)),
+            top2_id=int(m.group(10)),
+            top2=float(m.group(11)),
+            margin=float(m.group(12)),
+            status=m.group(13),
         )
-        key = (row.verify_ordinal1, row.row)
+        key = (row.event_ordinal1, row.verify_call_seq, row.row)
         if key in rows:
             die(f"duplicate E9 row key {key} in {log}")
         rows[key] = row
@@ -385,8 +408,8 @@ def pct_delta(new: float | None, old: float | None) -> str:
     return f"{((new / old) - 1.0) * 100.0:.3f}"
 
 
-def event_for_verify(events: list[Event], verify_ordinal1: int) -> Event | None:
-    idx = verify_ordinal1 - 1
+def event_for_ordinal(events: list[Event], event_ordinal1: int) -> Event | None:
+    idx = event_ordinal1 - 1
     return events[idx] if 0 <= idx < len(events) else None
 
 
@@ -413,14 +436,16 @@ def analyze(args: argparse.Namespace) -> None:
     fast_events = parse_events(args.fast_trace_log)
     replay_events = parse_events(args.replay_log)
 
-    fast_verify_count = max(k[0] for k in fast)
-    replay_verify_count = max(k[0] for k in replay)
+    fast_event_count = max(k[0] for k in fast)
+    replay_event_count = max(k[0] for k in replay)
     alignment_ok = (
-        fast_verify_count == len(fast_events)
-        and replay_verify_count == len(replay_events)
+        fast_event_count == len(fast_events)
+        and replay_event_count == len(replay_events)
         and all(r.status == "PASS" for r in fast.values())
         and all(r.status == "PASS" for r in replay.values())
     )
+    fast_extra_calls = len({(k[0], k[1]) for k in fast if k[1] > 0})
+    replay_extra_calls = len({(k[0], k[1]) for k in replay if k[1] > 0})
 
     self_top_mismatch = sum(
         1 for r in list(fast.values()) + list(replay.values())
@@ -431,8 +456,8 @@ def analyze(args: argparse.Namespace) -> None:
         (e.event_index0 for e in fast_events if e.commit_type == "FULL_ACCEPT_FAST"),
         None,
     )
-    causal_verify = None if causal_idx is None else causal_idx + 1
-    next_verify = None if causal_idx is None else causal_idx + 2
+    causal_event_ordinal1 = None if causal_idx is None else causal_idx + 1
+    next_event_ordinal1 = None if causal_idx is None else causal_idx + 2
 
     print(
         "FAST_COMMIT_VERIFY_LOGITS_BASELINE "
@@ -457,22 +482,26 @@ def analyze(args: argparse.Namespace) -> None:
     print(
         "FAST_COMMIT_VERIFY_LOGITS_TRACE "
         f"fast_rows={len(fast)} replay_rows={len(replay)} "
-        f"fast_verifies={fast_verify_count} replay_verifies={replay_verify_count} "
         f"fast_events={len(fast_events)} replay_events={len(replay_events)} "
+        f"fast_extra_verify_calls={fast_extra_calls} "
+        f"replay_extra_verify_calls={replay_extra_calls} "
         f"verify_top_self_mismatches={self_top_mismatch} "
-        f"iter_event_alignment={'PASS' if alignment_ok else 'FAIL'}"
+        f"event_alignment={'PASS' if alignment_ok else 'FAIL'}"
     )
     print(
         "FAST_COMMIT_VERIFY_LOGITS_CAUSAL_WINDOW "
         f"full_accept_event_index0={fmt_index(causal_idx)} "
-        f"full_accept_verify_ordinal1={fmt_index(causal_verify)} "
-        f"next_verify_ordinal1={fmt_index(next_verify)} "
+        f"full_accept_event_ordinal1={fmt_index(causal_event_ordinal1)} "
+        f"next_event_ordinal1={fmt_index(next_event_ordinal1)} "
         f"result={'PASS' if causal_idx is not None else 'FAIL'}"
     )
 
-    common = sorted(set(fast) & set(replay))
-    first_hash: tuple[int, int] | None = None
-    first_argmax: tuple[int, int] | None = None
+    common = sorted(
+        key for key in (set(fast) & set(replay))
+        if key[1] == 0
+    )
+    first_hash: tuple[int, int, int] | None = None
+    first_argmax: tuple[int, int, int] | None = None
     precommit_divergence = False
     shape_mismatch = False
 
@@ -487,18 +516,18 @@ def analyze(args: argparse.Namespace) -> None:
             first_hash = key
         if first_argmax is None and not argmax_same:
             first_argmax = key
-        if causal_verify is not None and key[0] <= causal_verify and not hash_same:
+        if causal_event_ordinal1 is not None and key[0] <= causal_event_ordinal1 and not hash_same:
             precommit_divergence = True
 
         if (
-            key[0] in {causal_verify, next_verify}
+            key[0] in {causal_event_ordinal1, next_event_ordinal1}
             or not hash_same
             or not argmax_same
             or not same_shape
         ):
             print(
                 "FAST_COMMIT_VERIFY_LOGITS_ROW "
-                f"verify_ordinal1={key[0]} row={key[1]} "
+                f"event_ordinal1={key[0]} verify_call_seq={key[1]} row={key[2]} "
                 f"fast_start={f.start} replay_start={r.start} "
                 f"fast_n_tokens={f.n_tokens} replay_n_tokens={r.n_tokens} "
                 f"shape_result={'EXACT' if same_shape else 'MISMATCH'} "
@@ -517,7 +546,7 @@ def analyze(args: argparse.Namespace) -> None:
     else:
         print(
             "FAST_COMMIT_VERIFY_LOGITS_FIRST_HASH_DIVERGENCE "
-            f"verify_ordinal1={first_hash[0]} row={first_hash[1]}"
+            f"event_ordinal1={first_hash[0]} row={first_hash[2]}"
         )
     if first_argmax is None:
         print("FAST_COMMIT_VERIFY_LOGITS_FIRST_ARGMAX_DIVERGENCE=NONE")
@@ -526,16 +555,16 @@ def analyze(args: argparse.Namespace) -> None:
         r = replay[first_argmax]
         print(
             "FAST_COMMIT_VERIFY_LOGITS_FIRST_ARGMAX_DIVERGENCE "
-            f"verify_ordinal1={first_argmax[0]} row={first_argmax[1]} "
+            f"event_ordinal1={first_argmax[0]} row={first_argmax[2]} "
             f"fast_top1_id={f.top1_id} replay_top1_id={r.top1_id} "
             f"fast_margin={f.margin:.17g} replay_margin={r.margin:.17g}"
         )
 
     correction_match = False
     if first_argmax is not None:
-        verify_ord, row_idx = first_argmax
-        fe = event_for_verify(fast_events, verify_ord)
-        revent = event_for_verify(replay_events, verify_ord)
+        event_ord, _call_seq, row_idx = first_argmax
+        fe = event_for_ordinal(fast_events, event_ord)
+        revent = event_for_ordinal(replay_events, event_ord)
         fast_corr = fe.ids[-1] if fe and fe.correction and fe.ids else None
         replay_corr = (
             revent.ids[-1] if revent and revent.correction and revent.ids else None
@@ -548,7 +577,7 @@ def analyze(args: argparse.Namespace) -> None:
         )
         print(
             "FAST_COMMIT_VERIFY_LOGITS_CORRECTION "
-            f"verify_ordinal1={verify_ord} row={row_idx} "
+            f"event_ordinal1={event_ord} row={row_idx} "
             f"fast_commit_type={fe.commit_type if fe else 'MISSING'} "
             f"fast_accepted_drafts={fe.accepted_drafts if fe else 'MISSING'} "
             f"fast_correction_id={fast_corr if fast_corr is not None else 'NONE'} "
