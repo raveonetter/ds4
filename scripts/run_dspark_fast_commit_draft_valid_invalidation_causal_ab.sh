@@ -53,7 +53,12 @@ echo "FAST_COMMIT_DRAFT_VALID_INVALIDATION_SETUP source_run=$SOURCE_RUN_DIR conf
 git -C "$ROOT_DIR" worktree add --detach "$TRACE_WT" HEAD >/dev/null
 WORKTREE_ADDED=1
 
-python3 -m py_compile "$E12_TOOL"
+python3 - "$E12_TOOL" <<'PY'
+import ast
+import pathlib
+import sys
+ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+PY
 python3 "$E12_TOOL" instrument --source "$TRACE_WT/ds4.c"
 
 grep -q 'DS4_DSPARK_E11_SCHED' "$TRACE_WT/ds4.c" || { echo "E11 scheduler instrumentation missing" >&2; exit 2; }
